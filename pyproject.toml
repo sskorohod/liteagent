@@ -1,0 +1,53 @@
+[project]
+name = "liteagent"
+version = "1.0.0"
+description = "Ultra-lightweight AI agent with smart memory, 8 metacognition features, and token optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["ai", "agent", "llm", "claude", "openai", "ollama", "gemini", "memory", "metacognition", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "anthropic>=0.42.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vskorokhod/liteagent"
+Repository = "https://github.com/vskorokhod/liteagent"
+"Bug Tracker" = "https://github.com/vskorokhod/liteagent/issues"
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot>=21.0"]
+api = ["fastapi>=0.115.0", "uvicorn>=0.34.0"]
+embeddings = ["sentence-transformers>=3.0.0"]
+openai = ["openai>=1.0.0"]
+gemini = ["google-generativeai>=0.8.0"]
+ollama = ["openai>=1.0.0"]
+pdf = ["pymupdf>=1.24.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-cov>=5.0"]
+all = ["liteagent[telegram,api,embeddings,openai,gemini,dev]"]
+
+[project.scripts]
+liteagent = "liteagent.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["liteagent*"]
+
+[tool.setuptools.package-data]
+liteagent = ["static/*", "py.typed"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"

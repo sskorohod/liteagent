@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      - ./config.json:/config/config.json:ro
+      - ./soul.md:/app/soul.md:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    restart: unless-stopped
+
+  telegram:
+    build: .
+    command: ["python", "-m", "liteagent", "--channel", "telegram", "-c", "/config/config.json"]
+    volumes:
+      - ./data:/data
+      - ./config.json:/config/config.json:ro
+      - ./soul.md:/app/soul.md:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    restart: unless-stopped
+    profiles:
+      - telegram

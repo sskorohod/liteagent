@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LiteAgent Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        bg: { DEFAULT: '#0a0a0b', card: '#18181b', hover: '#1f1f23' },
+        accent: { DEFAULT: '#6366f1', light: '#818cf8', dim: '#4f46e5' },
+        border: '#27272a',
+        muted: '#71717a',
+      }
+    }
+  }
+}
+</script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #0a0a0b; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+  .tab-active { background: #6366f1; color: #fff; }
+  .fade-in { animation: fadeIn 0.2s ease-in; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .loading { animation: pulse 1.5s infinite; }
+
+  /* Typing indicator */
+  @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+  .typing-dot { width: 6px; height: 6px; border-radius: 50%; background: #71717a; display: inline-block; margin: 0 2px; }
+  .typing-dot:nth-child(1) { animation: bounce 1.2s infinite 0s; }
+  .typing-dot:nth-child(2) { animation: bounce 1.2s infinite 0.2s; }
+  .typing-dot:nth-child(3) { animation: bounce 1.2s infinite 0.4s; }
+
+  /* Chat message markdown styles */
+  .chat-msg { max-width: 80%; position: relative; }
+  .chat-msg pre { background: #0a0a0b; border: 1px solid #27272a; border-radius: 8px; padding: 12px; margin: 8px 0; overflow-x: auto; font-size: 13px; }
+  .chat-msg code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 13px; }
+  .chat-msg p code { background: #27272a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .chat-msg h1, .chat-msg h2, .chat-msg h3 { font-weight: 600; margin: 12px 0 6px 0; }
+  .chat-msg h1 { font-size: 1.3em; }
+  .chat-msg h2 { font-size: 1.15em; }
+  .chat-msg h3 { font-size: 1.05em; }
+  .chat-msg ul, .chat-msg ol { padding-left: 20px; margin: 6px 0; }
+  .chat-msg li { margin: 2px 0; }
+  .chat-msg blockquote { border-left: 3px solid #6366f1; padding-left: 12px; margin: 8px 0; color: #a1a1aa; }
+  .chat-msg a { color: #818cf8; text-decoration: underline; }
+  .chat-msg strong { font-weight: 600; color: #e4e4e7; }
+  .chat-msg em { font-style: italic; }
+  .chat-msg p { margin: 4px 0; }
+
+  /* Copy button */
+  .copy-btn { position: absolute; top: 8px; right: 8px; opacity: 0; transition: opacity 0.2s; }
+  .chat-msg:hover .copy-btn { opacity: 1; }
+
+  /* Mobile */
+  @media (max-width: 768px) {
+    aside { display: none; }
+    .chat-msg { max-width: 95%; }
+    main { padding: 1rem; }
+  }
+</style>
+</head>
+<body class="bg-bg text-zinc-200 min-h-screen flex">
+
+<!-- Sidebar -->
+<aside class="w-56 border-r border-border flex flex-col py-6 px-3 shrink-0 h-screen sticky top-0">
+  <div class="flex items-center gap-2 px-3 mb-8">
+    <div class="w-8 h-8 rounded-lg bg-accent flex items-center justify-center text-white font-bold text-sm">L</div>
+    <span class="font-semibold text-lg text-white">LiteAgent</span>
+  </div>
+  <nav class="flex flex-col gap-1 flex-1" id="nav">
+    <button onclick="switchTab('overview')" data-tab="overview" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
+      Overview
+    </button>
+    <button onclick="switchTab('usage')" data-tab="usage" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      Usage & Cost
+    </button>
+    <button onclick="switchTab('memories')" data-tab="memories" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+      Memories
+    </button>
+    <button onclick="switchTab('tools')" data-tab="tools" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      Tools
+    </button>
+    <button onclick="switchTab('chat')" data-tab="chat" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+      Chat
+    </button>
+    <button onclick="switchTab('settings')" data-tab="settings" class="nav-btn flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-left transition-colors">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/></svg>
+      Settings
+    </button>
+  </nav>
+  <div class="px-3 pt-4 border-t border-border">
+    <div class="text-xs text-muted">LiteAgent v1.0.0</div>
+    <div class="text-xs text-muted mt-1" id="sidebar-status">Connecting...</div>
+  </div>
+</aside>
+
+<!-- Main content -->
+<main class="flex-1 p-8 overflow-y-auto h-screen">
+
+  <!-- Overview Tab -->
+  <section id="tab-overview" class="tab-content hidden fade-in">
+    <h1 class="text-2xl font-semibold text-white mb-6">Overview</h1>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8" id="kpi-grid">
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Calls</div>
+        <div class="text-2xl font-bold text-white" id="kpi-calls">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Cost</div>
+        <div class="text-2xl font-bold text-white" id="kpi-cost">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Today Cost</div>
+        <div class="text-2xl font-bold text-white" id="kpi-today">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Memories</div>
+        <div class="text-2xl font-bold text-white" id="kpi-memories">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Tokens</div>
+        <div class="text-2xl font-bold text-white" id="kpi-tokens">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-5">
+        <div class="text-muted text-xs uppercase tracking-wide mb-1">Tools</div>
+        <div class="text-2xl font-bold text-white" id="kpi-tools">&mdash;</div>
+      </div>
+    </div>
+    <!-- Daily chart -->
+    <div class="bg-bg-card border border-border rounded-xl p-6">
+      <h2 class="text-sm font-medium text-muted mb-4">Daily Usage (14 days)</h2>
+      <canvas id="chart-daily" height="80"></canvas>
+    </div>
+  </section>
+
+  <!-- Usage Tab -->
+  <section id="tab-usage" class="tab-content hidden fade-in">
+    <h1 class="text-2xl font-semibold text-white mb-6">Usage & Cost</h1>
+    <div class="flex gap-2 mb-6">
+      <button onclick="loadUsage(7)" class="px-3 py-1.5 text-xs rounded-lg bg-bg-card border border-border hover:bg-bg-hover transition-colors">7 days</button>
+      <button onclick="loadUsage(14)" class="px-3 py-1.5 text-xs rounded-lg bg-bg-card border border-border hover:bg-bg-hover transition-colors">14 days</button>
+      <button onclick="loadUsage(30)" class="px-3 py-1.5 text-xs rounded-lg bg-bg-card border border-border hover:bg-bg-hover transition-colors">30 days</button>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div class="bg-bg-card border border-border rounded-xl p-6">
+        <h2 class="text-sm font-medium text-muted mb-4">Cost by Model</h2>
+        <canvas id="chart-model-cost" height="120"></canvas>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-6">
+        <h2 class="text-sm font-medium text-muted mb-4">Calls by Model</h2>
+        <canvas id="chart-model-calls" height="120"></canvas>
+      </div>
+    </div>
+    <div class="bg-bg-card border border-border rounded-xl overflow-hidden">
+      <table class="w-full text-sm">
+        <thead><tr class="text-muted text-xs uppercase border-b border-border">
+          <th class="text-left p-4">Model</th><th class="text-right p-4">Calls</th>
+          <th class="text-right p-4">Input Tokens</th><th class="text-right p-4">Output Tokens</th>
+          <th class="text-right p-4">Cache Read</th><th class="text-right p-4">Cost</th>
+        </tr></thead>
+        <tbody id="usage-table"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Memories Tab -->
+  <section id="tab-memories" class="tab-content hidden fade-in">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-semibold text-white">Memories</h1>
+      <span class="text-sm text-muted" id="memory-count"></span>
+    </div>
+    <div class="space-y-3" id="memories-list">
+      <div class="text-muted text-sm loading">Loading memories...</div>
+    </div>
+  </section>
+
+  <!-- Tools Tab -->
+  <section id="tab-tools" class="tab-content hidden fade-in">
+    <h1 class="text-2xl font-semibold text-white mb-6">Tools</h1>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="tools-list">
+      <div class="text-muted text-sm loading">Loading tools...</div>
+    </div>
+  </section>
+
+  <!-- Chat Tab -->
+  <section id="tab-chat" class="tab-content hidden fade-in flex flex-col" style="height: calc(100vh - 4rem);">
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-semibold text-white">Chat</h1>
+      <button onclick="clearChat()" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted hover:text-white hover:border-red-400/50 transition-colors">
+        Clear Chat
+      </button>
+    </div>
+    <div class="flex-1 overflow-y-auto space-y-4 mb-4 pr-2" id="chat-messages">
+      <div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>
+    </div>
+    <div class="flex gap-3">
+      <input id="chat-input" type="text" placeholder="Type a message..."
+        class="flex-1 bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-white placeholder-muted focus:outline-none focus:border-accent transition-colors"
+        onkeydown="if(event.key==='Enter' && !chatBusy)sendChat()">
+      <button onclick="sendChat()" id="chat-send-btn" class="bg-accent hover:bg-accent-dim text-white px-5 py-3 rounded-xl text-sm font-medium transition-colors">
+        Send
+      </button>
+    </div>
+  </section>
+
+  <!-- Settings Tab -->
+  <section id="tab-settings" class="tab-content hidden fade-in">
+    <h1 class="text-2xl font-semibold text-white mb-6">Settings</h1>
+    <div class="bg-bg-card border border-border rounded-xl p-6">
+      <h2 class="text-sm font-medium text-muted mb-4">Agent Configuration (read-only)</h2>
+      <pre id="config-json" class="text-xs text-zinc-400 bg-bg rounded-lg p-4 overflow-auto max-h-96 border border-border"></pre>
+    </div>
+  </section>
+
+</main>
+
+<script>
+// =======================================
+// STATE
+// =======================================
+let currentTab = 'overview';
+let charts = {};
+let chatBusy = false;
+
+// =======================================
+// API HELPERS
+// =======================================
+async function api(path, opts = {}) {
+  try {
+    const res = await fetch(path, opts);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return await res.json();
+  } catch (e) {
+    console.error(`API error (${path}):`, e);
+    return null;
+  }
+}
+
+function fmt(n) {
+  if (n == null) return '\u2014';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+// =======================================
+// TAB SWITCHING
+// =======================================
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+  document.getElementById('tab-' + name)?.classList.remove('hidden');
+  document.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.classList.remove('tab-active');
+    if (btn.dataset.tab === name) btn.classList.add('tab-active');
+  });
+  if (name === 'overview') loadOverview();
+  else if (name === 'usage') loadUsage(7);
+  else if (name === 'memories') loadMemories();
+  else if (name === 'tools') loadTools();
+  else if (name === 'chat') loadHistory();
+  else if (name === 'settings') loadConfig();
+}
+
+// =======================================
+// OVERVIEW
+// =======================================
+async function loadOverview() {
+  const data = await api('/api/overview');
+  if (!data) return;
+  document.getElementById('kpi-calls').textContent = fmt(data.total_calls);
+  document.getElementById('kpi-cost').textContent = '$' + data.total_cost_usd.toFixed(2);
+  document.getElementById('kpi-today').textContent = '$' + data.today_cost_usd.toFixed(4);
+  document.getElementById('kpi-memories').textContent = fmt(data.memory_count);
+  document.getElementById('kpi-tokens').textContent = fmt(data.total_tokens);
+  document.getElementById('kpi-tools').textContent = data.tools_count;
+  const daily = await api('/api/usage/daily?days=14');
+  if (daily && daily.length) renderDailyChart(daily);
+}
+
+function renderDailyChart(data) {
+  const ctx = document.getElementById('chart-daily');
+  if (charts.daily) charts.daily.destroy();
+  charts.daily = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.date.slice(5)),
+      datasets: [{
+        label: 'Cost ($)', data: data.map(d => d.cost_usd),
+        borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)',
+        fill: true, tension: 0.3, pointRadius: 3, pointBackgroundColor: '#6366f1',
+      }, {
+        label: 'Calls', data: data.map(d => d.calls),
+        borderColor: '#22d3ee', backgroundColor: 'rgba(34,211,238,0.1)',
+        fill: false, tension: 0.3, pointRadius: 3, pointBackgroundColor: '#22d3ee', yAxisID: 'y1',
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: '#71717a', font: { size: 11 } } } },
+      scales: {
+        x: { ticks: { color: '#71717a', font: { size: 10 } }, grid: { color: '#27272a' } },
+        y: { ticks: { color: '#71717a', font: { size: 10 }, callback: v => '$' + v.toFixed(2) }, grid: { color: '#27272a' }, position: 'left' },
+        y1: { ticks: { color: '#71717a', font: { size: 10 } }, grid: { display: false }, position: 'right' },
+      }
+    }
+  });
+}
+
+// =======================================
+// USAGE
+// =======================================
+async function loadUsage(days) {
+  const data = await api('/api/usage?days=' + days);
+  if (!data) return;
+  const tbody = document.getElementById('usage-table');
+  tbody.innerHTML = data.map(r => `
+    <tr class="border-b border-border hover:bg-bg-hover transition-colors">
+      <td class="p-4 font-mono text-xs">${shortModel(r.model)}</td>
+      <td class="p-4 text-right">${fmt(r.calls)}</td>
+      <td class="p-4 text-right">${fmt(r.input_tokens)}</td>
+      <td class="p-4 text-right">${fmt(r.output_tokens)}</td>
+      <td class="p-4 text-right">${fmt(r.cache_read_tokens)}</td>
+      <td class="p-4 text-right text-accent-light font-medium">$${r.cost_usd.toFixed(4)}</td>
+    </tr>
+  `).join('');
+  renderModelCharts(data);
+}
+
+function shortModel(m) {
+  if (!m) return 'unknown';
+  if (m.includes('haiku')) return 'Haiku';
+  if (m.includes('sonnet')) return 'Sonnet';
+  if (m.includes('opus')) return 'Opus';
+  if (m.includes('gpt-4o')) return 'GPT-4o';
+  if (m.includes('gpt-4.1')) return 'GPT-4.1';
+  if (m.includes('gemini')) return 'Gemini';
+  return m.split('-').slice(0, 2).join('-');
+}
+
+function renderModelCharts(data) {
+  const labels = data.map(r => shortModel(r.model));
+  const colors = ['#6366f1', '#22d3ee', '#f472b6', '#facc15', '#34d399', '#fb923c'];
+  const ctxCost = document.getElementById('chart-model-cost');
+  if (charts.modelCost) charts.modelCost.destroy();
+  charts.modelCost = new Chart(ctxCost, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data: data.map(r => r.cost_usd), backgroundColor: colors }] },
+    options: { responsive: true, plugins: { legend: { labels: { color: '#71717a', font: { size: 11 } } } } }
+  });
+  const ctxCalls = document.getElementById('chart-model-calls');
+  if (charts.modelCalls) charts.modelCalls.destroy();
+  charts.modelCalls = new Chart(ctxCalls, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data: data.map(r => r.calls), backgroundColor: colors }] },
+    options: { responsive: true, plugins: { legend: { labels: { color: '#71717a', font: { size: 11 } } } } }
+  });
+}
+
+// =======================================
+// MEMORIES
+// =======================================
+async function loadMemories() {
+  const data = await api('/api/memories');
+  const container = document.getElementById('memories-list');
+  const countEl = document.getElementById('memory-count');
+  if (!data || !data.length) {
+    container.innerHTML = '<div class="text-muted text-sm py-8 text-center">No memories stored yet</div>';
+    countEl.textContent = '0 memories';
+    return;
+  }
+  countEl.textContent = data.length + ' memories';
+  container.innerHTML = data.map(m => `
+    <div class="bg-bg-card border border-border rounded-xl p-4 flex items-start gap-4 group hover:border-accent/30 transition-colors" id="mem-${m.id}">
+      <div class="flex-1">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="text-xs px-2 py-0.5 rounded-full border border-border text-muted">${m.type}</span>
+          <span class="text-xs text-muted">${m.created_at ? new Date(m.created_at).toLocaleDateString() : ''}</span>
+          <span class="text-xs text-zinc-600">importance: ${m.importance}</span>
+        </div>
+        <div class="text-sm text-zinc-300">${escapeHtml(m.content)}</div>
+      </div>
+      <button onclick="deleteMemory(${m.id})" class="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 text-xs px-2 py-1 rounded border border-red-400/20 hover:border-red-400/50 transition-all">
+        Delete
+      </button>
+    </div>
+  `).join('');
+}
+
+async function deleteMemory(id) {
+  const res = await api('/api/memories/' + id, { method: 'DELETE' });
+  if (res) {
+    const el = document.getElementById('mem-' + id);
+    if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 200); }
+    const countEl = document.getElementById('memory-count');
+    const current = parseInt(countEl.textContent) || 0;
+    countEl.textContent = (current - 1) + ' memories';
+  }
+}
+
+// =======================================
+// TOOLS
+// =======================================
+async function loadTools() {
+  const data = await api('/api/tools');
+  const container = document.getElementById('tools-list');
+  if (!data || !data.length) {
+    container.innerHTML = '<div class="text-muted text-sm">No tools registered</div>';
+    return;
+  }
+  container.innerHTML = data.map(t => `
+    <div class="bg-bg-card border border-border rounded-xl p-5 hover:border-accent/30 transition-colors">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-accent font-mono text-sm font-medium">${escapeHtml(t.name)}</span>
+      </div>
+      <div class="text-xs text-muted mb-3">${escapeHtml(t.description || 'No description')}</div>
+      ${t.parameters.length ? `<div class="flex flex-wrap gap-1">
+        ${t.parameters.map(p => `<span class="text-xs px-2 py-0.5 rounded-full bg-bg border border-border text-zinc-500">${p}</span>`).join('')}
+      </div>` : ''}
+    </div>
+  `).join('');
+}
+
+// =======================================
+// MARKDOWN RENDERER
+// =======================================
+function renderMarkdown(text) {
+  if (!text) return '';
+
+  // Escape HTML first
+  let html = escapeHtml(text);
+
+  // Code blocks (``` ... ```)
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+  });
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+  // Bold and italic
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Blockquotes
+  html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+  // Unordered lists
+  html = html.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+  // Ordered lists
+  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Paragraphs (double newlines)
+  html = html.replace(/\n\n/g, '</p><p>');
+
+  // Single newlines -> <br>
+  html = html.replace(/\n/g, '<br>');
+
+  // Wrap in paragraph
+  html = '<p>' + html + '</p>';
+
+  // Clean up empty paragraphs
+  html = html.replace(/<p><\/p>/g, '');
+  html = html.replace(/<p>(<h[123]>)/g, '$1');
+  html = html.replace(/(<\/h[123]>)<\/p>/g, '$1');
+  html = html.replace(/<p>(<pre>)/g, '$1');
+  html = html.replace(/(<\/pre>)<\/p>/g, '$1');
+  html = html.replace(/<p>(<ul>)/g, '$1');
+  html = html.replace(/(<\/ul>)<\/p>/g, '$1');
+  html = html.replace(/<p>(<blockquote>)/g, '$1');
+  html = html.replace(/(<\/blockquote>)<\/p>/g, '$1');
+
+  return html;
+}
+
+// =======================================
+// CHAT — STREAMING
+// =======================================
+async function loadHistory() {
+  const data = await api('/api/history');
+  const container = document.getElementById('chat-messages');
+  if (!data || !data.length) {
+    container.innerHTML = '<div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>';
+    return;
+  }
+  container.innerHTML = data.map(m => renderMessage(m.role, m.content)).join('');
+  scrollToBottom();
+}
+
+function renderMessage(role, content) {
+  const isUser = role === 'user';
+  const id = 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+  if (isUser) {
+    return `
+      <div class="flex justify-end" id="${id}">
+        <div class="chat-msg bg-accent/20 border border-accent/30 rounded-xl px-4 py-3 text-sm text-zinc-200">
+          ${escapeHtml(content)}
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="flex justify-start" id="${id}">
+      <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
+        <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
+          onclick="copyMessage(this)">Copy</button>
+        <div class="msg-content">${renderMarkdown(content)}</div>
+      </div>
+    </div>`;
+}
+
+function scrollToBottom() {
+  const container = document.getElementById('chat-messages');
+  container.scrollTop = container.scrollHeight;
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  chatBusy = true;
+
+  const container = document.getElementById('chat-messages');
+  // Remove placeholder
+  if (container.querySelector('.text-center')) container.innerHTML = '';
+
+  // Add user message
+  container.insertAdjacentHTML('beforeend', renderMessage('user', msg));
+  scrollToBottom();
+
+  // Add typing indicator
+  const typingId = 'typing-' + Date.now();
+  container.insertAdjacentHTML('beforeend', `
+    <div id="${typingId}" class="flex justify-start">
+      <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3">
+        <span class="typing-dot"></span>
+        <span class="typing-dot"></span>
+        <span class="typing-dot"></span>
+      </div>
+    </div>`);
+  scrollToBottom();
+
+  // SSE streaming
+  const msgId = 'stream-' + Date.now();
+  let streamText = '';
+  let streamEl = null;
+
+  try {
+    const url = `/chat/stream?message=${encodeURIComponent(msg)}&user_id=dashboard-user`;
+    const eventSource = new EventSource(url);
+
+    eventSource.onmessage = function(event) {
+      const data = JSON.parse(event.data);
+
+      if (data.done) {
+        eventSource.close();
+        // Re-render with full markdown
+        if (streamEl) {
+          const contentEl = streamEl.querySelector('.msg-content');
+          if (contentEl) contentEl.innerHTML = renderMarkdown(streamText);
+        }
+        chatBusy = false;
+        return;
+      }
+
+      if (data.error) {
+        eventSource.close();
+        if (streamEl) {
+          const contentEl = streamEl.querySelector('.msg-content');
+          if (contentEl) contentEl.innerHTML = `<span class="text-red-400">Error: ${escapeHtml(data.error)}</span>`;
+        }
+        chatBusy = false;
+        return;
+      }
+
+      if (data.text) {
+        // Remove typing indicator on first chunk
+        const typingEl = document.getElementById(typingId);
+        if (typingEl) {
+          typingEl.remove();
+          // Create message bubble
+          container.insertAdjacentHTML('beforeend', `
+            <div class="flex justify-start" id="${msgId}">
+              <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
+                <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
+                  onclick="copyMessage(this)">Copy</button>
+                <div class="msg-content"></div>
+              </div>
+            </div>`);
+          streamEl = document.getElementById(msgId);
+        }
+
+        streamText += data.text;
+        // Show raw text during stream (fast), render markdown on completion
+        if (streamEl) {
+          const contentEl = streamEl.querySelector('.msg-content');
+          if (contentEl) contentEl.textContent = streamText;
+        }
+        scrollToBottom();
+      }
+    };
+
+    eventSource.onerror = function() {
+      eventSource.close();
+      const typingEl = document.getElementById(typingId);
+      if (typingEl) typingEl.remove();
+      if (!streamEl) {
+        container.insertAdjacentHTML('beforeend', renderMessage('assistant', 'Connection error. Please try again.'));
+      }
+      chatBusy = false;
+    };
+
+  } catch (e) {
+    document.getElementById(typingId)?.remove();
+    container.insertAdjacentHTML('beforeend', renderMessage('assistant', 'Error: ' + e.message));
+    chatBusy = false;
+  }
+}
+
+function copyMessage(btn) {
+  const content = btn.parentElement.querySelector('.msg-content');
+  if (content) {
+    navigator.clipboard.writeText(content.textContent).then(() => {
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    });
+  }
+}
+
+async function clearChat() {
+  await api('/command?cmd=/clear&user_id=dashboard-user', { method: 'POST' });
+  document.getElementById('chat-messages').innerHTML =
+    '<div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>';
+}
+
+// =======================================
+// SETTINGS
+// =======================================
+async function loadConfig() {
+  const data = await api('/api/config');
+  document.getElementById('config-json').textContent = data ? JSON.stringify(data, null, 2) : 'Failed to load config';
+}
+
+// =======================================
+// UTILS
+// =======================================
+function escapeHtml(s) {
+  if (!s) return '';
+  if (typeof s !== 'string') s = String(s);
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// =======================================
+// INIT
+// =======================================
+async function init() {
+  const health = await api('/health');
+  document.getElementById('sidebar-status').textContent = health ? 'Connected' : 'Offline';
+  document.getElementById('sidebar-status').className = 'text-xs mt-1 ' + (health ? 'text-emerald-400' : 'text-red-400');
+  switchTab('overview');
+}
+
+init();
+</script>
+</body>
+</html>
