@@ -1,6 +1,7 @@
 """Tests for dashboard API endpoints."""
 
 import pytest
+from pathlib import Path
 
 from liteagent.agent import LiteAgent
 from liteagent.channels.api import create_app
@@ -158,3 +159,161 @@ class TestSchedulerEndpoint:
         resp = c.get("/api/scheduler/jobs")
         assert resp.status_code == 200
         assert resp.json() == []
+
+
+class TestProviderSettings:
+    def test_get_providers_returns_all(self, client):
+        c, _ = client
+        resp = c.get("/api/settings/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "active_provider" in data
+        assert "active_model" in data
+        assert "providers" in data
+        assert "anthropic" in data["providers"]
+        assert "openai" in data["providers"]
+        assert "gemini" in data["providers"]
+        assert "ollama" in data["providers"]
+
+    def test_provider_has_models(self, client):
+        c, _ = client
+        data = c.get("/api/settings/providers").json()
+        for name, info in data["providers"].items():
+            assert "models" in info
+            assert len(info["models"]) > 0
+            assert "has_key" in info
+
+    def test_ollama_always_has_key(self, client):
+        c, _ = client
+        data = c.get("/api/settings/providers").json()
+        assert data["providers"]["ollama"]["has_key"] is True
+        assert data["providers"]["ollama"]["key_preview"] == "(local)"
+
+    def test_save_key_missing_name(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "", "api_key": "sk-test"})
+        assert resp.status_code == 400
+
+    def test_save_key_missing_key(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "openai", "api_key": ""})
+        assert resp.status_code == 400
+
+    def test_save_key_unknown_provider(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "nonexistent", "api_key": "x"})
+        assert resp.status_code == 400
+
+    def test_save_key_bad_format_anthropic(self, client):
+        """Anthropic key must start with sk-ant-."""
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "anthropic", "api_key": "xai-wrong-prefix"})
+        assert resp.status_code == 400
+        assert "sk-ant-" in resp.json()["detail"]
+
+    def test_save_key_bad_format_openai(self, client):
+        """OpenAI key must start with sk-."""
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "openai", "api_key": "bad-prefix-key"})
+        assert resp.status_code == 400
+        assert "sk-" in resp.json()["detail"]
+
+    def test_save_key_valid_format(self, client, monkeypatch, tmp_path):
+        """Valid key format should save successfully."""
+        keys_path = tmp_path / "keys.json"
+        monkeypatch.setattr("liteagent.config.KEYS_PATH", keys_path)
+        monkeypatch.setattr("liteagent.config.KEYS_DIR", tmp_path)
+        c, _ = client
+        resp = c.post("/api/settings/provider/key",
+                       json={"provider": "anthropic", "api_key": "sk-ant-valid-key-12345"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    def test_apply_provider_missing_name(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider",
+                       json={"provider": "", "model": "gpt-4o"})
+        assert resp.status_code == 400
+
+    def test_apply_provider_unknown(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider",
+                       json={"provider": "nonexistent", "model": "x"})
+        assert resp.status_code == 400
+
+    def test_apply_anthropic_works(self, client, monkeypatch):
+        """Anthropic SDK is always installed, so applying should work with key in env."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake-key-12345")
+        c, _ = client
+        resp = c.post("/api/settings/provider",
+                       json={"provider": "anthropic", "model": "claude-haiku-4-5-20251001"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+
+    def test_delete_key_not_found(self, client):
+        c, _ = client
+        resp = c.delete("/api/settings/provider/openai/key")
+        # May be 404 if no key saved
+        assert resp.status_code in (200, 404)
+
+    def test_test_provider_no_key(self, client):
+        c, _ = client
+        resp = c.post("/api/settings/provider/test",
+                       json={"provider": "openai", "api_key": ""})
+        data = resp.json()
+        # Should return ok=false (no key or no SDK)
+        assert data["ok"] is False
+
+
+class TestKeyManagement:
+    """Test config.py key management functions."""
+
+    def test_save_and_load_key(self, tmp_path, monkeypatch):
+        from liteagent.config import (
+            load_provider_keys, save_provider_key,
+            delete_provider_key, get_api_key, key_preview,
+            KEYS_DIR,
+        )
+        import liteagent.config as config_mod
+
+        # Override paths to use tmp_path
+        monkeypatch.setattr(config_mod, "KEYS_DIR", tmp_path)
+        monkeypatch.setattr(config_mod, "KEYS_PATH", tmp_path / "keys.json")
+
+        # Save a key
+        save_provider_key("openai", "sk-test-key-12345")
+        keys = load_provider_keys()
+        assert keys["openai"] == "sk-test-key-12345"
+
+        # Get key
+        key = get_api_key("openai")
+        assert key == "sk-test-key-12345"
+
+        # Preview
+        assert key_preview("sk-test-key-12345") == "sk-tes...2345"
+
+        # Delete
+        assert delete_provider_key("openai") is True
+        assert delete_provider_key("openai") is False
+        assert get_api_key("openai") is None  # unless env var set
+
+    def test_key_preview_short(self):
+        from liteagent.config import key_preview
+        assert key_preview("") == ""
+        assert key_preview("abcdefghij") == "abc...ij"
+        assert key_preview("sk-ant-api03-longkey1234") == "sk-ant...1234"
+
+    def test_get_api_key_from_env(self, monkeypatch):
+        from liteagent.config import get_api_key
+        import liteagent.config as config_mod
+        # No keys.json → should fall back to env
+        monkeypatch.setattr(config_mod, "KEYS_PATH", Path("/nonexistent/keys.json"))
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key-123")
+        key = get_api_key("openai")
+        assert key == "env-key-123"

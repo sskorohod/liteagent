@@ -179,6 +179,7 @@ class LiteAgent:
         """Run agent on user input. Accepts str or list of content blocks (multimodal)."""
         self._current_user_id = user_id
         await self._ensure_mcp_loaded()
+        self._ensure_onboarding_tool()
 
         # Normalize multimodal input
         if isinstance(user_input, list):
@@ -311,6 +312,7 @@ class LiteAgent:
         """Stream agent response token by token."""
         self._current_user_id = user_id
         await self._ensure_mcp_loaded()
+        self._ensure_onboarding_tool()
 
         if self.memory.get_today_cost() >= self.budget_daily:
             yield f"⚠️ Daily budget (${self.budget_daily:.2f}) reached."
@@ -343,13 +345,23 @@ class LiteAgent:
             self.memory.track_usage(user_id, model, response.usage, cost)
 
             if response.stop_reason == "tool_use":
-                # Show tool usage indicator
-                for block in response.content:
-                    if block.type == "tool_use":
-                        yield f"\n🔧 Using {block.name}...\n"
-                tool_results = await self.tools.execute(response.content)
+                # Execute tools one by one with structured events
+                tool_blocks = [b for b in response.content if b.type == "tool_use"]
+                tool_results = []
+                for block in tool_blocks:
+                    # Signal tool start
+                    yield f"\n__TOOL_START__{json.dumps({'name': block.name, 'input': block.input, 'id': block.id})}__TOOL_END__\n"
+                    # Execute and collect result
+                    result = await self.tools.execute_one(block)
+                    tool_results.append(result)
+                    meta = result.get("_meta", {})
+                    # Signal tool result
+                    yield f"\n__TOOL_RESULT__{json.dumps({'name': meta.get('tool_name', block.name), 'id': block.id, 'duration_ms': meta.get('duration_ms', 0), 'error': meta.get('error', False), 'preview': meta.get('result_preview', '')[:300]})}__TOOL_END__\n"
+
+                # Strip _meta before sending to LLM
+                clean_results = [{k: v for k, v in r.items() if k != "_meta"} for r in tool_results]
                 messages.append({"role": "assistant", "content": response.content})
-                messages.append({"role": "user", "content": tool_results})
+                messages.append({"role": "user", "content": clean_results})
                 full_text = ""  # Reset for next iteration
             else:
                 self.memory.add_message(user_id, "user", user_input)
@@ -386,8 +398,25 @@ class LiteAgent:
     # CONTEXT BUILDING
     # ══════════════════════════════════════════
 
+    def _ensure_onboarding_tool(self):
+        """Register/unregister onboarding tool based on state."""
+        from .onboarding import needs_onboarding, register_onboarding_tool, unregister_onboarding_tool
+        if needs_onboarding(self):
+            if "setup_agent" not in self.tools._tools:
+                register_onboarding_tool(self)
+                logger.info("Onboarding tool registered")
+        else:
+            if "setup_agent" in self.tools._tools:
+                unregister_onboarding_tool(self)
+                logger.info("Onboarding tool unregistered")
+
     def _build_system_prompt(self, user_input: str, user_id: str) -> str | list[dict]:
         """Build system prompt with memories + feature injections."""
+        # Onboarding mode — return special prompt
+        from .onboarding import needs_onboarding, ONBOARDING_PROMPT
+        if needs_onboarding(self):
+            return ONBOARDING_PROMPT
+
         # Recall relevant memories
         memories = self.memory.recall(user_input, user_id, top_k=5)
         memory_section = ""
@@ -402,17 +431,19 @@ class LiteAgent:
         dynamic_text = memory_section + feature_section
 
         if self.prompt_caching:
-            return [
+            blocks = [
                 {
                     "type": "text",
                     "text": self._soul_prompt,
                     "cache_control": {"type": "ephemeral"},  # Static part cached
                 },
-                {
+            ]
+            if dynamic_text.strip():
+                blocks.append({
                     "type": "text",
                     "text": dynamic_text,  # Dynamic — not cached
-                },
-            ]
+                })
+            return blocks
         else:
             return self._soul_prompt + dynamic_text
 

@@ -459,14 +459,78 @@ class GeminiProvider:
 
 
 # ══════════════════════════════════════════
+# PROVIDER MODELS CATALOG
+# ══════════════════════════════════════════
+
+PROVIDER_MODELS: dict[str, list[str]] = {
+    "anthropic": [
+        "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
+        "claude-opus-4-20250115",
+    ],
+    "openai": [
+        "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+        "gpt-4.1-nano", "o1", "o3-mini",
+    ],
+    "gemini": [
+        "gemini-2.0-flash", "gemini-2.5-pro", "gemini-2.5-flash",
+    ],
+    "ollama": [
+        "llama3", "mistral", "codellama", "deepseek-coder",
+    ],
+}
+
+
+# ══════════════════════════════════════════
 # FACTORY
 # ══════════════════════════════════════════
 
+def create_test_provider(provider_name: str, api_key: str, base_url: str | None = None):
+    """Create a temporary provider instance for testing connectivity.
+
+    Sets the API key in env temporarily, creates the provider, then restores env.
+    """
+    from .config import PROVIDER_ENV_VARS
+    env_var = PROVIDER_ENV_VARS.get(provider_name)
+
+    old_val = None
+    if env_var:
+        old_val = os.environ.get(env_var)
+        os.environ[env_var] = api_key
+
+    try:
+        if provider_name == "anthropic":
+            return AnthropicProvider()
+        elif provider_name == "openai":
+            return OpenAIProvider(base_url=base_url)
+        elif provider_name == "ollama":
+            return OllamaProvider(base_url=base_url or "http://localhost:11434/v1")
+        elif provider_name == "gemini":
+            return GeminiProvider()
+        else:
+            raise ValueError(f"Unknown provider: {provider_name}")
+    finally:
+        # Restore original env
+        if env_var:
+            if old_val is not None:
+                os.environ[env_var] = old_val
+            elif env_var in os.environ:
+                del os.environ[env_var]
+
+
 def create_provider(config: dict):
     """Create LLM provider from config."""
+    from .config import get_api_key, PROVIDER_ENV_VARS
+
     agent_cfg = config.get("agent", {})
     provider_name = agent_cfg.get("provider", "anthropic")
     providers_cfg = config.get("providers", {})
+
+    # Load key from keys.json into env (always update to pick up latest saved key)
+    env_var = PROVIDER_ENV_VARS.get(provider_name)
+    if env_var:
+        key = get_api_key(provider_name)
+        if key:
+            os.environ[env_var] = key
 
     if provider_name == "anthropic":
         return AnthropicProvider()

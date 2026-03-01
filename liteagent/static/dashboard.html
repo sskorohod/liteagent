@@ -220,6 +220,38 @@ tailwind.config = {
   <!-- Settings Tab -->
   <section id="tab-settings" class="tab-content hidden fade-in">
     <h1 class="text-2xl font-semibold text-white mb-6">Settings</h1>
+
+    <!-- Active Provider Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <h2 class="text-sm font-medium text-muted mb-4">Active Provider</h2>
+      <div class="flex flex-wrap items-end gap-4">
+        <div class="flex-1 min-w-[200px]">
+          <label class="text-xs text-muted block mb-1.5">Provider</label>
+          <select id="active-provider" onchange="onProviderChange()"
+            class="w-full bg-bg border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-accent transition-colors">
+          </select>
+        </div>
+        <div class="flex-1 min-w-[200px]">
+          <label class="text-xs text-muted block mb-1.5">Model</label>
+          <select id="active-model"
+            class="w-full bg-bg border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-accent transition-colors">
+          </select>
+        </div>
+        <button onclick="applyProviderSettings()" class="bg-accent hover:bg-accent-dim text-white px-5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+          Apply
+        </button>
+      </div>
+      <div id="provider-status" class="mt-3 text-xs"></div>
+    </div>
+
+    <!-- API Keys Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <h2 class="text-sm font-medium text-muted mb-4">API Keys</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="keys-grid">
+      </div>
+    </div>
+
+    <!-- Config JSON (read-only) -->
     <div class="bg-bg-card border border-border rounded-xl p-6">
       <h2 class="text-sm font-medium text-muted mb-4">Agent Configuration (read-only)</h2>
       <pre id="config-json" class="text-xs text-zinc-400 bg-bg rounded-lg p-4 overflow-auto max-h-96 border border-border"></pre>
@@ -242,11 +274,15 @@ let chatBusy = false;
 async function api(path, opts = {}) {
   try {
     const res = await fetch(path, opts);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    return await res.json();
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      console.error(`API error (${path}):`, res.status, body);
+      return body || { detail: `HTTP ${res.status} ${res.statusText}` };
+    }
+    return body;
   } catch (e) {
     console.error(`API error (${path}):`, e);
-    return null;
+    return { detail: e.message || 'Network error' };
   }
 }
 
@@ -574,6 +610,8 @@ async function sendChat() {
     const url = `/chat/stream?message=${encodeURIComponent(msg)}&user_id=dashboard-user`;
     const eventSource = new EventSource(url);
 
+    let toolCounter = 0;
+
     eventSource.onmessage = function(event) {
       const data = JSON.parse(event.data);
 
@@ -598,6 +636,73 @@ async function sendChat() {
         return;
       }
 
+      // --- Tool start event ---
+      if (data.tool_start) {
+        const t = data.tool_start;
+        toolCounter++;
+        const toolId = `tool-${msgId}-${toolCounter}`;
+        // Remove typing indicator if still there
+        const typingEl = document.getElementById(typingId);
+        if (typingEl) typingEl.remove();
+        // Render tool card
+        const inputStr = Object.keys(t.input || {}).length > 0
+          ? Object.entries(t.input).map(([k,v]) => `<span class="text-zinc-500">${escapeHtml(k)}:</span> ${escapeHtml(typeof v === 'string' ? (v.length > 80 ? v.slice(0,80)+'...' : v) : JSON.stringify(v).slice(0,80))}`).join(', ')
+          : '<span class="text-zinc-500">no params</span>';
+        container.insertAdjacentHTML('beforeend', `
+          <div class="flex justify-start fade-in" id="${toolId}">
+            <div class="w-full max-w-lg border border-indigo-500/30 bg-indigo-950/20 rounded-lg px-3 py-2 text-xs">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-medium">
+                  <svg class="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" class="opacity-75"></path></svg>
+                  ${escapeHtml(t.name)}
+                </span>
+                <span class="text-zinc-500" id="${toolId}-time">running...</span>
+              </div>
+              <div class="text-zinc-400 truncate">${inputStr}</div>
+              <div id="${toolId}-result" class="hidden mt-2 pt-2 border-t border-indigo-500/10"></div>
+            </div>
+          </div>`);
+        scrollToBottom();
+        return;
+      }
+
+      // --- Tool result event ---
+      if (data.tool_result) {
+        const t = data.tool_result;
+        const toolId = `tool-${msgId}-${toolCounter}`;
+        const timeEl = document.getElementById(`${toolId}-time`);
+        const resultEl = document.getElementById(`${toolId}-result`);
+        const cardEl = document.getElementById(toolId);
+        // Update spinner → status
+        if (cardEl) {
+          const badge = cardEl.querySelector('.animate-spin');
+          if (badge) {
+            badge.classList.remove('animate-spin');
+            badge.outerHTML = t.error
+              ? '<span class="text-red-400">✗</span>'
+              : '<span class="text-emerald-400">✓</span>';
+          }
+        }
+        if (timeEl) timeEl.textContent = `${t.duration_ms}ms`;
+        if (resultEl && t.preview) {
+          resultEl.classList.remove('hidden');
+          const preview = t.preview.length > 200 ? t.preview.slice(0, 200) + '...' : t.preview;
+          resultEl.innerHTML = `
+            <details class="cursor-pointer">
+              <summary class="text-zinc-500 hover:text-zinc-300 transition-colors select-none">
+                ${t.error ? '<span class="text-red-400">Error</span>' : 'Result'} <span class="text-zinc-600">(${t.preview.length} chars)</span>
+              </summary>
+              <pre class="mt-1 p-2 bg-black/30 rounded text-zinc-400 text-xs overflow-x-auto whitespace-pre-wrap max-h-40 overflow-y-auto">${escapeHtml(preview)}</pre>
+            </details>`;
+        }
+        // Reset streamEl so next text creates a new bubble
+        streamEl = null;
+        streamText = '';
+        scrollToBottom();
+        return;
+      }
+
+      // --- Regular text ---
       if (data.text) {
         // Remove typing indicator on first chunk
         const typingEl = document.getElementById(typingId);
@@ -613,6 +718,20 @@ async function sendChat() {
               </div>
             </div>`);
           streamEl = document.getElementById(msgId);
+        }
+
+        // If streamEl was reset after tool call, create new bubble
+        if (!streamEl) {
+          const newId = msgId + '-after-tool-' + toolCounter;
+          container.insertAdjacentHTML('beforeend', `
+            <div class="flex justify-start" id="${newId}">
+              <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
+                <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
+                  onclick="copyMessage(this)">Copy</button>
+                <div class="msg-content"></div>
+              </div>
+            </div>`);
+          streamEl = document.getElementById(newId);
         }
 
         streamText += data.text;
@@ -661,9 +780,162 @@ async function clearChat() {
 // =======================================
 // SETTINGS
 // =======================================
+let providerData = null;
+
 async function loadConfig() {
-  const data = await api('/api/config');
-  document.getElementById('config-json').textContent = data ? JSON.stringify(data, null, 2) : 'Failed to load config';
+  // Load provider settings
+  providerData = await api('/api/settings/providers');
+  if (providerData) renderProviderSettings(providerData);
+
+  // Load config JSON (read-only)
+  const cfg = await api('/api/config');
+  document.getElementById('config-json').textContent = cfg ? JSON.stringify(cfg, null, 2) : 'Failed to load config';
+}
+
+function renderProviderSettings(data) {
+  // Populate provider dropdown
+  const provSelect = document.getElementById('active-provider');
+  const providers = Object.keys(data.providers);
+  provSelect.innerHTML = providers.map(p =>
+    `<option value="${p}" ${p === data.active_provider ? 'selected' : ''}>${providerLabel(p)}</option>`
+  ).join('');
+
+  // Populate model dropdown
+  updateModelDropdown(data.active_provider, data.active_model);
+
+  // Render API key cards
+  const grid = document.getElementById('keys-grid');
+  grid.innerHTML = providers.map(p => {
+    const info = data.providers[p];
+    if (p === 'ollama') {
+      return `
+        <div class="bg-bg border border-border rounded-lg p-4">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-medium text-white">${providerLabel(p)}</span>
+            <span class="text-xs text-emerald-400">Local</span>
+          </div>
+          <div class="text-xs text-muted">No API key needed — runs locally</div>
+          <div class="mt-3 flex gap-2">
+            <button onclick="testProviderKey('${p}', '')" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+              Test
+            </button>
+          </div>
+          <div id="key-status-${p}" class="mt-2 text-xs"></div>
+        </div>`;
+    }
+    return `
+      <div class="bg-bg border border-border rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-sm font-medium text-white">${providerLabel(p)}</span>
+          ${info.has_key ? `<span class="text-xs text-emerald-400">&#10003; Saved</span>` : `<span class="text-xs text-zinc-500">Not set</span>`}
+        </div>
+        <input id="key-input-${p}" type="password" placeholder="${info.has_key ? info.key_preview : 'Enter API key...'}"
+          class="w-full bg-bg-card border border-border rounded-lg px-3 py-2 text-xs text-white placeholder-muted focus:outline-none focus:border-accent transition-colors mb-3">
+        <div class="flex gap-2">
+          <button onclick="saveProviderKey('${p}')" class="text-xs px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/30 text-accent-light hover:bg-accent/30 transition-colors">
+            Save
+          </button>
+          <button onclick="testProviderKey('${p}')" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+            Test
+          </button>
+          ${info.has_key ? `<button onclick="deleteProviderKey('${p}')" class="text-xs px-3 py-1.5 rounded-lg border border-red-400/20 text-red-400 hover:border-red-400/50 transition-colors">
+            Delete
+          </button>` : ''}
+        </div>
+        <div id="key-status-${p}" class="mt-2 text-xs"></div>
+      </div>`;
+  }).join('');
+}
+
+function providerLabel(name) {
+  return { anthropic: 'Anthropic', openai: 'OpenAI', gemini: 'Google Gemini', ollama: 'Ollama (Local)' }[name] || name;
+}
+
+function onProviderChange() {
+  const sel = document.getElementById('active-provider').value;
+  if (providerData) {
+    updateModelDropdown(sel, providerData.providers[sel]?.models?.[0] || '');
+  }
+}
+
+function updateModelDropdown(provider, selectedModel) {
+  if (!providerData) return;
+  const models = providerData.providers[provider]?.models || [];
+  const modelSelect = document.getElementById('active-model');
+  modelSelect.innerHTML = models.map(m =>
+    `<option value="${m}" ${m === selectedModel ? 'selected' : ''}>${m}</option>`
+  ).join('');
+}
+
+async function applyProviderSettings() {
+  const provider = document.getElementById('active-provider').value;
+  const model = document.getElementById('active-model').value;
+  const statusEl = document.getElementById('provider-status');
+  statusEl.innerHTML = '<span class="text-muted">Applying...</span>';
+
+  const res = await api('/api/settings/provider', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, model }),
+  });
+
+  if (res && res.ok) {
+    statusEl.innerHTML = `<span class="text-emerald-400">&#10003; Active: ${providerLabel(provider)} / ${res.model || model}</span>`;
+    setTimeout(() => loadConfig(), 500);
+  } else {
+    const errMsg = res?.detail || 'Failed to apply. Check that the SDK is installed and API key is saved.';
+    statusEl.innerHTML = `<span class="text-red-400">${errMsg}</span>`;
+  }
+}
+
+async function saveProviderKey(name) {
+  const input = document.getElementById('key-input-' + name);
+  const key = input.value.trim();
+  if (!key) return;
+  const statusEl = document.getElementById('key-status-' + name);
+  statusEl.innerHTML = '<span class="text-muted">Saving...</span>';
+
+  const res = await api('/api/settings/provider/key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: name, api_key: key }),
+  });
+
+  if (res && res.ok) {
+    statusEl.innerHTML = '<span class="text-emerald-400">&#10003; Key saved</span>';
+    input.value = '';
+    setTimeout(() => loadConfig(), 1000);
+  } else {
+    statusEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error saving key'}</span>`;
+  }
+}
+
+async function testProviderKey(name, explicitKey) {
+  const statusEl = document.getElementById('key-status-' + name);
+  const input = document.getElementById('key-input-' + name);
+  const key = explicitKey !== undefined ? explicitKey : (input ? input.value.trim() : '');
+  statusEl.innerHTML = '<span class="text-muted">Testing...</span>';
+
+  const res = await api('/api/settings/provider/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: name, api_key: key }),
+  });
+
+  if (res && res.ok) {
+    statusEl.innerHTML = `<span class="text-emerald-400">&#10003; Connected (${res.latency_ms}ms)</span>`;
+  } else {
+    statusEl.innerHTML = `<span class="text-red-400">&#10007; ${res?.error || 'Connection failed'}</span>`;
+  }
+}
+
+async function deleteProviderKey(name) {
+  const statusEl = document.getElementById('key-status-' + name);
+  const res = await api('/api/settings/provider/' + name + '/key', { method: 'DELETE' });
+  if (res && res.ok) {
+    statusEl.innerHTML = '<span class="text-muted">Key deleted</span>';
+    setTimeout(() => loadConfig(), 500);
+  }
 }
 
 // =======================================

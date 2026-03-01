@@ -22,12 +22,18 @@ def mount_dashboard(app, agent):
     STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
 
     @app.get("/", response_class=HTMLResponse)
+    @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard_page():
         """Serve the dashboard SPA."""
         html_path = os.path.join(STATIC_DIR, "dashboard.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Dashboard not found")
         return FileResponse(html_path, media_type="text/html")
+
+    @app.get("/favicon.ico")
+    async def favicon():
+        """Return empty 204 for favicon requests."""
+        return Response(status_code=204)
 
     @app.get("/api/overview")
     async def api_overview():
@@ -252,6 +258,219 @@ def mount_dashboard(app, agent):
             register_synthesized_tool(
                 agent.tools, row[0], row[2], row[1], schema)
         return {"status": "approved", "validation": "ok" if ok else err}
+
+    # ── Provider Settings ─────────────────────
+
+    @app.get("/api/settings/providers")
+    async def api_settings_providers():
+        """Get provider settings with key status and available models."""
+        from ..config import get_api_key, key_preview, PROVIDER_ENV_VARS
+        from ..providers import PROVIDER_MODELS
+
+        agent_cfg = agent.config.get("agent", {})
+        active_provider = agent_cfg.get("provider", "anthropic")
+        active_model = agent_cfg.get("default_model", "claude-sonnet-4-20250514")
+
+        providers = {}
+        for name, models in PROVIDER_MODELS.items():
+            key = get_api_key(name)
+            if name == "ollama":
+                providers[name] = {
+                    "has_key": True,
+                    "key_preview": "(local)",
+                    "models": models,
+                }
+            else:
+                providers[name] = {
+                    "has_key": bool(key),
+                    "key_preview": key_preview(key) if key else "",
+                    "models": models,
+                }
+
+        return {
+            "active_provider": active_provider,
+            "active_model": active_model,
+            "providers": providers,
+        }
+
+    @app.post("/api/settings/provider/key")
+    async def api_settings_save_key(body: dict):
+        """Save an API key for a provider (does NOT switch active provider)."""
+        from ..config import save_provider_key
+        from ..providers import PROVIDER_MODELS
+
+        provider_name = body.get("provider", "").strip()
+        api_key = body.get("api_key", "").strip()
+
+        if not provider_name:
+            raise HTTPException(status_code=400, detail="Provider name required")
+        if provider_name not in PROVIDER_MODELS:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_name}")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key required")
+        if provider_name == "ollama":
+            return {"ok": True, "message": "Ollama doesn't need an API key"}
+
+        # Validate key format
+        _KEY_PREFIXES = {
+            "anthropic": ("sk-ant-", "Anthropic keys start with 'sk-ant-'. Get yours at console.anthropic.com/settings/keys"),
+            "openai": ("sk-", "OpenAI keys start with 'sk-'. Get yours at platform.openai.com/api-keys"),
+        }
+        prefix_info = _KEY_PREFIXES.get(provider_name)
+        if prefix_info:
+            prefix, hint = prefix_info
+            if not api_key.startswith(prefix):
+                logger.warning("Invalid key format for %s: starts with '%s...'", provider_name, api_key[:6])
+                raise HTTPException(status_code=400, detail=f"Invalid key format. {hint}")
+
+        logger.info("Saving API key for provider: %s (key: %s...%s)", provider_name, api_key[:6], api_key[-4:])
+        save_provider_key(provider_name, api_key)
+
+        # If this is the active provider, also update env + recreate provider
+        from ..config import PROVIDER_ENV_VARS
+        import os as _os
+        active_provider = agent.config.get("agent", {}).get("provider", "anthropic")
+        env_var = PROVIDER_ENV_VARS.get(provider_name)
+        if env_var:
+            _os.environ[env_var] = api_key
+            logger.info("Updated env var %s", env_var)
+
+        if provider_name == active_provider:
+            try:
+                from ..providers import create_provider
+                agent.provider = create_provider(agent.config)
+                logger.info("Recreated active provider: %s", provider_name)
+            except Exception as e:
+                logger.warning("Failed to recreate provider: %s", e)
+
+        return {"ok": True, "provider": provider_name}
+
+    @app.post("/api/settings/provider")
+    async def api_settings_apply_provider(body: dict):
+        """Switch active provider and model. Optionally save API key."""
+        from ..config import save_provider_key, get_api_key, PROVIDER_ENV_VARS
+        from ..providers import PROVIDER_MODELS
+        import os as _os
+
+        provider_name = body.get("provider", "").strip()
+        api_key = body.get("api_key", "").strip()
+        model = body.get("model", "").strip()
+
+        if not provider_name:
+            raise HTTPException(status_code=400, detail="Provider name required")
+        if provider_name not in PROVIDER_MODELS:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_name}")
+
+        # Save API key if provided
+        if api_key and provider_name != "ollama":
+            save_provider_key(provider_name, api_key)
+
+        # Ensure API key is available in env
+        if provider_name != "ollama":
+            key = api_key or get_api_key(provider_name)
+            env_var = PROVIDER_ENV_VARS.get(provider_name)
+            if key and env_var:
+                _os.environ[env_var] = key
+            elif not key and provider_name != "ollama":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No API key for {provider_name}. Save a key first.")
+
+        # Check if SDK is installed before switching
+        _SDK_PACKAGES = {
+            "anthropic": "anthropic",
+            "openai": "openai",
+            "gemini": "google.generativeai",
+            "ollama": "openai",
+        }
+        pkg = _SDK_PACKAGES.get(provider_name)
+        if pkg:
+            try:
+                __import__(pkg)
+            except ImportError:
+                pip_extra = {"openai": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"SDK not installed. Run: pip install liteagent[{pip_extra}]")
+
+        # Update config and recreate provider
+        agent.config.setdefault("agent", {})["provider"] = provider_name
+        if model:
+            agent.config["agent"]["default_model"] = model
+
+        try:
+            from ..providers import create_provider
+            agent.provider = create_provider(agent.config)
+            if model:
+                agent.model = model
+            return {"ok": True, "provider": provider_name, "model": model or agent.model}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Provider init failed: {e}")
+
+    @app.post("/api/settings/provider/test")
+    async def api_settings_test_provider(body: dict):
+        """Test provider connectivity with given API key."""
+        import time
+
+        provider_name = body.get("provider", "").strip()
+        api_key = body.get("api_key", "").strip()
+
+        if not provider_name:
+            raise HTTPException(status_code=400, detail="Provider name required")
+
+        # Check SDK first
+        _SDK = {"anthropic": "anthropic", "openai": "openai",
+                "gemini": "google.generativeai", "ollama": "openai"}
+        pkg = _SDK.get(provider_name)
+        if pkg:
+            try:
+                __import__(pkg)
+            except ImportError:
+                pip_extra = {"openai": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
+                return {"ok": False, "error": f"SDK not installed. Run: pip install liteagent[{pip_extra}]"}
+
+        # For Ollama, no key needed
+        if provider_name == "ollama":
+            api_key = "ollama"
+
+        if not api_key:
+            # Try existing key
+            from ..config import get_api_key
+            api_key = get_api_key(provider_name)
+            if not api_key:
+                return {"ok": False, "error": "No API key provided or saved"}
+
+        try:
+            from ..providers import create_test_provider
+            logger.info("Testing %s connectivity (key: %s...)", provider_name, api_key[:8] if api_key else "none")
+            provider = create_test_provider(provider_name, api_key)
+            start = time.time()
+            # Minimal test call
+            test_model = {
+                "anthropic": "claude-haiku-4-5-20251001",
+                "openai": "gpt-4o-mini",
+                "gemini": "gemini-2.0-flash",
+                "ollama": "llama3",
+            }.get(provider_name, "gpt-4o-mini")
+
+            await provider.complete(
+                model=test_model, max_tokens=5,
+                messages=[{"role": "user", "content": [{"type": "text", "text": "Hi"}]}])
+            latency_ms = int((time.time() - start) * 1000)
+            logger.info("Test %s OK (%dms)", provider_name, latency_ms)
+            return {"ok": True, "latency_ms": latency_ms}
+        except Exception as e:
+            logger.warning("Test %s FAILED: %s", provider_name, e)
+            return {"ok": False, "error": str(e)}
+
+    @app.delete("/api/settings/provider/{name}/key")
+    async def api_settings_delete_key(name: str):
+        """Delete a saved provider API key."""
+        from ..config import delete_provider_key
+        deleted = delete_provider_key(name)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="No saved key found")
+        return {"ok": True}
 
     # ── RAG Document Management ─────────────
 

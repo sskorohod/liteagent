@@ -153,6 +153,42 @@ class ToolRegistry:
             })
         return results
 
+    async def execute_one(self, block) -> dict:
+        """Execute a single tool call and return result with metadata."""
+        import time
+        handler = self._handlers.get(block.name)
+        start = time.time()
+        error = False
+        if not handler:
+            result = f"Error: unknown tool '{block.name}'"
+            error = True
+        else:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    result = await handler(**block.input)
+                else:
+                    result = handler(**block.input)
+                if not isinstance(result, str):
+                    result = json.dumps(result, ensure_ascii=False, default=str)
+            except Exception as e:
+                result = f"Error executing {block.name}: {e}"
+                error = True
+
+        duration_ms = int((time.time() - start) * 1000)
+        content = str(result)[:10000]
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": content,
+            "_meta": {
+                "tool_name": block.name,
+                "tool_input": block.input,
+                "duration_ms": duration_ms,
+                "error": error,
+                "result_preview": content[:300],
+            },
+        }
+
     def has_tool(self, name: str) -> bool:
         return name in self._handlers
 

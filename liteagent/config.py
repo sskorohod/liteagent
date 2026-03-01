@@ -3,10 +3,80 @@
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════
+# PROVIDER KEY MANAGEMENT
+# ══════════════════════════════════════════
+
+KEYS_DIR = Path.home() / ".liteagent"
+KEYS_PATH = KEYS_DIR / "keys.json"
+
+# Env var name per provider
+PROVIDER_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+    "ollama": None,  # No key needed
+}
+
+
+def load_provider_keys() -> dict[str, str]:
+    """Load API keys from ~/.liteagent/keys.json."""
+    if KEYS_PATH.exists():
+        try:
+            return json.loads(KEYS_PATH.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load keys.json: %s", e)
+    return {}
+
+
+def save_provider_key(provider: str, key: str) -> None:
+    """Save API key to ~/.liteagent/keys.json with chmod 600."""
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    keys = load_provider_keys()
+    keys[provider] = key
+    KEYS_PATH.write_text(json.dumps(keys, indent=2))
+    try:
+        os.chmod(KEYS_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except OSError:
+        pass  # Windows doesn't support chmod
+
+
+def delete_provider_key(provider: str) -> bool:
+    """Remove API key from keys.json. Returns True if key existed."""
+    keys = load_provider_keys()
+    if provider in keys:
+        del keys[provider]
+        KEYS_PATH.write_text(json.dumps(keys, indent=2))
+        return True
+    return False
+
+
+def get_api_key(provider: str) -> str | None:
+    """Get API key: first from keys.json, then from env var."""
+    # 1. Check keys.json
+    keys = load_provider_keys()
+    if provider in keys and keys[provider]:
+        return keys[provider]
+    # 2. Check env var
+    env_var = PROVIDER_ENV_VARS.get(provider)
+    if env_var:
+        return os.environ.get(env_var)
+    return None
+
+
+def key_preview(key: str) -> str:
+    """Return masked preview of API key: first 6 + last 4 chars."""
+    if not key:
+        return ""
+    if len(key) <= 12:
+        return key[:3] + "..." + key[-2:]
+    return key[:6] + "..." + key[-4:]
 
 
 DEFAULT_CONFIG_PATHS = [
@@ -59,6 +129,24 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     return config
+
+
+# ══════════════════════════════════════════
+# CONFIG WRITING
+# ══════════════════════════════════════════
+
+DEFAULT_CONFIG_WRITE_PATH = Path("config.json")
+
+
+def save_config(config: dict, config_path: str | None = None):
+    """Write config dict back to config.json."""
+    path = Path(config_path) if config_path else DEFAULT_CONFIG_WRITE_PATH
+    # Don't write internal/transient keys
+    _SKIP_KEYS = {"_resolved"}
+    clean = {k: v for k, v in config.items() if k not in _SKIP_KEYS}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False)
+    logger.info("Config saved to %s", path)
 
 
 _KNOWN_TOP_KEYS = {"agent", "memory", "tools", "channels", "cost", "providers", "logging",

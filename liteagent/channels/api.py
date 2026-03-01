@@ -77,11 +77,52 @@ def create_app(agent):
     @app.get("/chat/stream")
     async def chat_stream(message: str, user_id: str = "dashboard-user"):
         """SSE streaming endpoint for real-time chat."""
+        import re
+        _TOOL_START_RE = re.compile(r'__TOOL_START__(.+?)__TOOL_END__')
+        _TOOL_RESULT_RE = re.compile(r'__TOOL_RESULT__(.+?)__TOOL_END__')
+
         async def event_generator():
             try:
+                buffer = ""
                 async for chunk in agent.stream(message, user_id):
-                    data = json.dumps({"text": chunk})
-                    yield f"data: {data}\n\n"
+                    buffer += chunk
+                    # Check for tool markers in buffer
+                    while True:
+                        # Tool start event
+                        m = _TOOL_START_RE.search(buffer)
+                        if m:
+                            # Send any text before the marker
+                            pre = buffer[:m.start()].strip()
+                            if pre:
+                                yield f"data: {json.dumps({'text': pre})}\n\n"
+                            # Send structured tool_start event
+                            tool_data = json.loads(m.group(1))
+                            yield f"data: {json.dumps({'tool_start': tool_data})}\n\n"
+                            buffer = buffer[m.end():]
+                            continue
+
+                        # Tool result event
+                        m = _TOOL_RESULT_RE.search(buffer)
+                        if m:
+                            pre = buffer[:m.start()].strip()
+                            if pre:
+                                yield f"data: {json.dumps({'text': pre})}\n\n"
+                            tool_data = json.loads(m.group(1))
+                            yield f"data: {json.dumps({'tool_result': tool_data})}\n\n"
+                            buffer = buffer[m.end():]
+                            continue
+
+                        break
+
+                    # Flush text that definitely doesn't contain markers
+                    # Keep potential partial markers in buffer
+                    if "__TOOL" not in buffer and buffer:
+                        yield f"data: {json.dumps({'text': buffer})}\n\n"
+                        buffer = ""
+
+                # Flush remaining buffer
+                if buffer.strip():
+                    yield f"data: {json.dumps({'text': buffer})}\n\n"
                 yield f"data: {json.dumps({'done': True})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
