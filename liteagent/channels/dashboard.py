@@ -371,20 +371,26 @@ def mount_dashboard(app, agent):
     async def api_settings_providers():
         """Get provider settings with key status and available models."""
         from ..config import get_api_key, key_preview, PROVIDER_ENV_VARS
-        from ..providers import PROVIDER_MODELS
+        from ..providers import PROVIDER_MODELS, refresh_ollama_models, is_ollama_available
 
         agent_cfg = agent.config.get("agent", {})
         active_provider = agent_cfg.get("provider", "anthropic")
         active_model = agent_cfg.get("default_model", "claude-sonnet-4-20250514")
+
+        # Auto-discover Ollama models from local instance
+        ollama_running = is_ollama_available()
+        if ollama_running:
+            refresh_ollama_models()
 
         providers = {}
         for name, models in PROVIDER_MODELS.items():
             key = get_api_key(name)
             if name == "ollama":
                 providers[name] = {
-                    "has_key": True,
-                    "key_preview": "(local)",
+                    "has_key": ollama_running,
+                    "key_preview": "(running)" if ollama_running else "(not running)",
                     "models": models,
+                    "local": True,
                 }
             else:
                 providers[name] = {
@@ -551,13 +557,18 @@ def mount_dashboard(app, agent):
             logger.info("Testing %s connectivity (key: %s...)", provider_name, api_key[:8] if api_key else "none")
             provider = create_test_provider(provider_name, api_key)
             start = time.time()
-            # Minimal test call
-            test_model = {
+            # Minimal test call — for Ollama use first available model
+            from ..providers import PROVIDER_MODELS
+            _default_test_models = {
                 "anthropic": "claude-haiku-4-5-20251001",
                 "openai": "gpt-4o-mini",
                 "gemini": "gemini-2.0-flash",
-                "ollama": "llama3",
-            }.get(provider_name, "gpt-4o-mini")
+            }
+            if provider_name == "ollama":
+                ollama_models = PROVIDER_MODELS.get("ollama", [])
+                test_model = ollama_models[0] if ollama_models else "llama3.1"
+            else:
+                test_model = _default_test_models.get(provider_name, "gpt-4o-mini")
 
             await provider.complete(
                 model=test_model, max_tokens=5,
@@ -576,6 +587,85 @@ def mount_dashboard(app, agent):
         deleted = delete_provider_key(name)
         if not deleted:
             raise HTTPException(status_code=404, detail="No saved key found")
+        return {"ok": True}
+
+    # ── Telegram Settings ───────────────────
+
+    @app.get("/api/settings/telegram")
+    async def api_settings_telegram():
+        """Get Telegram bot configuration status."""
+        from ..config import get_api_key, key_preview
+        tg_cfg = agent.config.get("channels", {}).get("telegram", {})
+        token = tg_cfg.get("token") or get_api_key("telegram")
+        return {
+            "configured": bool(token),
+            "token_preview": key_preview(token) if token else "",
+            "mode": tg_cfg.get("mode", "polling"),
+            "webhook_url": tg_cfg.get("webhook_url", ""),
+        }
+
+    @app.post("/api/settings/telegram")
+    async def api_settings_telegram_save(body: dict):
+        """Save Telegram bot token."""
+        from ..config import save_provider_key, key_preview
+        token = body.get("token", "").strip()
+        mode = body.get("mode", "polling").strip()
+
+        if not token:
+            raise HTTPException(status_code=400, detail="Token required")
+        if not token.count(":") == 1 or not token.split(":")[0].isdigit():
+            raise HTTPException(status_code=400,
+                detail="Invalid token format. Get it from @BotFather in Telegram")
+
+        # Save token to keys.json under "telegram" key
+        save_provider_key("telegram", token)
+
+        # Update runtime config
+        agent.config.setdefault("channels", {}).setdefault("telegram", {})
+        agent.config["channels"]["telegram"]["token"] = token
+        agent.config["channels"]["telegram"]["mode"] = mode
+        logger.info("Telegram token saved (mode: %s)", mode)
+
+        return {"ok": True, "token_preview": key_preview(token)}
+
+    @app.post("/api/settings/telegram/test")
+    async def api_settings_telegram_test(body: dict):
+        """Test Telegram bot token validity."""
+        from ..config import get_api_key
+        import urllib.request
+
+        token = body.get("token", "").strip()
+        if not token:
+            token = agent.config.get("channels", {}).get("telegram", {}).get("token")
+        if not token:
+            token = get_api_key("telegram")
+        if not token:
+            return {"ok": False, "error": "No token provided or saved"}
+
+        try:
+            url = f"https://api.telegram.org/bot{token}/getMe"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if data.get("ok"):
+                bot = data["result"]
+                return {
+                    "ok": True,
+                    "bot_name": bot.get("first_name", ""),
+                    "bot_username": bot.get("username", ""),
+                }
+            return {"ok": False, "error": data.get("description", "Unknown error")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.delete("/api/settings/telegram")
+    async def api_settings_telegram_delete():
+        """Remove saved Telegram token."""
+        from ..config import delete_provider_key
+        deleted = delete_provider_key("telegram")
+        agent.config.get("channels", {}).get("telegram", {}).pop("token", None)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="No token saved")
         return {"ok": True}
 
     # ── RAG Document Management ─────────────

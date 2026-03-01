@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -474,10 +475,40 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "gemini": [
         "gemini-2.0-flash", "gemini-2.5-pro", "gemini-2.5-flash",
     ],
-    "ollama": [
-        "llama3", "mistral", "codellama", "deepseek-coder",
-    ],
+    "ollama": [],  # Populated dynamically by discover_ollama_models()
 }
+
+
+def discover_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
+    """Query local Ollama instance for available models. Returns model names."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        models = [m["name"] for m in data.get("models", [])]
+        logger.info("Discovered %d Ollama models: %s", len(models), models)
+        return models
+    except Exception as e:
+        logger.debug("Ollama not available: %s", e)
+        return []
+
+
+def is_ollama_available(base_url: str = "http://localhost:11434") -> bool:
+    """Check if Ollama is running locally."""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{base_url}/api/tags", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def refresh_ollama_models(base_url: str = "http://localhost:11434"):
+    """Refresh the PROVIDER_MODELS['ollama'] list from local instance."""
+    models = discover_ollama_models(base_url)
+    PROVIDER_MODELS["ollama"] = models
+    return models
 
 
 # ══════════════════════════════════════════
@@ -543,8 +574,11 @@ def create_provider(config: dict):
 
     elif provider_name == "ollama":
         pcfg = providers_cfg.get("ollama", {})
-        return OllamaProvider(
-            base_url=pcfg.get("base_url", "http://localhost:11434/v1"))
+        base = pcfg.get("base_url", "http://localhost:11434/v1")
+        # Auto-discover available models
+        api_base = base.replace("/v1", "") if base.endswith("/v1") else base
+        refresh_ollama_models(api_base)
+        return OllamaProvider(base_url=base)
 
     elif provider_name == "gemini":
         pcfg = providers_cfg.get("gemini", {})

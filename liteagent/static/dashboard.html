@@ -287,6 +287,36 @@ tailwind.config = {
       </div>
     </div>
 
+    <!-- Telegram Bot Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-medium text-muted">Telegram Bot</h2>
+        <span id="tg-status-badge" class="text-[10px] px-2 py-0.5 rounded-full border"></span>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs text-muted block mb-1.5">Bot Token <span class="text-zinc-600">(from @BotFather)</span></label>
+          <div class="flex gap-2">
+            <input id="tg-token" type="password" placeholder="123456789:ABCdefGHI..."
+              class="flex-1 bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+            <button onclick="testTelegram()" class="text-xs px-3 py-2 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+              Test
+            </button>
+            <button onclick="saveTelegram()" class="text-xs px-3 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
+              Save
+            </button>
+          </div>
+        </div>
+        <div id="tg-result" class="text-xs"></div>
+        <div class="text-xs text-zinc-600">
+          1. Open <a href="https://t.me/BotFather" target="_blank" class="text-accent hover:underline">@BotFather</a> in Telegram
+          2. Send <code class="bg-bg px-1 py-0.5 rounded">/newbot</code>
+          3. Paste the token above
+          4. Run: <code class="bg-bg px-1 py-0.5 rounded">python -m liteagent --channel telegram</code>
+        </div>
+      </div>
+    </div>
+
     <!-- Config JSON (read-only) -->
     <div class="bg-bg-card border border-border rounded-xl p-6">
       <h2 class="text-sm font-medium text-muted mb-4">Agent Configuration (read-only)</h2>
@@ -891,6 +921,9 @@ async function loadConfig() {
   providerData = await api('/api/settings/providers');
   if (providerData) renderProviderSettings(providerData);
 
+  // Load Telegram settings
+  loadTelegramStatus();
+
   // Load config JSON (read-only)
   const cfg = await api('/api/config');
   document.getElementById('config-json').textContent = cfg ? JSON.stringify(cfg, null, 2) : 'Failed to load config';
@@ -912,13 +945,15 @@ function renderProviderSettings(data) {
   grid.innerHTML = providers.map(p => {
     const info = data.providers[p];
     if (p === 'ollama') {
+      const ollamaRunning = info.has_key;
+      const modelCount = info.models?.length || 0;
       return `
         <div class="bg-bg border border-border rounded-lg p-4">
           <div class="flex items-center justify-between mb-3">
             <span class="text-sm font-medium text-white">${providerLabel(p)}</span>
-            <span class="text-xs text-emerald-400">Local</span>
+            <span class="text-xs ${ollamaRunning ? 'text-emerald-400' : 'text-zinc-500'}">${ollamaRunning ? 'Running' : 'Not running'}</span>
           </div>
-          <div class="text-xs text-muted">No API key needed — runs locally</div>
+          <div class="text-xs text-muted">${ollamaRunning ? `${modelCount} model${modelCount !== 1 ? 's' : ''} available: ${info.models.join(', ')}` : 'Install: <a href="https://ollama.com" target="_blank" class="text-accent hover:underline">ollama.com</a>'}</div>
           <div class="mt-3 flex gap-2">
             <button onclick="testProviderKey('${p}', '')" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
               Test
@@ -1039,6 +1074,62 @@ async function deleteProviderKey(name) {
   if (res && res.ok) {
     statusEl.innerHTML = '<span class="text-muted">Key deleted</span>';
     setTimeout(() => loadConfig(), 500);
+  }
+}
+
+// =======================================
+// TELEGRAM
+// =======================================
+async function loadTelegramStatus() {
+  const data = await api('/api/settings/telegram');
+  const badge = document.getElementById('tg-status-badge');
+  if (!data) return;
+  if (data.configured) {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+    badge.textContent = 'Configured';
+    document.getElementById('tg-token').placeholder = data.token_preview || 'Token saved';
+  } else {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-zinc-500/15 text-zinc-400 border-zinc-500/30';
+    badge.textContent = 'Not configured';
+  }
+}
+
+async function saveTelegram() {
+  const token = document.getElementById('tg-token').value.trim();
+  const resultEl = document.getElementById('tg-result');
+  if (!token) { resultEl.innerHTML = '<span class="text-red-400">Enter a token</span>'; return; }
+  resultEl.innerHTML = '<span class="text-muted">Saving...</span>';
+
+  const res = await api('/api/settings/telegram', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token}),
+  });
+
+  if (res && res.ok) {
+    resultEl.innerHTML = `<span class="text-emerald-400">Token saved (${res.token_preview})</span>`;
+    document.getElementById('tg-token').value = '';
+    loadTelegramStatus();
+  } else {
+    resultEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error saving token'}</span>`;
+  }
+}
+
+async function testTelegram() {
+  const token = document.getElementById('tg-token').value.trim();
+  const resultEl = document.getElementById('tg-result');
+  resultEl.innerHTML = '<span class="text-muted">Testing...</span>';
+
+  const res = await api('/api/settings/telegram/test', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token}),
+  });
+
+  if (res && res.ok) {
+    resultEl.innerHTML = `<span class="text-emerald-400">Bot: @${res.bot_username} (${res.bot_name})</span>`;
+  } else {
+    resultEl.innerHTML = `<span class="text-red-400">${res?.error || 'Connection failed'}</span>`;
   }
 }
 

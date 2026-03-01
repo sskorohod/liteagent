@@ -284,11 +284,14 @@ class TestProviderSettings:
             assert len(info["models"]) > 0
             assert "has_key" in info
 
-    def test_ollama_always_has_key(self, client):
+    def test_ollama_status(self, client):
         c, _ = client
         data = c.get("/api/settings/providers").json()
-        assert data["providers"]["ollama"]["has_key"] is True
-        assert data["providers"]["ollama"]["key_preview"] == "(local)"
+        ollama = data["providers"]["ollama"]
+        # Ollama status depends on whether it's running locally
+        assert "has_key" in ollama
+        assert ollama["key_preview"] in ("(running)", "(not running)")
+        assert isinstance(ollama["models"], list)
 
     def test_save_key_missing_name(self, client):
         c, _ = client
