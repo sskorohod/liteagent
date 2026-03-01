@@ -95,7 +95,7 @@ async def run_counterfactual_replay(provider, db, memory_system,
             data = json.loads(text)
             lesson = data.get("lesson", "")
             if lesson and len(lesson) > 10:
-                memory_system.remember(
+                await memory_system.remember(
                     f"[lesson] {lesson}", user_id, "lesson", 0.9)
                 lessons_count += 1
         except Exception as e:
@@ -160,7 +160,7 @@ async def run_dream_cycle(provider, db, memory_system, config: dict) -> dict:
                         f"DELETE FROM memories WHERE id IN ({placeholders})",
                         cluster_ids)
                     db.commit()
-                    memory_system.remember(
+                    await memory_system.remember(
                         merged, user_id, "consolidated",
                         min(max_imp + 0.1, 1.0))
                     stats["merged"] += 1

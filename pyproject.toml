@@ -1,7 +1,7 @@
 [project]
 name = "liteagent"
 version = "1.0.0"
-description = "Ultra-lightweight AI agent with smart memory, 8 metacognition features, and token optimization"
+description = "Ultra-lightweight AI agent with smart memory, 11 metacognition features, and token optimization"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

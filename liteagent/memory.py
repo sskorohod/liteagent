@@ -7,11 +7,18 @@ import os
 import pickle
 import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Contradiction indicator words (EN + RU)
+_CONTRADICTION_WORDS = {
+    "not", "no", "never", "isn't", "aren't", "wasn't", "weren't", "don't",
+    "doesn't", "didn't", "can't", "won't", "shouldn't", "couldn't",
+    "не", "нет", "никогда", "ни", "без",
+}
 
 
 class MemorySystem:
@@ -141,6 +148,11 @@ class MemorySystem:
             self.db.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Add archived_at column if missing (memory conflict resolution)
+        try:
+            self.db.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self.db.commit()
 
     def _init_embedder(self):
@@ -258,7 +270,7 @@ class MemorySystem:
         """Find relevant memories using embeddings (if available) or keyword matching."""
         rows = self.db.execute(
             """SELECT content, type, importance, created_at, embedding
-               FROM memories WHERE user_id = ?
+               FROM memories WHERE user_id = ? AND archived_at IS NULL
                ORDER BY importance DESC, created_at DESC
                LIMIT 50""",
             (user_id,)).fetchall()
@@ -306,9 +318,9 @@ class MemorySystem:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
 
-    def remember(self, content: str, user_id: str,
-                 memory_type: str = "fact", importance: float = 0.5):
-        """Store a new memory with deduplication and optional embedding."""
+    async def remember(self, content: str, user_id: str,
+                       memory_type: str = "fact", importance: float = 0.5):
+        """Store a new memory with deduplication, conflict detection, and optional embedding."""
         content_hash = hashlib.md5(content.lower().strip().encode()).hexdigest()
 
         # Dedup by hash
@@ -321,6 +333,21 @@ class MemorySystem:
                 (datetime.now().isoformat(), existing[0]))
             self.db.commit()
             return
+
+        # Conflict detection (if enabled)
+        mcd_cfg = self._features_config.get("memory_conflict_detection", {})
+        if mcd_cfg.get("enabled", False):
+            conflicts = self.detect_memory_conflicts(
+                content, user_id, memory_type,
+                threshold=mcd_cfg.get("similarity_threshold", 0.75))
+            if conflicts and mcd_cfg.get("auto_resolve", True):
+                for conflict in conflicts:
+                    action = await self.resolve_memory_conflict(
+                        content, conflict["existing"], user_id)
+                    self._apply_conflict_resolution(
+                        action, content, conflict["existing"],
+                        user_id, memory_type, importance)
+                return  # Resolution handles storage
 
         embedding = self._embed(content)
         self.db.execute(
@@ -346,6 +373,191 @@ class MemorySystem:
             "DELETE FROM memories WHERE user_id=? AND content LIKE ?",
             (user_id, f"%{content_fragment}%"))
         self.db.commit()
+
+    # ══════════════════════════════════════════
+    # MEMORY CONFLICT DETECTION & RESOLUTION
+    # ══════════════════════════════════════════
+
+    def detect_memory_conflicts(self, content: str, user_id: str,
+                                memory_type: str = "fact",
+                                threshold: float = 0.75) -> list[dict]:
+        """Find existing memories that may conflict with new content.
+
+        Returns list of {"existing": {id, content, type}, "similarity": float, "conflict_type": str}.
+        """
+        rows = self.db.execute(
+            """SELECT id, content, type, embedding
+               FROM memories WHERE user_id = ? AND archived_at IS NULL
+               ORDER BY created_at DESC LIMIT 100""",
+            (user_id,)).fetchall()
+
+        if not rows:
+            return []
+
+        new_embedding = None
+        if self._embedder is not None:
+            new_embedding = self._embedder.encode(content)
+
+        new_words = set(content.lower().split())
+        conflicts = []
+
+        for mem_id, mem_content, mem_type, emb_blob in rows:
+            # Compute semantic similarity
+            similarity = 0.0
+            if new_embedding is not None and emb_blob:
+                try:
+                    existing_emb = pickle.loads(emb_blob)
+                    similarity = self._cosine_similarity(new_embedding, existing_emb)
+                except Exception:
+                    pass
+            else:
+                # Keyword fallback
+                mem_words = set(mem_content.lower().split())
+                overlap = len(new_words & mem_words)
+                similarity = overlap / max(len(new_words | mem_words), 1)
+
+            if similarity < threshold:
+                continue
+
+            # Check for contradiction indicators
+            conflict_type = self._detect_contradiction_type(content, mem_content)
+            if conflict_type:
+                conflicts.append({
+                    "existing": {"id": mem_id, "content": mem_content, "type": mem_type},
+                    "similarity": similarity,
+                    "conflict_type": conflict_type,
+                })
+
+        return conflicts
+
+    @staticmethod
+    def _detect_contradiction_type(new_content: str, old_content: str) -> str | None:
+        """Detect if two similar memories contradict each other.
+
+        Returns conflict type string or None if no contradiction detected.
+        """
+        new_lower = new_content.lower()
+        old_lower = old_content.lower()
+
+        # Check for negation words in either
+        new_has_neg = any(w in new_lower.split() for w in _CONTRADICTION_WORDS)
+        old_has_neg = any(w in old_lower.split() for w in _CONTRADICTION_WORDS)
+
+        if new_has_neg != old_has_neg:
+            return "negation"
+
+        # Check for value replacement patterns
+        # e.g., "works at Google" vs "works at Apple"
+        new_words = set(new_lower.split())
+        old_words = set(old_lower.split())
+        common = new_words & old_words
+        diff_new = new_words - old_words
+        diff_old = old_words - new_words
+
+        # If they share many words but differ in key content → replacement
+        if len(common) >= 2 and diff_new and diff_old:
+            common_ratio = len(common) / max(len(new_words | old_words), 1)
+            if common_ratio >= 0.4:
+                return "replacement"
+
+        return None
+
+    async def resolve_memory_conflict(self, new_content: str,
+                                       existing: dict,
+                                       user_id: str) -> str:
+        """Use LLM to decide how to resolve a memory conflict.
+
+        Returns action: "replace" | "merge" | "archive_old" | "keep_both".
+        """
+        if not self.provider:
+            return "keep_both"
+
+        prompt = (
+            "Two memories about the same user may conflict. Decide the best action.\n\n"
+            f"EXISTING memory: {existing['content']}\n"
+            f"NEW memory: {new_content}\n\n"
+            "Choose ONE action:\n"
+            "- replace: the new memory replaces the old (old is outdated)\n"
+            "- merge: combine both into a single updated memory\n"
+            "- archive_old: keep both but mark old as archived\n"
+            "- keep_both: they don't actually conflict, keep both active\n\n"
+            "Return ONLY the action word, nothing else."
+        )
+
+        try:
+            model = self.config.get("extraction_model", "claude-haiku-4-5-20251001")
+            result = await self.provider.complete(
+                model=model,
+                max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            action = result.content[0].text.strip().lower()
+            if action in ("replace", "merge", "archive_old", "keep_both"):
+                logger.info("Memory conflict resolved: %s (old: '%s...', new: '%s...')",
+                            action, existing['content'][:40], new_content[:40])
+                return action
+        except Exception as e:
+            logger.warning("Memory conflict resolution failed: %s", e)
+
+        return "keep_both"  # Safe default
+
+    def _apply_conflict_resolution(self, action: str, new_content: str,
+                                    existing: dict, user_id: str,
+                                    memory_type: str = "fact",
+                                    importance: float = 0.5):
+        """Apply the chosen conflict resolution action."""
+        now = datetime.now().isoformat()
+        new_hash = hashlib.md5(new_content.lower().strip().encode()).hexdigest()
+        embedding = self._embed(new_content)
+
+        if action == "replace":
+            # Update existing memory with new content
+            self.db.execute(
+                """UPDATE memories SET content=?, hash=?, embedding=?,
+                   accessed_at=?, importance=? WHERE id=?""",
+                (new_content, new_hash, embedding, now, importance, existing["id"]))
+
+        elif action == "archive_old":
+            # Archive old memory, insert new
+            self.db.execute(
+                "UPDATE memories SET archived_at=? WHERE id=?",
+                (now, existing["id"]))
+            self.db.execute(
+                """INSERT INTO memories (user_id, content, type, importance, hash,
+                   created_at, accessed_at, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, new_content, memory_type, importance, new_hash,
+                 now, now, embedding))
+
+        elif action == "merge":
+            # Merge: combine both contents
+            merged = f"{existing['content']} [updated: {new_content}]"
+            merged_hash = hashlib.md5(merged.lower().strip().encode()).hexdigest()
+            merged_emb = self._embed(merged)
+            self.db.execute(
+                """UPDATE memories SET content=?, hash=?, embedding=?,
+                   accessed_at=?, importance=MIN(importance+0.1, 1.0) WHERE id=?""",
+                (merged, merged_hash, merged_emb, now, existing["id"]))
+
+        else:  # keep_both
+            self.db.execute(
+                """INSERT INTO memories (user_id, content, type, importance, hash,
+                   created_at, accessed_at, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, new_content, memory_type, importance, new_hash,
+                 now, now, embedding))
+
+        self.db.commit()
+
+    def get_archived_memories(self, user_id: str, limit: int = 20) -> list[dict]:
+        """Get recently archived memories (for /conflicts command)."""
+        rows = self.db.execute(
+            """SELECT id, content, type, archived_at
+               FROM memories WHERE user_id = ? AND archived_at IS NOT NULL
+               ORDER BY archived_at DESC LIMIT ?""",
+            (user_id, limit)).fetchall()
+        return [{"id": r[0], "content": r[1], "type": r[2], "archived_at": r[3]}
+                for r in rows]
 
     # ══════════════════════════════════════════
     # L4: KNOWLEDGE EXTRACTOR
@@ -388,13 +600,13 @@ class MemorySystem:
 
             for fact in data.get("facts", []):
                 if len(fact) > 10:  # Skip trivial
-                    self.remember(fact, user_id, "fact", 0.6)
+                    await self.remember(fact, user_id, "fact", 0.6)
             for pref in data.get("preferences", []):
                 if len(pref) > 10:
-                    self.remember(pref, user_id, "preference", 0.8)
+                    await self.remember(pref, user_id, "preference", 0.8)
             for correction in data.get("corrections", []):
                 if len(correction) > 10:
-                    self.remember(correction, user_id, "correction", 0.9)
+                    await self.remember(correction, user_id, "correction", 0.9)
 
             # Update session summary for context compression
             summary_update = data.get("session_summary", "")
@@ -537,7 +749,6 @@ class MemorySystem:
     def prune_old_memories(self, days: int = 90, min_importance: float = 0.3) -> int:
         """Delete memories older than `days` with importance below threshold.
         Returns number of deleted rows."""
-        from datetime import timedelta
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         cur = self.db.execute(
             "DELETE FROM memories WHERE accessed_at < ? AND importance < ?",

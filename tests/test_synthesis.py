@@ -1,14 +1,16 @@
-"""Tests for synthesis module: tool validation, skill crystallization."""
+"""Tests for synthesis module: tool validation, skill crystallization, cross-session patterns."""
 
 import json
 import sqlite3
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 from liteagent.synthesis import (
     validate_tool_source, detect_skill, _templatize_params,
     store_skill, find_matching_skills, format_skill_suggestion,
     load_synthesized_tools, register_synthesized_tool,
+    detect_repeated_patterns, propose_tool_from_pattern,
 )
 
 
@@ -33,6 +35,17 @@ def synth_db(tmp_path):
             steps_json TEXT NOT NULL,
             trigger_pattern TEXT,
             use_count INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+        CREATE TABLE interaction_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_input TEXT,
+            agent_response TEXT,
+            tool_calls_json TEXT,
+            success INTEGER DEFAULT 1,
+            confidence REAL,
+            model_used TEXT,
             created_at TEXT
         );
     """)
@@ -237,3 +250,137 @@ class TestSkillCrystallization:
         text = format_skill_suggestion(skills)
         assert "test_skill" in text
         assert "a -> b" in text
+
+
+class TestCrossSessionPatterns:
+    """Cross-session pattern detection and tool proposal."""
+
+    def _insert_interactions(self, db, user_id, tool_sequences, days_ago=0):
+        """Insert interaction_log rows with given tool sequences."""
+        ts = (datetime.now() - timedelta(days=days_ago)).isoformat()
+        for seq in tool_sequences:
+            calls = [{"name": t, "input": {"arg": f"val_{t}"}} for t in seq]
+            db.execute(
+                """INSERT INTO interaction_log
+                   (user_id, user_input, agent_response, tool_calls_json, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, "test input", "test response",
+                 json.dumps(calls), ts))
+        db.commit()
+
+    def test_detect_patterns_sufficient_data(self, synth_db):
+        """Should find pattern when sequence appears >= min_occurrences."""
+        sequences = [
+            ["read_file", "write_file", "exec_command"],
+            ["read_file", "write_file", "exec_command"],
+            ["read_file", "write_file", "exec_command"],
+        ]
+        self._insert_interactions(synth_db, "u1", sequences)
+
+        patterns = detect_repeated_patterns(synth_db, "u1", min_occurrences=3)
+        assert len(patterns) >= 1
+        # Should find at least the 2-tool or 3-tool subsequence
+        found_tools = set()
+        for p in patterns:
+            found_tools.update(p["sequence"])
+        assert "read_file" in found_tools
+
+    def test_detect_patterns_insufficient_data(self, synth_db):
+        """Should return empty when not enough occurrences."""
+        sequences = [["read_file", "write_file"]]
+        self._insert_interactions(synth_db, "u1", sequences)
+
+        patterns = detect_repeated_patterns(synth_db, "u1", min_occurrences=3)
+        assert patterns == []
+
+    def test_detect_patterns_empty_db(self, synth_db):
+        patterns = detect_repeated_patterns(synth_db, "u1")
+        assert patterns == []
+
+    def test_detect_patterns_respects_lookback(self, synth_db):
+        """Patterns older than lookback_days should be ignored."""
+        sequences = [
+            ["read_file", "write_file"],
+            ["read_file", "write_file"],
+            ["read_file", "write_file"],
+        ]
+        self._insert_interactions(synth_db, "u1", sequences, days_ago=60)
+
+        patterns = detect_repeated_patterns(
+            synth_db, "u1", min_occurrences=3, lookback_days=30)
+        assert patterns == []
+
+    @pytest.mark.asyncio
+    async def test_propose_tool_valid(self):
+        """Should return proposal with valid source."""
+        proposal_json = json.dumps({
+            "name": "read_and_save",
+            "description": "Read a file and save processed output",
+            "source_code": "def read_and_save(path: str) -> str:\n    return path",
+            "parameters_json": '{"type": "object", "properties": {"path": {"type": "string"}}}',
+        })
+        provider = AsyncMock()
+        result = MagicMock()
+        result.content = [MagicMock(text=proposal_json)]
+        provider.complete = AsyncMock(return_value=result)
+
+        pattern = {"sequence": ["read_file", "write_file"], "count": 5}
+        proposal = await propose_tool_from_pattern(provider, pattern, {})
+        assert proposal is not None
+        assert proposal["name"] == "read_and_save"
+
+    @pytest.mark.asyncio
+    async def test_propose_tool_unsafe_source(self):
+        """Should return None if generated source is unsafe."""
+        proposal_json = json.dumps({
+            "name": "hack",
+            "description": "Bad tool",
+            "source_code": "import subprocess\ndef hack():\n    subprocess.run('rm -rf /')",
+            "parameters_json": "{}",
+        })
+        provider = AsyncMock()
+        result = MagicMock()
+        result.content = [MagicMock(text=proposal_json)]
+        provider.complete = AsyncMock(return_value=result)
+
+        pattern = {"sequence": ["tool_a", "tool_b"], "count": 3}
+        proposal = await propose_tool_from_pattern(provider, pattern, {})
+        assert proposal is None
+
+    @pytest.mark.asyncio
+    async def test_propose_tool_llm_failure(self):
+        """Should return None on LLM failure."""
+        provider = AsyncMock()
+        provider.complete = AsyncMock(side_effect=Exception("timeout"))
+
+        pattern = {"sequence": ["a", "b"], "count": 3}
+        proposal = await propose_tool_from_pattern(provider, pattern, {})
+        assert proposal is None
+
+    @pytest.mark.asyncio
+    async def test_propose_tool_empty_sequence(self):
+        """Empty sequence should return None."""
+        provider = AsyncMock()
+        pattern = {"sequence": [], "count": 0}
+        proposal = await propose_tool_from_pattern(provider, pattern, {})
+        assert proposal is None
+
+    def test_pattern_stored_in_synthesized_tools(self, synth_db):
+        """Verify pattern-based tool gets stored in DB when integrated."""
+        # This tests the storage path (not the full agent integration)
+        synth_db.execute(
+            """INSERT OR IGNORE INTO synthesized_tools
+               (name, description, source_code, parameters_json, approved, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("auto_read_write", "Auto-generated from pattern",
+             "def auto_read_write(path: str) -> str:\n    return path",
+             '{"type": "object", "properties": {"path": {"type": "string"}}}',
+             0, datetime.now().isoformat()))
+        synth_db.commit()
+
+        row = synth_db.execute(
+            "SELECT name, approved FROM synthesized_tools WHERE name=?",
+            ("auto_read_write",)).fetchone()
+        assert row is not None
+        assert row[0] == "auto_read_write"
+        assert row[1] == 0  # Not auto-approved

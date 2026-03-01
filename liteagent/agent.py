@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import time
+from datetime import datetime
 from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,6 @@ from .config import get_soul_prompt
 from .memory import MemorySystem
 from .providers import create_provider, get_pricing, MODEL_PRICING
 from .tools import ToolRegistry, register_builtin_tools
-from .cognitive import register_cognitive_tools
 
 COMPLEXITY_MARKERS_COMPLEX = {
     "проанализируй", "сравни", "спланируй", "архитектур", "рефактор",
@@ -56,7 +56,6 @@ class LiteAgent:
         self.tools = ToolRegistry()
         builtin = config.get("tools", {}).get("builtin", ["read_file", "write_file", "exec_command"])
         register_builtin_tools(self.tools, enabled=builtin + ["memory_search"])
-        register_cognitive_tools(self)
 
         # Wire memory_search to actual memory
         self._wire_memory_tool()
@@ -212,6 +211,29 @@ class LiteAgent:
         # Track tool calls for skill crystallization
         _tool_calls_log = []
 
+        # Internal monologue: pre-planning
+        _plan = None
+        if self._features.get("internal_monologue", {}).get("enabled"):
+            try:
+                from .planning import generate_plan, format_plan_for_prompt
+                _plan = await generate_plan(
+                    self.provider, text_for_memory,
+                    self.memory.recall(text_for_memory, user_id, top_k=3),
+                    tool_defs,
+                    self._features["internal_monologue"])
+                if _plan:
+                    plan_text = format_plan_for_prompt(_plan)
+                    # Inject plan into system prompt (append to dynamic section)
+                    if isinstance(system_prompt, list):
+                        system_prompt[-1]["text"] += plan_text
+                    else:
+                        system_prompt += plan_text
+                    # Override model if plan says "complex"
+                    if _plan.get("complexity") == "complex" and self.cascade_routing:
+                        model = self.models.get("complex", model)
+            except Exception as e:
+                logger.debug("Internal monologue error: %s", e)
+
         # Agent loop
         for iteration in range(self.max_iterations):
             t0 = time.time()
@@ -238,13 +260,29 @@ class LiteAgent:
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
                 # Log tool calls for skill crystallization
-                if self._features.get("skill_crystallization", {}).get("enabled"):
-                    for block in response.content:
-                        if hasattr(block, 'type') and block.type == "tool_use":
-                            _tool_calls_log.append({
-                                "name": block.name,
-                                "input": block.input,
-                            })
+                for block in response.content:
+                    if hasattr(block, 'type') and block.type == "tool_use":
+                        _tool_calls_log.append({
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                # Mid-loop reflection (internal monologue)
+                if _plan and self._features.get("internal_monologue", {}).get("enabled"):
+                    im_cfg = self._features["internal_monologue"]
+                    reflect_every = im_cfg.get("reflect_every_n_tools", 3)
+                    if (len(_tool_calls_log) % reflect_every == 0
+                            and len(_tool_calls_log) > 0):
+                        try:
+                            from .planning import reflect_on_progress
+                            adjustment = await reflect_on_progress(
+                                self.provider, _plan, _tool_calls_log, im_cfg)
+                            if adjustment:
+                                messages.append({"role": "user", "content": [
+                                    {"type": "text",
+                                     "text": f"[Internal note: {adjustment}]"}
+                                ]})
+                        except Exception as e:
+                            logger.debug("Reflection error: %s", e)
             else:
                 # Done — extract text
                 text = self._extract_text(response)
@@ -532,10 +570,10 @@ class LiteAgent:
                 except Exception as e:
                     logger.debug("Skill crystallization error: %s", e)
 
-        # Log interaction (for counterfactual replay + proactive)
+        # Log interaction (for counterfactual replay + proactive + cross-session synthesis)
         if any(self._features.get(f, {}).get("enabled")
                for f in ("counterfactual_replay", "proactive_agent",
-                          "confidence_gate")):
+                          "confidence_gate", "auto_tool_synthesis")):
             try:
                 from .metacognition import log_interaction
                 log_interaction(
@@ -543,6 +581,40 @@ class LiteAgent:
                     tool_calls_log, _success, _confidence, model)
             except Exception as e:
                 logger.debug("Interaction logging error: %s", e)
+
+        # Advanced tool synthesis: cross-session pattern detection
+        ats_cfg = self._features.get("auto_tool_synthesis", {})
+        if ats_cfg.get("enabled") and ats_cfg.get("cross_session_detection", False):
+            try:
+                from .synthesis import (detect_repeated_patterns,
+                                         propose_tool_from_pattern,
+                                         register_synthesized_tool)
+                patterns = detect_repeated_patterns(
+                    self.memory.db, user_id,
+                    min_occurrences=ats_cfg.get("min_pattern_occurrences", 3),
+                    lookback_days=ats_cfg.get("pattern_lookback_days", 30))
+                for pattern in patterns[:1]:  # Process max 1 pattern per turn
+                    proposal = await propose_tool_from_pattern(
+                        self.provider, pattern, ats_cfg)
+                    if proposal:
+                        approved = 1 if ats_cfg.get("auto_approve", False) else 0
+                        self.memory.db.execute(
+                            """INSERT OR IGNORE INTO synthesized_tools
+                               (name, description, source_code, parameters_json,
+                                approved, created_at) VALUES (?,?,?,?,?,?)""",
+                            (proposal["name"], proposal.get("description", ""),
+                             proposal["source_code"],
+                             proposal.get("parameters_json", "{}"),
+                             approved, datetime.now().isoformat()))
+                        self.memory.db.commit()
+                        if approved:
+                            register_synthesized_tool(
+                                self.tools, proposal["name"],
+                                proposal["source_code"],
+                                proposal.get("description", ""),
+                                json.loads(proposal.get("parameters_json", "{}")))
+            except Exception as e:
+                logger.debug("Cross-session synthesis error: %s", e)
 
         return text
 
@@ -629,6 +701,15 @@ class LiteAgent:
                 lines.append(f"  [{d['id']}] {d['name']} — {d['chunks']} chunks")
             return "\n".join(lines)
 
+        elif cmd == "/conflicts":
+            archived = self.memory.get_archived_memories(user_id, limit=20)
+            if not archived:
+                return "No memory conflicts resolved yet."
+            lines = [f"🔀 {len(archived)} archived memories (conflict resolutions):\n"]
+            for m in archived:
+                lines.append(f"  [{m['type']}] {m['content'][:80]}  (archived: {m['archived_at'][:10]})")
+            return "\n".join(lines)
+
         elif cmd == "/help":
             help_text = (
                 "Commands:\n"
@@ -636,6 +717,7 @@ class LiteAgent:
                 "  /usage      — Show token usage and costs\n"
                 "  /clear      — Clear conversation history\n"
                 "  /forget X   — Forget memories matching X\n"
+                "  /conflicts  — Show resolved memory conflicts\n"
             )
             if self._rag:
                 help_text += (

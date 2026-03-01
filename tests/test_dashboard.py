@@ -62,9 +62,10 @@ class TestMemoriesEndpoints:
         resp = c.delete("/api/memories/999")
         assert resp.status_code == 404
 
-    def test_add_and_delete_memory(self, client):
+    @pytest.mark.asyncio
+    async def test_add_and_delete_memory(self, client):
         c, agent = client
-        agent.memory.remember("Test fact", "dashboard-user", "fact", 0.5)
+        await agent.memory.remember("Test fact", "dashboard-user", "fact", 0.5)
         memories = c.get("/api/memories").json()
         assert len(memories) == 1
         resp = c.delete(f"/api/memories/{memories[0]['id']}")
@@ -107,24 +108,27 @@ class TestConfigEndpoint:
 
 
 class TestExportEndpoints:
-    def test_export_memories_json(self, client):
+    @pytest.mark.asyncio
+    async def test_export_memories_json(self, client):
         c, agent = client
-        agent.memory.remember("Export test", "test-user", "fact", 0.5)
+        await agent.memory.remember("Export test", "test-user", "fact", 0.5)
         resp = c.get("/api/export/memories?format=json")
         assert resp.status_code == 200
         assert len(resp.json()) == 1
 
-    def test_export_memories_csv(self, client):
+    @pytest.mark.asyncio
+    async def test_export_memories_csv(self, client):
         c, agent = client
-        agent.memory.remember("CSV test", "test-user", "fact", 0.5)
+        await agent.memory.remember("CSV test", "test-user", "fact", 0.5)
         resp = c.get("/api/export/memories?format=csv")
         assert resp.status_code == 200
         assert "text/csv" in resp.headers["content-type"]
         assert "CSV test" in resp.text
 
-    def test_export_memories_markdown(self, client):
+    @pytest.mark.asyncio
+    async def test_export_memories_markdown(self, client):
         c, agent = client
-        agent.memory.remember("MD test", "test-user", "fact", 0.5)
+        await agent.memory.remember("MD test", "test-user", "fact", 0.5)
         resp = c.get("/api/export/memories?format=md")
         assert resp.status_code == 200
         assert "MD test" in resp.text

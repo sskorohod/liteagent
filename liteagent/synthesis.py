@@ -3,7 +3,8 @@
 import ast
 import json
 import logging
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -287,3 +288,157 @@ def format_skill_suggestion(skills: list) -> str:
         tools = " -> ".join(step["tool"] for step in s["steps"])
         lines.append(f"- **{s['name']}**: {s['description']} [{tools}]")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════
+# CROSS-SESSION PATTERN DETECTION
+# ══════════════════════════════════════════
+
+def detect_repeated_patterns(db, user_id: str,
+                             min_occurrences: int = 3,
+                             lookback_days: int = 30) -> list[dict]:
+    """Detect recurring tool-call sequences across sessions.
+
+    Queries interaction_log for recent entries, extracts tool sequences,
+    and finds patterns that appear >= min_occurrences times.
+
+    Returns list of {"sequence": [str], "count": int, "example_params": dict}.
+    """
+    cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+    rows = db.execute(
+        """SELECT tool_calls_json FROM interaction_log
+           WHERE user_id = ? AND tool_calls_json IS NOT NULL
+                 AND tool_calls_json != '[]'
+                 AND created_at >= ?
+           ORDER BY created_at DESC LIMIT 200""",
+        (user_id, cutoff)).fetchall()
+
+    if not rows:
+        return []
+
+    # Extract all tool sequences
+    all_sequences = []
+    all_params: dict[str, dict] = {}
+
+    for (tc_json,) in rows:
+        try:
+            calls = json.loads(tc_json)
+            if not calls or not isinstance(calls, list):
+                continue
+            tool_names = [c.get("name", "") for c in calls if c.get("name")]
+            if len(tool_names) >= 2:
+                all_sequences.append(tuple(tool_names))
+                # Store example params for first occurrence
+                key = "->".join(tool_names)
+                if key not in all_params:
+                    all_params[key] = calls[0].get("input", {}) if calls else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not all_sequences:
+        return []
+
+    # Sliding window: find recurring subsequences (size 2-4)
+    subseq_counter: Counter = Counter()
+    subseq_params: dict[tuple, dict] = {}
+
+    for seq in all_sequences:
+        for window_size in range(2, min(5, len(seq) + 1)):
+            for i in range(len(seq) - window_size + 1):
+                subseq = seq[i:i + window_size]
+                subseq_counter[subseq] += 1
+                if subseq not in subseq_params:
+                    subseq_params[subseq] = all_params.get(
+                        "->".join(subseq), {})
+
+    # Filter by min_occurrences and deduplicate (prefer longer patterns)
+    patterns = []
+    seen_tools = set()
+
+    for subseq, count in subseq_counter.most_common():
+        if count < min_occurrences:
+            continue
+        # Skip if this is a subset of an already-found longer pattern
+        seq_key = "->".join(subseq)
+        if any(seq_key in s for s in seen_tools):
+            continue
+        seen_tools.add(seq_key)
+        patterns.append({
+            "sequence": list(subseq),
+            "count": count,
+            "example_params": subseq_params.get(subseq, {}),
+        })
+
+    return patterns[:5]  # Max 5 patterns
+
+
+async def propose_tool_from_pattern(provider, pattern: dict,
+                                     config: dict) -> dict | None:
+    """Use LLM to generate a combined tool from a detected pattern.
+
+    Returns {"name": str, "description": str, "source_code": str, "parameters_json": str}
+    or None if generation fails.
+    """
+    model = config.get("synthesis_model",
+                        config.get("planning_model", "claude-haiku-4-5-20251001"))
+    sequence = pattern.get("sequence", [])
+    count = pattern.get("count", 0)
+
+    if not sequence:
+        return None
+
+    tool_chain = " → ".join(sequence)
+    prompt = (
+        "Users repeatedly call these tools in sequence (detected pattern):\n"
+        f"Pattern: {tool_chain} (seen {count} times)\n\n"
+        "Generate a single Python function that combines this workflow into one tool.\n\n"
+        "Requirements:\n"
+        "- Function name should describe the combined workflow (snake_case)\n"
+        "- Accept necessary parameters with type hints\n"
+        "- Only use safe imports (json, re, math, os.path, pathlib, etc.)\n"
+        "- Do NOT use subprocess, exec, eval, open()\n"
+        "- Keep it simple — the function orchestrates the steps\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"name": "tool_name", "description": "What it does", '
+        '"source_code": "def tool_name(...): ...", '
+        '"parameters_json": "{\\"type\\": \\"object\\", \\"properties\\": {...}}"}'
+    )
+
+    try:
+        result = await provider.complete(
+            model=model,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = result.content[0].text.strip()
+
+        # Handle markdown code blocks
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        proposal = json.loads(text)
+
+        # Validate required fields
+        if not all(k in proposal for k in ("name", "source_code")):
+            return None
+
+        # Validate source safety
+        ok, err = validate_tool_source(proposal["source_code"])
+        if not ok:
+            logger.warning("Proposed tool source validation failed: %s", err)
+            return None
+
+        # Ensure parameters_json is a string
+        if isinstance(proposal.get("parameters_json"), dict):
+            proposal["parameters_json"] = json.dumps(proposal["parameters_json"])
+        elif not proposal.get("parameters_json"):
+            proposal["parameters_json"] = json.dumps({
+                "type": "object", "properties": {}})
+
+        logger.info("Proposed tool from pattern: %s (%s)",
+                     proposal["name"], tool_chain)
+        return proposal
+
+    except Exception as e:
+        logger.debug("Tool proposal from pattern failed: %s", e)
+        return None

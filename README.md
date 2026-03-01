@@ -1,12 +1,12 @@
 # LiteAgent
 
-Ultra-lightweight AI agent with persistent memory, multi-provider support, RAG pipeline, 8 metacognition features, and aggressive cost optimization.
+Ultra-lightweight AI agent with persistent memory, multi-provider support, RAG pipeline, 11 metacognition features, and aggressive cost optimization.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-182%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-230%20passed-brightgreen.svg)]()
 
-**~4,000 LOC core** | **182 tests** | **4 LLM providers** | **Zero bloat**
+**~4,500 LOC core** | **230 tests** | **4 LLM providers** | **Zero bloat**
 
 ---
 
@@ -17,7 +17,7 @@ Ultra-lightweight AI agent with persistent memory, multi-provider support, RAG p
 | **Multi-Provider** | Anthropic Claude, OpenAI GPT, Google Gemini, Ollama (local) |
 | **4-Layer Memory** | Conversation (RAM), Scoped State (SQLite), Semantic Recall (embeddings), Auto-Learning (Haiku) |
 | **RAG Pipeline** | Document ingestion, recursive chunking, cosine similarity search with keyword fallback |
-| **8 Metacognition Features** | Dream Cycle, Self-Evolving Prompt, Proactive Agent, Auto Tool Synthesis, Confidence Gate, Style Adaptation, Skill Crystallization, Counterfactual Replay |
+| **11 Metacognition Features** | Dream Cycle, Self-Evolving Prompt, Proactive Agent, Auto Tool Synthesis, Confidence Gate, Style Adaptation, Skill Crystallization, Counterfactual Replay, Internal Monologue, Memory Conflict Resolution, Cross-Session Pattern Detection |
 | **5 Cost Optimizations** | Cascade routing (Haiku/Sonnet/Opus), prompt caching, context compression, semantic tool loading, daily budget |
 | **Multi-Channel** | CLI, REST API + Web Dashboard (SSE streaming), Telegram bot |
 | **MCP Support** | Connect any MCP server via JSON config |
@@ -202,10 +202,12 @@ Full `config.json` reference:
     "track_usage": true
   },
   "features": {
+    "internal_monologue":     { "enabled": false, "planning_model": "claude-haiku-4-5-20251001", "reflect_every_n_tools": 3 },
+    "memory_conflict_detection": { "enabled": false, "similarity_threshold": 0.75, "auto_resolve": true },
     "dream_cycle":            { "enabled": false },
     "self_evolving_prompt":   { "enabled": false },
     "proactive_agent":        { "enabled": false },
-    "auto_tool_synthesis":    { "enabled": false },
+    "auto_tool_synthesis":    { "enabled": false, "cross_session_detection": false },
     "confidence_gate":        { "enabled": false, "threshold": 6 },
     "style_adaptation":       { "enabled": false },
     "skill_crystallization":  { "enabled": false },
@@ -216,12 +218,15 @@ Full `config.json` reference:
 
 ---
 
-## 8 Metacognition Features
+## 11 Metacognition Features
 
 All features are opt-in and have zero overhead when disabled.
 
 | Feature | Description |
 |---------|-------------|
+| **Internal Monologue** | Hidden planning layer: Haiku generates execution plan before main LLM call, mid-loop reflection adjusts strategy |
+| **Memory Conflict Resolution** | Detects contradicting memories (semantic similarity + contradiction indicators), resolves via LLM (replace/merge/archive) |
+| **Cross-Session Pattern Detection** | Mines interaction logs for recurring tool-call sequences across sessions, proposes combined tools |
 | **Dream Cycle** | Off-hours memory consolidation: decay old memories, merge similar ones, extract insights |
 | **Self-Evolving Prompt** | Detects user friction, synthesizes prompt patches, applies them with approval |
 | **Proactive Agent** | Detects usage patterns and proactively offers relevant suggestions |
@@ -239,13 +244,14 @@ All features are opt-in and have zero overhead when disabled.
 liteagent/
   agent.py          Core agent loop, cascade routing, context building
   providers.py      Multi-provider abstraction (Anthropic, OpenAI, Ollama, Gemini)
-  memory.py         4-layer memory system (conversation, state, semantic, learning)
+  memory.py         4-layer memory system + conflict detection & resolution
   rag.py            RAG pipeline (ingestion, chunking, retrieval)
   tools.py          Tool registry, schema generation, MCP support
   config.py         Config loader, validation, env vars
+  planning.py       Internal monologue: chain-of-thought planning + reflection
   metacognition.py  Confidence gate, counterfactual replay, dream cycle
   evolution.py      Self-evolving prompt, style adaptation, proactive agent
-  synthesis.py      Auto tool synthesis, skill crystallization
+  synthesis.py      Auto tool synthesis, skill crystallization, cross-session patterns
   scheduler.py      Async cron scheduler (zero dependencies)
   pool.py           Multi-agent pool
   main.py           CLI entry point

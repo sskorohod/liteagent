@@ -64,22 +64,25 @@ class TestScopedState:
 class TestSemanticMemory:
     """L3: Persistent semantic memory."""
 
-    def test_remember_and_recall(self, memory_system):
-        memory_system.remember("User's name is Alice", "u1", "fact", 0.8)
+    @pytest.mark.asyncio
+    async def test_remember_and_recall(self, memory_system):
+        await memory_system.remember("User's name is Alice", "u1", "fact", 0.8)
         results = memory_system.recall("Alice name", "u1")
         assert len(results) > 0
         assert "Alice" in results[0]["content"]
 
-    def test_deduplication(self, memory_system):
-        memory_system.remember("User loves Python", "u1", "fact", 0.5)
-        memory_system.remember("User loves Python", "u1", "fact", 0.5)
+    @pytest.mark.asyncio
+    async def test_deduplication(self, memory_system):
+        await memory_system.remember("User loves Python", "u1", "fact", 0.5)
+        await memory_system.remember("User loves Python", "u1", "fact", 0.5)
         all_mems = memory_system.get_all_memories("u1")
         assert len(all_mems) == 1
         # Importance should have been bumped
         assert all_mems[0]["importance"] > 0.5
 
-    def test_forget(self, memory_system):
-        memory_system.remember("Secret info", "u1", "fact", 0.5)
+    @pytest.mark.asyncio
+    async def test_forget(self, memory_system):
+        await memory_system.remember("Secret info", "u1", "fact", 0.5)
         memory_system.forget("u1", "Secret")
         all_mems = memory_system.get_all_memories("u1")
         assert len(all_mems) == 0
@@ -88,8 +91,9 @@ class TestSemanticMemory:
         results = memory_system.recall("anything", "u1")
         assert results == []
 
-    def test_recall_user_isolation(self, memory_system):
-        memory_system.remember("Alice fact", "u1", "fact", 0.8)
+    @pytest.mark.asyncio
+    async def test_recall_user_isolation(self, memory_system):
+        await memory_system.remember("Alice fact", "u1", "fact", 0.8)
         results = memory_system.recall("Alice", "u2")
         assert len(results) == 0
 

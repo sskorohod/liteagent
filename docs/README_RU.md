@@ -2,9 +2,9 @@
 
 [English](../README.md) | **Русский**
 
-Ультра-легкий AI-агент с персистентной памятью, мульти-провайдером, RAG-пайплайном, 8 метакогнитивными фичами и агрессивной оптимизацией стоимости.
+Ультра-легкий AI-агент с персистентной памятью, мульти-провайдером, RAG-пайплайном, 11 метакогнитивными фичами и агрессивной оптимизацией стоимости.
 
-**~4,000 LOC ядро** | **182 теста** | **4 LLM провайдера** | **Zero bloat**
+**~4,500 LOC ядро** | **230 тестов** | **4 LLM провайдера** | **Zero bloat**
 
 ---
 
@@ -13,7 +13,7 @@
 - **4 LLM провайдера** — Anthropic Claude, OpenAI GPT, Google Gemini, Ollama (локальные модели)
 - **4-уровневая память** — разговор (RAM), scoped state (SQLite), семантический recall (embeddings), авто-обучение (Haiku)
 - **RAG-пайплайн** — загрузка документов, рекурсивное разбиение, поиск по косинусному сходству
-- **8 метакогнитивных фич** — Dream Cycle, Self-Evolving Prompt, Proactive Agent, Auto Tool Synthesis, Confidence Gate, Style Adaptation, Skill Crystallization, Counterfactual Replay
+- **11 метакогнитивных фич** — Internal Monologue, Memory Conflict Resolution, Cross-Session Pattern Detection, Dream Cycle, Self-Evolving Prompt, Proactive Agent, Auto Tool Synthesis, Confidence Gate, Style Adaptation, Skill Crystallization, Counterfactual Replay
 - **5 оптимизаций стоимости** — каскадная маршрутизация (Haiku/Sonnet/Opus), кэширование промптов, сжатие контекста, семантическая загрузка инструментов, дневной бюджет
 - **Мульти-канальность** — CLI, REST API + Web Dashboard (SSE streaming), Telegram бот
 - **MCP поддержка** — подключение любых MCP серверов через конфиг
@@ -96,7 +96,7 @@ liteagent --channel api            # веб-дашборд на :8080
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -v          # 182 теста
+python -m pytest tests/ -v          # 230 тестов
 python -m pytest tests/ --cov=liteagent  # с покрытием
 ```
 
