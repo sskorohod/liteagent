@@ -40,21 +40,26 @@ tailwind.config = {
   .typing-dot:nth-child(3) { animation: bounce 1.2s infinite 0.4s; }
 
   /* Chat message markdown styles */
-  .chat-msg { max-width: 80%; position: relative; }
-  .chat-msg pre { background: #0a0a0b; border: 1px solid #27272a; border-radius: 8px; padding: 12px; margin: 8px 0; overflow-x: auto; font-size: 13px; }
-  .chat-msg code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 13px; }
-  .chat-msg p code { background: #27272a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-  .chat-msg h1, .chat-msg h2, .chat-msg h3 { font-weight: 600; margin: 12px 0 6px 0; }
-  .chat-msg h1 { font-size: 1.3em; }
-  .chat-msg h2 { font-size: 1.15em; }
-  .chat-msg h3 { font-size: 1.05em; }
-  .chat-msg ul, .chat-msg ol { padding-left: 20px; margin: 6px 0; }
-  .chat-msg li { margin: 2px 0; }
-  .chat-msg blockquote { border-left: 3px solid #6366f1; padding-left: 12px; margin: 8px 0; color: #a1a1aa; }
+  .chat-msg { max-width: 80%; position: relative; line-height: 1.5; }
+  .chat-msg pre { background: #0a0a0b; border: 1px solid #27272a; border-radius: 6px; padding: 10px 12px; margin: 4px 0; overflow-x: auto; font-size: 12px; line-height: 1.4; }
+  .chat-msg code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 12px; }
+  .chat-msg p code { background: #27272a; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .chat-msg h1, .chat-msg h2, .chat-msg h3 { font-weight: 600; margin: 6px 0 3px 0; }
+  .chat-msg h1 { font-size: 1.2em; }
+  .chat-msg h2 { font-size: 1.1em; }
+  .chat-msg h3 { font-size: 1em; }
+  .chat-msg ul, .chat-msg ol { padding-left: 18px; margin: 3px 0; }
+  .chat-msg li { margin: 1px 0; }
+  .chat-msg blockquote { border-left: 2px solid #6366f1; padding-left: 10px; margin: 4px 0; color: #a1a1aa; }
   .chat-msg a { color: #818cf8; text-decoration: underline; }
   .chat-msg strong { font-weight: 600; color: #e4e4e7; }
   .chat-msg em { font-style: italic; }
-  .chat-msg p { margin: 4px 0; }
+  .chat-msg p { margin: 2px 0; }
+  .chat-msg p:first-child { margin-top: 0; }
+  .chat-msg p:last-child { margin-bottom: 0; }
+
+  /* Chat messages container — ensure last message is fully visible */
+  #chat-messages { padding-bottom: 12px; }
 
   /* Copy button */
   .copy-btn { position: absolute; top: 8px; right: 8px; opacity: 0; transition: opacity 0.2s; }
@@ -109,7 +114,7 @@ tailwind.config = {
 </aside>
 
 <!-- Main content -->
-<main class="flex-1 p-8 overflow-y-auto h-screen">
+<main id="main-content" class="flex-1 p-8 overflow-y-auto h-screen">
 
   <!-- Overview Tab -->
   <section id="tab-overview" class="tab-content hidden fade-in">
@@ -190,28 +195,59 @@ tailwind.config = {
 
   <!-- Tools Tab -->
   <section id="tab-tools" class="tab-content hidden fade-in">
-    <h1 class="text-2xl font-semibold text-white mb-6">Tools</h1>
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-semibold text-white">Tools</h1>
+      <button onclick="toggleAddToolForm()" id="add-tool-btn"
+        class="text-xs px-3 py-1.5 rounded-lg border border-accent/50 text-accent hover:bg-accent/10 transition-colors">
+        + Add Custom Tool
+      </button>
+    </div>
+
+    <!-- Add Tool Form (hidden by default) -->
+    <div id="add-tool-form" class="hidden mb-6 bg-bg-card border border-accent/30 rounded-xl p-5 fade-in">
+      <h3 class="text-sm font-medium text-white mb-3">New Custom Tool</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs text-muted block mb-1">Function name</label>
+          <input id="tool-name" type="text" placeholder="my_tool" class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:border-accent/50 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1">Description</label>
+          <input id="tool-desc" type="text" placeholder="What the tool does" class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:border-accent/50 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1">Python code <span class="text-zinc-600">(define a function with the same name)</span></label>
+          <textarea id="tool-code" rows="6" placeholder="def my_tool(query: str) -> str:&#10;    &quot;&quot;&quot;query: Search query&quot;&quot;&quot;&#10;    return f'Result for {query}'" class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white font-mono placeholder-zinc-600 focus:border-accent/50 focus:outline-none resize-y"></textarea>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="submitCustomTool()" class="text-xs px-4 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">Save Tool</button>
+          <button onclick="toggleAddToolForm()" class="text-xs px-4 py-2 rounded-lg border border-border text-muted hover:text-white transition-colors">Cancel</button>
+          <span id="tool-form-error" class="text-xs text-red-400 self-center ml-2"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="tools-list">
       <div class="text-muted text-sm loading">Loading tools...</div>
     </div>
   </section>
 
   <!-- Chat Tab -->
-  <section id="tab-chat" class="tab-content hidden fade-in flex flex-col" style="height: calc(100vh - 4rem);">
-    <div class="flex items-center justify-between mb-4">
+  <section id="tab-chat" class="tab-content hidden fade-in flex flex-col" style="height: calc(100vh - 4rem); min-height: 0;">
+    <div class="flex items-center justify-between mb-3 shrink-0">
       <h1 class="text-2xl font-semibold text-white">Chat</h1>
       <button onclick="clearChat()" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted hover:text-white hover:border-red-400/50 transition-colors">
         Clear Chat
       </button>
     </div>
-    <div class="flex-1 overflow-y-auto space-y-4 mb-4 pr-2" id="chat-messages">
+    <div class="flex-1 overflow-y-auto space-y-3 pr-2 min-h-0" id="chat-messages" style="scroll-behavior: smooth;">
       <div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>
     </div>
-    <div class="flex gap-3">
+    <div class="flex gap-3 pt-3 shrink-0 border-t border-border mt-2">
       <input id="chat-input" type="text" placeholder="Type a message..."
         class="flex-1 bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-white placeholder-muted focus:outline-none focus:border-accent transition-colors"
         onkeydown="if(event.key==='Enter' && !chatBusy)sendChat()">
-      <button onclick="sendChat()" id="chat-send-btn" class="bg-accent hover:bg-accent-dim text-white px-5 py-3 rounded-xl text-sm font-medium transition-colors">
+      <button onclick="sendChat()" id="chat-send-btn" class="bg-accent hover:bg-accent-dim text-white px-6 py-3 rounded-xl text-sm font-medium transition-colors whitespace-nowrap">
         Send
       </button>
     </div>
@@ -304,6 +340,17 @@ function switchTab(name) {
     btn.classList.remove('tab-active');
     if (btn.dataset.tab === name) btn.classList.add('tab-active');
   });
+  // Chat tab needs special layout — no main scroll, reduced padding
+  const main = document.getElementById('main-content');
+  if (name === 'chat') {
+    main.classList.remove('overflow-y-auto');
+    main.classList.add('overflow-hidden');
+    main.style.padding = '1.5rem 2rem';
+  } else {
+    main.classList.remove('overflow-hidden');
+    main.classList.add('overflow-y-auto');
+    main.style.padding = '';
+  }
   if (name === 'overview') loadOverview();
   else if (name === 'usage') loadUsage(7);
   else if (name === 'memories') loadMemories();
@@ -451,6 +498,13 @@ async function deleteMemory(id) {
 // =======================================
 // TOOLS
 // =======================================
+const _SOURCE_BADGE = {
+  builtin: {cls: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30', label: 'builtin'},
+  mcp: {cls: 'bg-blue-500/15 text-blue-400 border-blue-500/30', label: 'MCP'},
+  custom: {cls: 'bg-amber-500/15 text-amber-400 border-amber-500/30', label: 'custom'},
+  onboarding: {cls: 'bg-purple-500/15 text-purple-400 border-purple-500/30', label: 'setup'},
+};
+
 async function loadTools() {
   const data = await api('/api/tools');
   const container = document.getElementById('tools-list');
@@ -458,17 +512,63 @@ async function loadTools() {
     container.innerHTML = '<div class="text-muted text-sm">No tools registered</div>';
     return;
   }
-  container.innerHTML = data.map(t => `
+  container.innerHTML = data.map(t => {
+    const badge = _SOURCE_BADGE[t.source] || _SOURCE_BADGE.builtin;
+    const params = (t.parameters || []).map(p =>
+      `<span class="text-xs px-2 py-0.5 rounded-full bg-bg border border-border text-zinc-500" title="${p.type}${p.required ? ', required' : ''}">${escapeHtml(p.name)}<span class="text-zinc-600 ml-1">${p.type}</span></span>`
+    ).join('');
+    const deleteBtn = t.source === 'custom'
+      ? `<button onclick="deleteCustomTool('${escapeHtml(t.name)}')" class="text-xs text-red-400/60 hover:text-red-400 transition-colors ml-auto" title="Delete tool">&times;</button>`
+      : '';
+    return `
     <div class="bg-bg-card border border-border rounded-xl p-5 hover:border-accent/30 transition-colors">
       <div class="flex items-center gap-2 mb-2">
         <span class="text-accent font-mono text-sm font-medium">${escapeHtml(t.name)}</span>
+        <span class="text-[10px] px-1.5 py-0.5 rounded border ${badge.cls}">${badge.label}</span>
+        ${deleteBtn}
       </div>
       <div class="text-xs text-muted mb-3">${escapeHtml(t.description || 'No description')}</div>
-      ${t.parameters.length ? `<div class="flex flex-wrap gap-1">
-        ${t.parameters.map(p => `<span class="text-xs px-2 py-0.5 rounded-full bg-bg border border-border text-zinc-500">${p}</span>`).join('')}
-      </div>` : ''}
-    </div>
-  `).join('');
+      ${params ? `<div class="flex flex-wrap gap-1">${params}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function toggleAddToolForm() {
+  const form = document.getElementById('add-tool-form');
+  form.classList.toggle('hidden');
+  document.getElementById('tool-form-error').textContent = '';
+}
+
+async function submitCustomTool() {
+  const name = document.getElementById('tool-name').value.trim();
+  const desc = document.getElementById('tool-desc').value.trim();
+  const code = document.getElementById('tool-code').value.trim();
+  const errEl = document.getElementById('tool-form-error');
+  errEl.textContent = '';
+
+  if (!name || !code) { errEl.textContent = 'Name and code are required'; return; }
+
+  const res = await api('/api/tools/custom', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, description: desc, code}),
+  });
+
+  if (res && res.ok) {
+    document.getElementById('tool-name').value = '';
+    document.getElementById('tool-desc').value = '';
+    document.getElementById('tool-code').value = '';
+    toggleAddToolForm();
+    loadTools();
+  } else {
+    errEl.textContent = (res && res.detail) || 'Failed to add tool';
+  }
+}
+
+async function deleteCustomTool(name) {
+  if (!confirm(`Delete custom tool "${name}"?`)) return;
+  const res = await api(`/api/tools/custom/${encodeURIComponent(name)}`, {method: 'DELETE'});
+  if (res && res.ok) loadTools();
 }
 
 // =======================================
@@ -544,6 +644,7 @@ async function loadHistory() {
     return;
   }
   container.innerHTML = data.map(m => renderMessage(m.role, m.content)).join('');
+  // Ensure last message is fully visible
   scrollToBottom();
 }
 
@@ -553,15 +654,15 @@ function renderMessage(role, content) {
   if (isUser) {
     return `
       <div class="flex justify-end" id="${id}">
-        <div class="chat-msg bg-accent/20 border border-accent/30 rounded-xl px-4 py-3 text-sm text-zinc-200">
+        <div class="chat-msg bg-accent/15 border border-accent/20 rounded-lg px-3.5 py-2.5 text-sm text-zinc-200">
           ${escapeHtml(content)}
         </div>
       </div>`;
   }
   return `
     <div class="flex justify-start" id="${id}">
-      <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
-        <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
+      <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5 text-[13px] text-zinc-300">
+        <button class="copy-btn text-xs px-1.5 py-0.5 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
           onclick="copyMessage(this)">Copy</button>
         <div class="msg-content">${renderMarkdown(content)}</div>
       </div>
@@ -570,7 +671,9 @@ function renderMessage(role, content) {
 
 function scrollToBottom() {
   const container = document.getElementById('chat-messages');
-  container.scrollTop = container.scrollHeight;
+  requestAnimationFrame(() => {
+    container.scrollTop = container.scrollHeight;
+  });
 }
 
 async function sendChat() {
@@ -593,7 +696,7 @@ async function sendChat() {
   const typingId = 'typing-' + Date.now();
   container.insertAdjacentHTML('beforeend', `
     <div id="${typingId}" class="flex justify-start">
-      <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3">
+      <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5">
         <span class="typing-dot"></span>
         <span class="typing-dot"></span>
         <span class="typing-dot"></span>
@@ -711,7 +814,7 @@ async function sendChat() {
           // Create message bubble
           container.insertAdjacentHTML('beforeend', `
             <div class="flex justify-start" id="${msgId}">
-              <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
+              <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5 text-[13px] text-zinc-300">
                 <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
                   onclick="copyMessage(this)">Copy</button>
                 <div class="msg-content"></div>
@@ -725,7 +828,7 @@ async function sendChat() {
           const newId = msgId + '-after-tool-' + toolCounter;
           container.insertAdjacentHTML('beforeend', `
             <div class="flex justify-start" id="${newId}">
-              <div class="chat-msg bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-zinc-300">
+              <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5 text-[13px] text-zinc-300">
                 <button class="copy-btn text-xs px-2 py-1 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
                   onclick="copyMessage(this)">Copy</button>
                 <div class="msg-content"></div>
@@ -772,6 +875,7 @@ function copyMessage(btn) {
 }
 
 async function clearChat() {
+  await api('/api/history', { method: 'DELETE' });
   await api('/command?cmd=/clear&user_id=dashboard-user', { method: 'POST' });
   document.getElementById('chat-messages').innerHTML =
     '<div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>';

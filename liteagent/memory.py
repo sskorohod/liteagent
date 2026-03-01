@@ -61,6 +61,16 @@ class MemorySystem:
                 value TEXT,
                 updated_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_history_user
+                ON chat_history(user_id, created_at);
+
             CREATE TABLE IF NOT EXISTS session_summaries (
                 user_id TEXT NOT NULL,
                 summary TEXT,
@@ -186,14 +196,69 @@ class MemorySystem:
     # ══════════════════════════════════════════
 
     def get_history(self, user_id: str) -> list[dict]:
-        """Get current conversation history."""
+        """Get current conversation history (RAM buffer)."""
         return self._conversations.get(user_id, [])
 
     def add_message(self, user_id: str, role: str, content):
-        """Add message to conversation buffer."""
+        """Add message to conversation buffer AND persist to SQLite."""
         if user_id not in self._conversations:
             self._conversations[user_id] = []
         self._conversations[user_id].append({"role": role, "content": content})
+        # Persist
+        content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+        try:
+            self.db.execute(
+                "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
+                (user_id, role, content_str))
+            self.db.commit()
+        except Exception as e:
+            logger.warning("Failed to persist chat message: %s", e)
+
+    def load_history(self, user_id: str, limit: int = 100) -> list[dict]:
+        """Load persisted chat history from SQLite into RAM buffer."""
+        rows = self.db.execute(
+            "SELECT role, content FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit)).fetchall()
+        rows.reverse()  # oldest first
+        messages = []
+        for role, content_str in rows:
+            # Try to parse as JSON (for structured content), fallback to plain string
+            try:
+                content = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                content = content_str
+            messages.append({"role": role, "content": content})
+        self._conversations[user_id] = messages
+        return messages
+
+    def get_chat_history_for_display(self, user_id: str, limit: int = 100) -> list[dict]:
+        """Get chat history with timestamps for dashboard display."""
+        rows = self.db.execute(
+            "SELECT role, content, created_at FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit)).fetchall()
+        rows.reverse()
+        result = []
+        for role, content_str, created_at in rows:
+            try:
+                content = json.loads(content_str)
+            except (json.JSONDecodeError, TypeError):
+                content = content_str
+            # For display, flatten structured content to string
+            if isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content)
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = str(content)
+            result.append({"role": role, "content": text, "created_at": created_at})
+        return result
+
+    def clear_chat_history(self, user_id: str):
+        """Clear persisted chat history for a user."""
+        self.db.execute("DELETE FROM chat_history WHERE user_id=?", (user_id,))
+        self.db.commit()
 
     def get_compressed_history(self, user_id: str) -> list[dict]:
         """Return conversation history with compression for older messages."""

@@ -99,6 +99,107 @@ class TestToolsEndpoint:
         names = [t["name"] for t in tools]
         assert "memory_search" in names
 
+    def test_tools_have_source_and_params(self, client):
+        c, _ = client
+        tools = c.get("/api/tools").json()
+        for t in tools:
+            assert "source" in t
+            assert t["source"] in ("builtin", "mcp", "custom", "onboarding")
+            assert "parameters" in t
+
+    def test_add_custom_tool_missing_name(self, client):
+        c, _ = client
+        resp = c.post("/api/tools/custom", json={"name": "", "code": "def x(): pass"})
+        assert resp.status_code == 400
+
+    def test_add_custom_tool_missing_code(self, client):
+        c, _ = client
+        resp = c.post("/api/tools/custom", json={"name": "test_tool", "code": ""})
+        assert resp.status_code == 400
+
+    def test_add_custom_tool_blocked_pattern(self, client):
+        c, _ = client
+        resp = c.post("/api/tools/custom", json={
+            "name": "bad_tool",
+            "code": "import os\ndef bad_tool(): return os.listdir('/')"
+        })
+        assert resp.status_code == 400
+        assert "Blocked" in resp.json()["detail"]
+
+    def test_add_and_delete_custom_tool(self, client, monkeypatch, tmp_path):
+        from liteagent.channels import dashboard
+        monkeypatch.setattr(dashboard, "CUSTOM_TOOLS_DIR", tmp_path / "custom_tools")
+        c, _ = client
+        resp = c.post("/api/tools/custom", json={
+            "name": "greet",
+            "description": "Greet someone",
+            "code": "def greet(name: str) -> str:\n    return f'Hello, {name}!'"
+        })
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        # Tool should appear in list
+        tools = c.get("/api/tools").json()
+        names = [t["name"] for t in tools]
+        assert "greet" in names
+        # Delete it
+        resp = c.delete("/api/tools/custom/greet")
+        assert resp.status_code == 200
+        tools = c.get("/api/tools").json()
+        assert "greet" not in [t["name"] for t in tools]
+
+    def test_delete_builtin_tool_fails(self, client):
+        c, _ = client
+        resp = c.delete("/api/tools/custom/memory_search")
+        assert resp.status_code == 400
+
+
+class TestChatHistoryPersistence:
+    def test_history_empty_initially(self, client):
+        c, _ = client
+        resp = c.get("/api/history")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_history_persists_messages(self, client):
+        c, agent = client
+        agent.memory.add_message("dashboard-user", "user", "Hello")
+        agent.memory.add_message("dashboard-user", "assistant", "Hi there!")
+        resp = c.get("/api/history")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        assert data[0]["role"] == "user"
+        assert data[0]["content"] == "Hello"
+        assert data[1]["role"] == "assistant"
+        assert "created_at" in data[0]
+
+    def test_history_survives_ram_clear(self, client):
+        c, agent = client
+        agent.memory.add_message("dashboard-user", "user", "Persistent msg")
+        agent.memory.clear_conversation("dashboard-user")
+        # RAM is empty, but SQLite still has it
+        resp = c.get("/api/history")
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["content"] == "Persistent msg"
+
+    def test_clear_history(self, client):
+        c, agent = client
+        agent.memory.add_message("dashboard-user", "user", "To be deleted")
+        resp = c.delete("/api/history")
+        assert resp.status_code == 200
+        assert c.get("/api/history").json() == []
+
+    def test_load_history_restores_ram(self, client):
+        c, agent = client
+        agent.memory.add_message("dashboard-user", "user", "Msg 1")
+        agent.memory.add_message("dashboard-user", "assistant", "Msg 2")
+        agent.memory.clear_conversation("dashboard-user")
+        assert agent.memory.get_history("dashboard-user") == []
+        loaded = agent.memory.load_history("dashboard-user")
+        assert len(loaded) == 2
+        assert loaded[0]["role"] == "user"
+
 
 class TestConfigEndpoint:
     def test_config_returns_dict(self, client):

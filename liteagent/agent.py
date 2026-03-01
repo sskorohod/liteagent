@@ -180,6 +180,9 @@ class LiteAgent:
         self._current_user_id = user_id
         await self._ensure_mcp_loaded()
         self._ensure_onboarding_tool()
+        # Load persisted history on first interaction
+        if not self.memory.get_history(user_id):
+            self.memory.load_history(user_id)
 
         # Normalize multimodal input
         if isinstance(user_input, list):
@@ -313,6 +316,9 @@ class LiteAgent:
         self._current_user_id = user_id
         await self._ensure_mcp_loaded()
         self._ensure_onboarding_tool()
+        # Load persisted history on first interaction
+        if not self.memory.get_history(user_id):
+            self.memory.load_history(user_id)
 
         if self.memory.get_today_cost() >= self.budget_daily:
             yield f"⚠️ Daily budget (${self.budget_daily:.2f}) reached."

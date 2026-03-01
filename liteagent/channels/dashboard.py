@@ -4,10 +4,12 @@ import csv
 import io
 import json
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_USER = "dashboard-user"
+CUSTOM_TOOLS_DIR = Path.home() / ".liteagent" / "custom_tools"
 
 
 def mount_dashboard(app, agent):
@@ -74,11 +76,109 @@ def mount_dashboard(app, agent):
 
     @app.get("/api/tools")
     async def api_tools():
-        """List registered tools."""
+        """List registered tools with source info."""
         defs = agent.tools.get_definitions()
-        return [{"name": d["name"], "description": d.get("description", ""),
-                 "parameters": list(d.get("input_schema", {}).get("properties", {}).keys())}
-                for d in defs]
+        # Determine tool source (builtin, mcp, custom, onboarding)
+        builtin_names = set(agent.config.get("tools", {}).get(
+            "builtin", ["read_file", "write_file", "exec_command", "memory_search"]))
+        builtin_names.add("rag_search")
+        mcp_names = {n for n in agent.tools._tools if "__" in n}
+        onboarding_names = {"setup_agent"}
+        custom_dir = CUSTOM_TOOLS_DIR
+
+        result = []
+        for d in defs:
+            name = d["name"]
+            if name in onboarding_names:
+                source = "onboarding"
+            elif name in mcp_names:
+                source = "mcp"
+            elif name in builtin_names:
+                source = "builtin"
+            else:
+                source = "custom"
+            schema = d.get("input_schema", {})
+            params = []
+            for pname, pinfo in schema.get("properties", {}).items():
+                params.append({
+                    "name": pname,
+                    "type": pinfo.get("type", "string"),
+                    "required": pname in schema.get("required", []),
+                })
+            result.append({
+                "name": name,
+                "description": d.get("description", ""),
+                "source": source,
+                "parameters": params,
+            })
+        return result
+
+    @app.post("/api/tools/custom")
+    async def api_tools_add_custom(body: dict):
+        """Add a custom Python tool from code string."""
+        name = body.get("name", "").strip()
+        description = body.get("description", "").strip()
+        code = body.get("code", "").strip()
+
+        if not name:
+            raise HTTPException(status_code=400, detail="Tool name required")
+        if not code:
+            raise HTTPException(status_code=400, detail="Tool code required")
+        if name in agent.tools._tools:
+            raise HTTPException(status_code=400, detail=f"Tool '{name}' already exists")
+
+        # Validate: no dangerous patterns
+        _BLOCKED = ["import os", "import subprocess", "import sys", "eval(", "exec(",
+                     "__import__", "open('/etc", "open('/dev", "rm -rf"]
+        for pat in _BLOCKED:
+            if pat in code:
+                raise HTTPException(status_code=400, detail=f"Blocked pattern: {pat}")
+
+        # Compile and register
+        try:
+            namespace = {}
+            exec(compile(code, f"<custom_tool_{name}>", "exec"), namespace)
+            func = namespace.get(name)
+            if not func or not callable(func):
+                raise HTTPException(status_code=400,
+                    detail=f"Code must define a function named '{name}'")
+
+            agent.tools.tool(name=name, description=description or func.__doc__)(func)
+
+            # Save to disk for persistence
+            CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+            tool_path = CUSTOM_TOOLS_DIR / f"{name}.py"
+            tool_path.write_text(code, encoding="utf-8")
+            logger.info("Custom tool '%s' added and saved to %s", name, tool_path)
+
+            return {"ok": True, "name": name}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid code: {e}")
+
+    @app.delete("/api/tools/custom/{name}")
+    async def api_tools_delete_custom(name: str):
+        """Remove a custom tool."""
+        builtin_names = set(agent.config.get("tools", {}).get(
+            "builtin", ["read_file", "write_file", "exec_command", "memory_search"]))
+        builtin_names.update(["rag_search", "memory_search", "setup_agent"])
+        if name in builtin_names or "__" in name:
+            raise HTTPException(status_code=400, detail="Cannot delete builtin/MCP tools")
+        if name not in agent.tools._tools:
+            raise HTTPException(status_code=404, detail=f"Tool '{name}' not found")
+
+        del agent.tools._tools[name]
+        if name in agent.tools._handlers:
+            del agent.tools._handlers[name]
+
+        # Remove from disk
+        tool_path = CUSTOM_TOOLS_DIR / f"{name}.py"
+        if tool_path.exists():
+            tool_path.unlink()
+            logger.info("Custom tool '%s' removed from disk", name)
+
+        return {"ok": True, "name": name}
 
     @app.get("/api/config")
     async def api_config():
@@ -100,9 +200,15 @@ def mount_dashboard(app, agent):
 
     @app.get("/api/history")
     async def api_history():
-        """Conversation history for dashboard user."""
-        msgs = agent.memory.get_history(DASHBOARD_USER)
-        return msgs[-50:]  # last 50 messages
+        """Conversation history for dashboard user (persisted)."""
+        return agent.memory.get_chat_history_for_display(DASHBOARD_USER, limit=100)
+
+    @app.delete("/api/history")
+    async def api_clear_history():
+        """Clear chat history for dashboard user."""
+        agent.memory.clear_chat_history(DASHBOARD_USER)
+        agent.memory.clear_conversation(DASHBOARD_USER)
+        return {"ok": True}
 
     # ── Export endpoints ──────────────────────
 
