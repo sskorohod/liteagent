@@ -328,16 +328,39 @@ class LiteAgent:
         full_text = ""
 
         for iteration in range(self.max_iterations):
-            # Use streaming API for real token-by-token output
-            async for delta in self.provider.stream(
-                model=model,
-                max_tokens=4096,
-                system=system_prompt,
-                tools=tool_defs,
-                messages=messages,
-            ):
-                full_text += delta
-                yield delta
+            # Use streaming API with self-healing fallback
+            try:
+                async for delta in self.provider.stream(
+                    model=model,
+                    max_tokens=4096,
+                    system=system_prompt,
+                    tools=tool_defs,
+                    messages=messages,
+                ):
+                    full_text += delta
+                    yield delta
+            except Exception as e:
+                if self._is_fatal_error(e) or self._is_switchable_error(e):
+                    fallback = self._get_fallback_provider()
+                    if fallback:
+                        fb_name, fb_model = fallback
+                        logger.warning("Self-healing stream: %s → %s (%s)",
+                                       self.config.get("agent", {}).get("provider"), fb_name, e)
+                        self._switch_provider(fb_name, fb_model)
+                        model = fb_model
+                        yield f"\n⚡ Switched to {fb_name} ({fb_model}) — retrying...\n"
+                        # Retry with new provider
+                        async for delta in self.provider.stream(
+                            model=model, max_tokens=4096,
+                            system=system_prompt, tools=tool_defs, messages=messages,
+                        ):
+                            full_text += delta
+                            yield delta
+                    else:
+                        yield f"\n❌ Error: {e}\n"
+                        return
+                else:
+                    raise
 
             response = self.provider._last_stream_response
 
@@ -350,13 +373,13 @@ class LiteAgent:
                 tool_results = []
                 for block in tool_blocks:
                     # Signal tool start
-                    yield f"\n__TOOL_START__{json.dumps({'name': block.name, 'input': block.input, 'id': block.id})}__TOOL_END__\n"
+                    yield f"\n__TOOL_START__{json.dumps({'name': block.name, 'input': block.input, 'id': block.id}, default=str)}__TOOL_END__\n"
                     # Execute and collect result
                     result = await self.tools.execute_one(block)
                     tool_results.append(result)
                     meta = result.get("_meta", {})
                     # Signal tool result
-                    yield f"\n__TOOL_RESULT__{json.dumps({'name': meta.get('tool_name', block.name), 'id': block.id, 'duration_ms': meta.get('duration_ms', 0), 'error': meta.get('error', False), 'preview': meta.get('result_preview', '')[:300]})}__TOOL_END__\n"
+                    yield f"\n__TOOL_RESULT__{json.dumps({'name': meta.get('tool_name', block.name), 'id': block.id, 'duration_ms': meta.get('duration_ms', 0), 'error': meta.get('error', False), 'preview': meta.get('result_preview', '')[:300]}, default=str)}__TOOL_END__\n"
 
                 # Strip _meta before sending to LLM
                 clean_results = [{k: v for k, v in r.items() if k != "_meta"} for r in tool_results]
@@ -374,16 +397,84 @@ class LiteAgent:
         yield "\n⚠️ Max iterations reached."
 
     # ══════════════════════════════════════════
-    # API CALL WITH RETRY
+    # SELF-HEALING: PROVIDER FALLBACK
+    # ══════════════════════════════════════════
+
+    _FATAL_ERRORS = ("authentication", "auth", "401", "permission", "forbidden", "403")
+    _SWITCHABLE_ERRORS = ("rate", "limit", "429", "quota", "overloaded", "503", "capacity")
+
+    def _get_fallback_provider(self) -> tuple[str, str] | None:
+        """Find an alternative provider with a saved key. Returns (name, model) or None."""
+        from .config import get_api_key
+        from .providers import PROVIDER_MODELS
+        current = self.config.get("agent", {}).get("provider", "anthropic")
+        # Prefer providers in this order
+        _FALLBACK_ORDER = ["anthropic", "openai", "gemini", "ollama"]
+        for name in _FALLBACK_ORDER:
+            if name == current:
+                continue
+            key = get_api_key(name)
+            if key or name == "ollama":
+                # Check SDK availability
+                _SDK = {"anthropic": "anthropic", "openai": "openai",
+                        "gemini": "google.generativeai", "ollama": "openai"}
+                try:
+                    __import__(_SDK.get(name, name))
+                except ImportError:
+                    continue
+                models = PROVIDER_MODELS.get(name, [])
+                default_model = models[0] if models else "gpt-4o-mini"
+                return (name, default_model)
+        return None
+
+    def _switch_provider(self, provider_name: str, model: str):
+        """Switch to a fallback provider at runtime."""
+        import os
+        from .config import get_api_key, PROVIDER_ENV_VARS
+        key = get_api_key(provider_name)
+        env_var = PROVIDER_ENV_VARS.get(provider_name)
+        if key and env_var:
+            os.environ[env_var] = key
+        self.config.setdefault("agent", {})["provider"] = provider_name
+        self.config["agent"]["default_model"] = model
+        self.provider = create_provider(self.config)
+        self.default_model = model
+        logger.info("Self-healing: switched to provider %s / %s", provider_name, model)
+
+    def _is_fatal_error(self, e: Exception) -> bool:
+        """Check if error is non-retryable (bad key, permission denied)."""
+        err_str = f"{type(e).__name__} {e}".lower()
+        return any(kw in err_str for kw in self._FATAL_ERRORS)
+
+    def _is_switchable_error(self, e: Exception) -> bool:
+        """Check if error suggests switching provider (rate limit, quota, overloaded)."""
+        err_str = f"{type(e).__name__} {e}".lower()
+        return any(kw in err_str for kw in self._SWITCHABLE_ERRORS)
+
+    # ══════════════════════════════════════════
+    # API CALL WITH RETRY + FALLBACK
     # ══════════════════════════════════════════
 
     async def _call_api(self, **kwargs) -> "LLMResponse":
-        """Call LLM provider with retry + exponential backoff."""
+        """Call LLM provider with retry, exponential backoff, and provider fallback."""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 return await self.provider.complete(**kwargs)
             except Exception as e:
+                # Fatal error (auth) → try fallback provider immediately
+                if self._is_fatal_error(e) or self._is_switchable_error(e):
+                    fallback = self._get_fallback_provider()
+                    if fallback:
+                        fb_name, fb_model = fallback
+                        logger.warning("Self-healing: %s failed (%s), switching to %s",
+                                       self.config.get("agent", {}).get("provider"), e, fb_name)
+                        self._switch_provider(fb_name, fb_model)
+                        kwargs["model"] = fb_model
+                        # Remove provider-specific params that may not be supported
+                        continue
+                    raise
+
                 err_name = type(e).__name__
                 retryable = any(kw in err_name.lower() for kw in
                                 ("rate", "timeout", "connection", "server", "503", "429"))
