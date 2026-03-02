@@ -5,14 +5,23 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 
 
+def _make_test_agent():
+    """Create agent with forced anthropic provider (independent of user config)."""
+    os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
+    from liteagent.config import load_config
+    from liteagent.agent import LiteAgent
+    config = load_config()
+    # Force anthropic provider for tests (user config may have openai/gemini)
+    config["agent"]["provider"] = "anthropic"
+    config["agent"]["default_model"] = "claude-sonnet-4-20250514"
+    return LiteAgent(config)
+
+
 class TestFatalErrorDetection:
     """Test error classification methods."""
 
     def _make_agent(self):
-        os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
-        from liteagent.config import load_config
-        from liteagent.agent import LiteAgent
-        return LiteAgent(load_config())
+        return _make_test_agent()
 
     def test_auth_error_is_fatal(self):
         agent = self._make_agent()
@@ -49,10 +58,7 @@ class TestFallbackProvider:
     """Test finding alternative providers."""
 
     def _make_agent(self):
-        os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
-        from liteagent.config import load_config
-        from liteagent.agent import LiteAgent
-        return LiteAgent(load_config())
+        return _make_test_agent()
 
     def test_fallback_skips_current_provider(self):
         agent = self._make_agent()
@@ -68,14 +74,14 @@ class TestFallbackProvider:
                             lambda self: None)
         assert agent._get_fallback_provider() is None
 
-    def test_switch_provider_updates_state(self, monkeypatch):
+    async def test_switch_provider_updates_state(self, monkeypatch):
         agent = self._make_agent()
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-key")
         # Mock create_provider to avoid actual SDK init
         mock_provider = MagicMock()
         monkeypatch.setattr("liteagent.agent.create_provider", lambda cfg: mock_provider)
 
-        agent._switch_provider("openai", "gpt-4o-mini")
+        await agent._switch_provider("openai", "gpt-4o-mini")
 
         assert agent.config["agent"]["provider"] == "openai"
         assert agent.config["agent"]["default_model"] == "gpt-4o-mini"
@@ -87,10 +93,7 @@ class TestCallApiWithFallback:
     """Test _call_api with provider fallback."""
 
     def _make_agent(self):
-        os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
-        from liteagent.config import load_config
-        from liteagent.agent import LiteAgent
-        return LiteAgent(load_config())
+        return _make_test_agent()
 
     @pytest.mark.asyncio
     async def test_call_api_success(self):
@@ -128,9 +131,10 @@ class TestCallApiWithFallback:
         fallback_response = MagicMock()
         fallback_provider.complete = AsyncMock(return_value=fallback_response)
         monkeypatch.setattr(agent, "_get_fallback_provider", lambda: ("openai", "gpt-4o-mini"))
-        monkeypatch.setattr(agent, "_switch_provider",
-                            lambda name, model: setattr(agent, "provider", fallback_provider) or
-                            setattr(agent, "default_model", model))
+        async def mock_switch(name, model):
+            agent.provider = fallback_provider
+            agent.default_model = model
+        monkeypatch.setattr(agent, "_switch_provider", mock_switch)
 
         result = await agent._call_api(model="claude-sonnet-4-20250514", messages=[], max_tokens=10)
         assert result is fallback_response
@@ -168,7 +172,8 @@ class TestToolExecuteOne:
         block.input = {"name": "World"}
 
         result = await registry.execute_one(block)
-        assert result["content"] == "Hello, World!"
+        assert "Hello, World!" in result["content"]
+        assert "<tool_output" in result["content"]
         assert result["_meta"]["tool_name"] == "hello"
         assert result["_meta"]["error"] is False
         assert result["_meta"]["duration_ms"] >= 0

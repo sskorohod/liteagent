@@ -18,10 +18,74 @@ def main():
     parser.add_argument("--one-shot", "-1", default=None, help="Run single query and exit")
     parser.add_argument("--channel", default=None, choices=["cli", "telegram", "api"],
                         help="Channel to use (default: auto-detect from config)")
+    # Vault commands
+    parser.add_argument("--vault-migrate", action="store_true",
+                        help="Encrypt existing keys.json into vault and exit")
+    parser.add_argument("--vault-set", nargs=2, metavar=("PROVIDER", "KEY"),
+                        help="Set an API key in the vault and exit")
+    parser.add_argument("--vault-list", action="store_true",
+                        help="List providers stored in the vault and exit")
+    # Backup commands
+    parser.add_argument("--backup", action="store_true",
+                        help="Create a backup and exit")
+    parser.add_argument("--restore", type=str, metavar="FILE",
+                        help="Restore from a backup file and exit")
+    parser.add_argument("--list-backups", action="store_true",
+                        help="List available backups and exit")
     args = parser.parse_args()
+
+    # ── Vault CLI commands (exit early) ──
+    if args.vault_migrate:
+        from .vault import migrate_to_vault
+        migrate_to_vault()
+        print("✅ keys.json encrypted into vault")
+        return
+    if args.vault_set:
+        from .vault import vault_set, vault_enabled
+        if not vault_enabled():
+            print("❌ Set LITEAGENT_VAULT_KEY environment variable first")
+            sys.exit(1)
+        vault_set(args.vault_set[0], args.vault_set[1])
+        print(f"✅ {args.vault_set[0]} key saved to vault")
+        return
+    if args.vault_list:
+        from .vault import vault_list, vault_enabled
+        if not vault_enabled():
+            print("❌ Set LITEAGENT_VAULT_KEY environment variable first")
+            sys.exit(1)
+        providers = vault_list()
+        if providers:
+            print("Keys in vault:")
+            for p in providers:
+                print(f"  • {p}")
+        else:
+            print("Vault is empty")
+        return
+
+    # ── Backup CLI commands (exit early) ──
+    if args.list_backups:
+        from .backup import list_backups
+        backups = list_backups()
+        if backups:
+            for b in backups:
+                print(f"  {b['name']}  ({b['size_kb']} KB)  {b['created_at']}")
+        else:
+            print("No backups found")
+        return
 
     # Load config
     config = load_config(args.config)
+
+    if args.backup:
+        from .backup import backup
+        path = backup(config.get("_config_path"))
+        print(f"✅ Backup created: {path}")
+        return
+    if args.restore:
+        from .backup import restore
+        restore(args.restore)
+        print("✅ Restored from backup. Restart liteagent to apply.")
+        return
 
     # Create agent(s) — use pool if multi-agent config present
     if "agents" in config:
@@ -43,16 +107,9 @@ def main():
 
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Determine channel
-    channel = args.channel
-    if not channel:
-        channels_cfg = config.get("channels", {})
-        for name in ["telegram", "api", "cli"]:
-            ch = channels_cfg.get(name, {})
-            if isinstance(ch, dict) and ch.get("enabled"):
-                channel = name
-                break
-        channel = channel or "cli"
+    # Determine channel — default is always "api" (dashboard)
+    # Telegram runs alongside API automatically if enabled in config
+    channel = args.channel or "api"
 
     # Setup scheduler
     from .scheduler import setup_scheduler
@@ -60,12 +117,37 @@ def main():
     if scheduler:
         agent._scheduler = scheduler  # Expose for dashboard API
 
+    # Health monitor (exposed for dashboard + scheduler integration)
+    from .health import HealthMonitor
+    health_monitor = HealthMonitor(config)
+    agent._health_monitor = health_monitor
+
+    # Register health check as scheduler job (if scheduler available)
+    if scheduler:
+        health_cfg = config.get("health", {})
+        if health_cfg.get("enabled", True):
+            async def _health_check_job():
+                results = await health_monitor.run_all_checks()
+                for name, health in results.items():
+                    if health.status == "down":
+                        import logging
+                        logging.getLogger("liteagent.health").warning(
+                            "Channel %s is DOWN: %s", name, health.error_message)
+            scheduler.add_job(
+                "_health_check",
+                health_cfg.get("cron", "*/5 * * * *"),
+                _health_check_job,
+                max_runtime_sec=30)
+
     try:
         if args.one_shot:
             response = asyncio.run(agent.run(args.one_shot, args.user))
             print(response)
         elif channel == "telegram":
+            from .config import get_api_key
             tg_cfg = config.get("channels", {}).get("telegram", {})
+            if not tg_cfg.get("token"):
+                tg_cfg["token"] = get_api_key("telegram") or ""
             mode = tg_cfg.get("mode", "polling")
             if mode == "webhook":
                 # Webhook mode: run Telegram alongside API server
@@ -78,7 +160,7 @@ def main():
                     async def _start_scheduler():
                         scheduler.start()
                 import uvicorn
-                host = config.get("channels", {}).get("api", {}).get("host", "0.0.0.0")
+                host = config.get("channels", {}).get("api", {}).get("host", "127.0.0.1")
                 port = config.get("channels", {}).get("api", {}).get("port", 8080)
                 uvicorn.run(app, host=host, port=port)
             else:
@@ -91,7 +173,101 @@ def main():
                 asyncio.run(_run_tg_with_scheduler())
         elif channel == "api":
             from .channels.api import run_api_with_scheduler
-            run_api_with_scheduler(agent, config.get("channels", {}).get("api", {}), scheduler)
+            api_cfg = config.get("channels", {}).get("api", {})
+            tg_cfg = config.get("channels", {}).get("telegram", {})
+
+            # If Telegram is also enabled, start polling alongside API
+            if tg_cfg.get("enabled") and tg_cfg.get("mode", "polling") == "polling":
+                if not tg_cfg.get("token"):
+                    from .config import get_api_key
+                    tg_cfg["token"] = get_api_key("telegram") or ""
+
+                async def _run_api_with_telegram():
+                    """Run API server and Telegram bot concurrently."""
+                    import uvicorn
+                    from .channels.api import create_app
+                    from .channels.telegram import (_make_message_handler,
+                                                    _make_voice_handler, _parse_chat_ids)
+
+                    # Start scheduler
+                    if scheduler:
+                        scheduler.start()
+
+                    # Start config watcher
+                    config_path = config.get("_config_path")
+                    watcher = None
+                    if config_path:
+                        from .config_watcher import ConfigWatcher
+                        watcher = ConfigWatcher(config_path, agent, scheduler)
+                        watcher.start()
+
+                    # Start Telegram bot
+                    tg_app = None
+                    try:
+                        from telegram.ext import Application, MessageHandler, filters
+                        token = tg_cfg.get("token")
+                        print(f"[Jess] Telegram token present: {bool(token)}", flush=True)
+                        if token:
+                            allowed_chat_ids = _parse_chat_ids(tg_cfg)
+                            tg_app = Application.builder().token(token).build()
+                            handler = _make_message_handler(agent, allowed_chat_ids)
+                            tg_app.add_handler(
+                                MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
+                            if tg_cfg.get("voice_enabled", True):
+                                voice_handler = _make_voice_handler(
+                                    agent, allowed_chat_ids, tg_cfg)
+                                tg_app.add_handler(
+                                    MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
+                                print("[Jess] Voice handler registered (Whisper)")
+                            await tg_app.initialize()
+                            await tg_app.updater.start_polling(drop_pending_updates=True)
+                            await tg_app.start()
+                            print("[Jess] Telegram bot running alongside API server!")
+                    except Exception as e:
+                        import traceback, sys
+                        print(f"[ERROR] Telegram bot failed: {e}", flush=True)
+                        traceback.print_exc(file=sys.stdout)
+                        sys.stdout.flush()
+
+                    # Boot checks (proactive startup tasks)
+                    from .boot import run_boot_checks
+                    try:
+                        boot_results = await run_boot_checks(agent, config)
+                        for r in boot_results:
+                            print(f"   Boot: {r['instruction']} → {r['status']}")
+                    except Exception as e:
+                        import logging
+                        logging.getLogger("liteagent.boot").warning(
+                            "Boot checks failed: %s", e)
+
+                    # Start API server
+                    app = create_app(agent)
+                    host = api_cfg.get("host", "127.0.0.1")
+                    port = api_cfg.get("port", 8080)
+
+                    # Auto-open dashboard in browser
+                    import webbrowser
+                    import threading
+                    open_host = "localhost" if host == "0.0.0.0" else host
+                    dashboard_url = f"http://{open_host}:{port}"
+                    print(f"\n   Dashboard: {dashboard_url}\n")
+                    threading.Timer(1.5, webbrowser.open, args=[dashboard_url]).start()
+
+                    uvi_config = uvicorn.Config(app, host=host, port=port)
+                    server = uvicorn.Server(uvi_config)
+                    try:
+                        await server.serve()
+                    finally:
+                        if watcher:
+                            watcher.stop()
+                        if tg_app:
+                            await tg_app.updater.stop()
+                            await tg_app.stop()
+                            await tg_app.shutdown()
+
+                asyncio.run(_run_api_with_telegram())
+            else:
+                run_api_with_scheduler(agent, api_cfg, scheduler, full_config=config)
         else:
             async def _run_cli_with_scheduler():
                 if scheduler:

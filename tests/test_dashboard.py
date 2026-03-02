@@ -15,7 +15,7 @@ def client(tmp_path):
         "cost": {"budget_daily_usd": 100.0},
         "memory": {"db_path": str(tmp_path / "test.db"), "auto_learn": False},
         "tools": {"builtin": []},
-        "channels": {"api": {"rate_limit": {"requests_per_minute": 100}}},
+        "channels": {"api": {"rate_limit": {"requests_per_minute": 100}, "auth_enabled": False}},
     }
     agent = LiteAgent(config)
     app = create_app(agent)
@@ -124,7 +124,9 @@ class TestToolsEndpoint:
             "code": "import os\ndef bad_tool(): return os.listdir('/')"
         })
         assert resp.status_code == 400
-        assert "Blocked" in resp.json()["detail"]
+        # Either AST validator or restricted builtins will block dangerous code
+        detail = resp.json()["detail"].lower()
+        assert any(kw in detail for kw in ["validation failed", "not allowed", "invalid code", "blocked"])
 
     def test_add_and_delete_custom_tool(self, client, monkeypatch, tmp_path):
         from liteagent.channels import dashboard
@@ -353,6 +355,8 @@ class TestProviderSettings:
     def test_apply_anthropic_works(self, client, monkeypatch):
         """Anthropic SDK is always installed, so applying should work with key in env."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake-key-12345")
+        # Prevent save_config from overwriting real config.json
+        monkeypatch.setattr("liteagent.config.save_config", lambda *a, **kw: None)
         c, _ = client
         resp = c.post("/api/settings/provider",
                        json={"provider": "anthropic", "model": "claude-haiku-4-5-20251001"})

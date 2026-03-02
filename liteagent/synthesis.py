@@ -3,6 +3,9 @@
 import ast
 import json
 import logging
+import signal
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -81,9 +84,63 @@ def validate_tool_source(source: str,
     return True, ""
 
 
+# ── Execution budgets for synthesized tools ──────────────────
+
+# Default limits (can be overridden via config)
+DEFAULT_SYNTH_TIMEOUT_SEC = 10
+DEFAULT_SYNTH_MAX_OUTPUT_CHARS = 50000
+
+
+class _SynthTimeoutError(Exception):
+    """Raised when a synthesized tool exceeds its execution time budget."""
+    pass
+
+
+def _budgeted_wrapper(func, name: str, timeout_sec: int = DEFAULT_SYNTH_TIMEOUT_SEC,
+                      max_output: int = DEFAULT_SYNTH_MAX_OUTPUT_CHARS):
+    """Wrap a synthesized function with execution time and output size limits.
+
+    Uses a thread with timeout to avoid blocking the event loop and to
+    work on all platforms (signal.alarm is Unix-only and main-thread-only).
+    """
+    def wrapper(*args, **kwargs):
+        result_container = [None]
+        error_container = [None]
+
+        def target():
+            try:
+                result_container[0] = func(*args, **kwargs)
+            except Exception as e:
+                error_container[0] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(timeout=timeout_sec)
+
+        if t.is_alive():
+            logger.warning("Synthesized tool '%s' timed out after %ds", name, timeout_sec)
+            raise _SynthTimeoutError(
+                f"Tool '{name}' exceeded execution time limit ({timeout_sec}s)")
+
+        if error_container[0]:
+            raise error_container[0]
+
+        result = result_container[0]
+        # Enforce output size limit
+        if isinstance(result, str) and len(result) > max_output:
+            result = result[:max_output] + f"\n... [truncated at {max_output} chars]"
+        return result
+
+    wrapper.__name__ = f"budgeted_{name}"
+    wrapper.__doc__ = func.__doc__
+    return wrapper
+
+
 def register_synthesized_tool(registry, name: str, source: str,
-                              description: str, schema: dict):
-    """Compile and register a synthesized tool into the registry."""
+                              description: str, schema: dict,
+                              timeout_sec: int = DEFAULT_SYNTH_TIMEOUT_SEC,
+                              max_output: int = DEFAULT_SYNTH_MAX_OUTPUT_CHARS):
+    """Compile and register a synthesized tool into the registry with execution budgets."""
     namespace = {}
     exec(compile(ast.parse(source), f"<synth:{name}>", "exec"), namespace)  # noqa: S102
 
@@ -98,16 +155,22 @@ def register_synthesized_tool(registry, name: str, source: str,
         raise ValueError("No callable function found in source")
 
     handler = namespace[func_name]
+    # Wrap with execution budget (timeout + output cap)
+    handler = _budgeted_wrapper(handler, name, timeout_sec, max_output)
+
     registry._tools[name] = {
         "name": name,
         "description": description,
         "input_schema": schema,
     }
     registry._handlers[name] = handler
-    logger.info("Registered synthesized tool: %s", name)
+    logger.info("Registered synthesized tool: %s (timeout=%ds, max_output=%d)",
+                name, timeout_sec, max_output)
 
 
-def load_synthesized_tools(db, registry, import_whitelist: set | None = None):
+def load_synthesized_tools(db, registry, import_whitelist: set | None = None,
+                           timeout_sec: int = DEFAULT_SYNTH_TIMEOUT_SEC,
+                           max_output: int = DEFAULT_SYNTH_MAX_OUTPUT_CHARS):
     """Load approved synthesized tools from DB on startup."""
     rows = db.execute(
         "SELECT name, description, source_code, parameters_json "
@@ -119,7 +182,8 @@ def load_synthesized_tools(db, registry, import_whitelist: set | None = None):
             schema = json.loads(params_json) if params_json else {
                 "type": "object", "properties": {}}
             try:
-                register_synthesized_tool(registry, name, source, desc, schema)
+                register_synthesized_tool(registry, name, source, desc, schema,
+                                          timeout_sec=timeout_sec, max_output=max_output)
             except Exception as e:
                 logger.error("Failed to load synth tool '%s': %s", name, e)
         else:
@@ -130,6 +194,8 @@ def create_synthesize_meta_tool(registry, db, config: dict):
     """Register the 'synthesize_tool' meta-tool that creates new tools."""
     whitelist = set(config.get("import_whitelist", DEFAULT_IMPORT_WHITELIST))
     auto_approve = config.get("auto_approve", False)
+    _timeout = config.get("timeout_sec", DEFAULT_SYNTH_TIMEOUT_SEC)
+    _max_out = config.get("max_output_chars", DEFAULT_SYNTH_MAX_OUTPUT_CHARS)
 
     async def synthesize_tool(name: str, description: str,
                               source_code: str,
@@ -163,8 +229,9 @@ def create_synthesize_meta_tool(registry, db, config: dict):
         if approved:
             try:
                 register_synthesized_tool(
-                    registry, name, source_code, description, schema)
-                return f"Tool '{name}' created and registered."
+                    registry, name, source_code, description, schema,
+                    timeout_sec=_timeout, max_output=_max_out)
+                return f"Tool '{name}' created and registered (timeout={_timeout}s)."
             except Exception as e:
                 return f"Tool created but registration failed: {e}"
         return f"Tool '{name}' created (pending approval)."

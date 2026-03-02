@@ -127,17 +127,22 @@ def mount_dashboard(app, agent):
         if name in agent.tools._tools:
             raise HTTPException(status_code=400, detail=f"Tool '{name}' already exists")
 
-        # Validate: no dangerous patterns
-        _BLOCKED = ["import os", "import subprocess", "import sys", "eval(", "exec(",
-                     "__import__", "open('/etc", "open('/dev", "rm -rf"]
-        for pat in _BLOCKED:
-            if pat in code:
-                raise HTTPException(status_code=400, detail=f"Blocked pattern: {pat}")
+        # Validate with AST-based analysis (same as synthesis.py)
+        from ..synthesis import validate_tool_source
+        ok, err = validate_tool_source(code)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Code validation failed: {err}")
 
-        # Compile and register
+        # Compile and register (with restricted builtins)
         try:
-            namespace = {}
-            exec(compile(code, f"<custom_tool_{name}>", "exec"), namespace)
+            import builtins as _builtins
+            _BLOCKED_BUILTINS = {"exec", "eval", "compile", "__import__", "open",
+                                 "globals", "locals", "getattr", "setattr", "delattr",
+                                 "breakpoint", "exit", "quit"}
+            safe_builtins = {k: v for k, v in vars(_builtins).items()
+                             if k not in _BLOCKED_BUILTINS}
+            namespace = {"__builtins__": safe_builtins}
+            exec(compile(code, f"<custom_tool_{name}>", "exec"), namespace)  # noqa: S102
             func = namespace.get(name)
             if not func or not callable(func):
                 raise HTTPException(status_code=400,
@@ -146,7 +151,7 @@ def mount_dashboard(app, agent):
             agent.tools.tool(name=name, description=description or func.__doc__)(func)
 
             # Save to disk for persistence
-            CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+            CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
             tool_path = CUSTOM_TOOLS_DIR / f"{name}.py"
             tool_path.write_text(code, encoding="utf-8")
             logger.info("Custom tool '%s' added and saved to %s", name, tool_path)
@@ -185,12 +190,18 @@ def mount_dashboard(app, agent):
         """Read-only agent config (strip sensitive keys)."""
         import copy
         cfg = copy.deepcopy(agent.config)
-        # Strip secrets
-        for key_path in [
+        # Strip ALL secret fields from API response
+        _SECRET_DISPLAY_PATHS = [
             ("providers", "anthropic", "api_key"),
+            ("providers", "openai", "api_key"),
+            ("providers", "gemini", "api_key"),
             ("channels", "telegram", "token"),
             ("tools", "brave_api_key"),
-        ]:
+            ("storage", "access_key"),
+            ("storage", "secret_key"),
+            ("rag", "qdrant", "api_key"),
+        ]
+        for key_path in _SECRET_DISPLAY_PATHS:
             obj = cfg
             for k in key_path[:-1]:
                 obj = obj.get(k, {}) if isinstance(obj, dict) else {}
@@ -282,6 +293,132 @@ def mount_dashboard(app, agent):
         if sched:
             return sched.get_jobs()
         return []
+
+    # ── Operations Dashboard ────────────────────
+
+    @app.get("/api/ops/active")
+    async def api_ops_active():
+        """Currently executing requests and scheduler job status."""
+        from ..agent import LiteAgent
+        active = LiteAgent.get_active_requests()
+
+        scheduler_running = []
+        sched = getattr(agent, '_scheduler', None)
+        if sched:
+            for job in sched._jobs:
+                if job.get("_running"):
+                    scheduler_running.append({
+                        "name": job["name"],
+                        "started_at": job.get("_run_started"),
+                    })
+
+        queued = LiteAgent.get_queued_requests()
+
+        return {
+            "requests": active,
+            "queued": queued,
+            "scheduler_jobs_running": scheduler_running,
+        }
+
+    @app.get("/api/ops/recent")
+    async def api_ops_recent(limit: int = 15):
+        """Recent agent interactions for activity feed."""
+        try:
+            rows = agent.memory.db.execute(
+                """SELECT id, user_id, user_input, agent_response,
+                          tool_calls_json, success, confidence, model_used, created_at
+                   FROM interaction_log
+                   ORDER BY id DESC LIMIT ?""",
+                (min(limit, 50),)).fetchall()
+        except Exception:
+            return []
+
+        result = []
+        for r in rows:
+            tool_calls = []
+            try:
+                tool_calls = json.loads(r[4]) if r[4] else []
+            except Exception:
+                pass
+            result.append({
+                "id": r[0],
+                "user_id": r[1],
+                "input_preview": (r[2] or "")[:150],
+                "response_preview": (r[3] or "")[:150],
+                "tool_calls": [tc.get("name", "?") for tc in tool_calls][:5],
+                "tool_count": len(tool_calls),
+                "success": r[5],
+                "confidence": r[6],
+                "model": r[7],
+                "created_at": r[8],
+            })
+        return result
+
+    @app.get("/api/ops/system")
+    async def api_ops_system():
+        """System status: provider, model, features, scheduler, budget."""
+        from ..agent import LiteAgent
+        from ..scheduler import cron_matches
+        from datetime import datetime, timedelta
+
+        agent_cfg = agent.config.get("agent", {})
+
+        # Provider info
+        provider_info = {
+            "provider": agent_cfg.get("provider", "anthropic"),
+            "model": agent.default_model,
+            "cascade_routing": agent.cascade_routing,
+            "models": agent.models,
+        }
+
+        # Budget info
+        today_cost = agent.memory.get_today_cost()
+        budget_info = {
+            "daily_budget": agent.budget_daily,
+            "today_cost": round(today_cost, 4),
+            "budget_pct": round(today_cost / agent.budget_daily * 100, 1) if agent.budget_daily > 0 else 0,
+        }
+
+        # Scheduler jobs with next run calculation
+        sched = getattr(agent, '_scheduler', None)
+        jobs = []
+        if sched:
+            now = datetime.now()
+            for job in sched._jobs:
+                # Calculate next run by scanning forward (max 7 days)
+                next_run = None
+                check = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                for _ in range(7 * 24 * 60):
+                    if cron_matches(job["cron"], check):
+                        next_run = check.isoformat()
+                        break
+                    check += timedelta(minutes=1)
+
+                jobs.append({
+                    "name": job["name"],
+                    "cron_expr": job["cron_expr"],
+                    "last_run": job["last_run"],
+                    "next_run": next_run,
+                    "running": job.get("_running", False),
+                })
+
+        # Feature flags (compact)
+        features_cfg = agent.config.get("features", {})
+        features = {}
+        for name in ["dream_cycle", "self_evolving_prompt", "proactive_agent",
+                      "auto_tool_synthesis", "confidence_gate", "style_adaptation",
+                      "skill_crystallization", "counterfactual_replay",
+                      "internal_monologue"]:
+            cfg = features_cfg.get(name, {})
+            features[name] = cfg.get("enabled", False)
+
+        return {
+            "provider": provider_info,
+            "budget": budget_info,
+            "scheduler_jobs": jobs,
+            "features": features,
+            "active_request_count": len(LiteAgent._active_requests),
+        }
 
     # ── Feature monitoring ────────────────────
 
@@ -507,15 +644,33 @@ def mount_dashboard(app, agent):
 
         # Update config and recreate provider
         agent.config.setdefault("agent", {})["provider"] = provider_name
+
+        # Auto-select model if not specified
+        if not model and provider_name == "ollama":
+            from ..providers import refresh_ollama_models
+            ollama_models = refresh_ollama_models()
+            model = ollama_models[0] if ollama_models else ""
+        if not model:
+            models = PROVIDER_MODELS.get(provider_name, [])
+            model = models[0] if models else ""
+
         if model:
             agent.config["agent"]["default_model"] = model
+            agent.default_model = model
+            # Update cascade models to use the same Ollama model
+            if provider_name == "ollama":
+                agent.models = {"simple": model, "medium": model, "complex": model}
+                agent.config["agent"]["models"] = {"simple": model, "medium": model, "complex": model}
 
         try:
             from ..providers import create_provider
             agent.provider = create_provider(agent.config)
-            if model:
-                agent.model = model
-            return {"ok": True, "provider": provider_name, "model": model or agent.model}
+
+            # Persist to config.json so settings survive server restart
+            from ..config import save_config
+            save_config(agent.config)
+
+            return {"ok": True, "provider": provider_name, "model": model}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Provider init failed: {e}")
 
@@ -589,6 +744,95 @@ def mount_dashboard(app, agent):
             raise HTTPException(status_code=404, detail="No saved key found")
         return {"ok": True}
 
+    # ── Routing Settings ──────────────────
+
+    @app.get("/api/settings/routing")
+    async def api_settings_routing():
+        """Get cascade routing mode and model config."""
+        cost_cfg = agent.config.get("cost", {})
+        agent_cfg = agent.config.get("agent", {})
+        return {
+            "cascade_routing": cost_cfg.get("cascade_routing", True),
+            "models": agent_cfg.get("models", {}),
+            "default_model": agent_cfg.get("default_model", ""),
+            "local_only_hours": cost_cfg.get("local_only_hours", {
+                "enabled": False, "start": "00:00", "end": "08:00"
+            }),
+        }
+
+    @app.post("/api/settings/routing")
+    async def api_settings_routing_save(body: dict):
+        """Save routing mode and cascade model config."""
+        from ..config import save_config
+
+        # Update cascade_routing flag
+        if "cascade_routing" in body:
+            agent.config.setdefault("cost", {})["cascade_routing"] = bool(body["cascade_routing"])
+            agent.cascade_routing = bool(body["cascade_routing"])
+
+        # Update cascade models
+        if "models" in body and isinstance(body["models"], dict):
+            models = body["models"]
+            agent_models = agent.config.setdefault("agent", {}).setdefault("models", {})
+            for level in ("simple", "medium", "complex"):
+                if level in models and models[level]:
+                    agent_models[level] = models[level]
+            agent.models = agent_models
+
+        # Update local-only hours schedule
+        if "local_only_hours" in body and isinstance(body["local_only_hours"], dict):
+            loh = body["local_only_hours"]
+            schedule = agent.config.setdefault("cost", {}).setdefault("local_only_hours", {})
+            if "enabled" in loh:
+                schedule["enabled"] = bool(loh["enabled"])
+            if "start" in loh:
+                schedule["start"] = loh["start"]
+            if "end" in loh:
+                schedule["end"] = loh["end"]
+
+        save_config(agent.config)
+        logger.info("Routing config saved: cascade=%s", agent.cascade_routing)
+        return {"ok": True}
+
+    # ── Planning (Internal Monologue) Settings ─
+
+    @app.get("/api/settings/planning")
+    async def api_settings_planning():
+        """Get internal monologue / planning configuration."""
+        im = agent.config.get("features", {}).get("internal_monologue", {})
+        return {
+            "enabled": im.get("enabled", False),
+            "planning_model": im.get("planning_model", "auto"),
+            "skip_simple": im.get("skip_simple", True),
+            "reflect_every_n_tools": im.get("reflect_every_n_tools", 3),
+        }
+
+    @app.post("/api/settings/planning")
+    async def api_settings_planning_save(body: dict):
+        """Save planning / internal monologue settings."""
+        from ..config import save_config
+
+        features = agent.config.setdefault("features", {})
+        im = features.setdefault("internal_monologue", {})
+
+        if "enabled" in body:
+            im["enabled"] = bool(body["enabled"])
+        if "planning_model" in body:
+            im["planning_model"] = str(body["planning_model"]).strip() or "auto"
+        if "skip_simple" in body:
+            im["skip_simple"] = bool(body["skip_simple"])
+        if "reflect_every_n_tools" in body:
+            val = body["reflect_every_n_tools"]
+            try:
+                im["reflect_every_n_tools"] = max(1, min(int(val), 10))
+            except (ValueError, TypeError):
+                pass
+
+        save_config(agent.config)
+        logger.info("Planning config saved: enabled=%s, model=%s",
+                     im.get("enabled"), im.get("planning_model"))
+        return {"ok": True}
+
     # ── Telegram Settings ───────────────────
 
     @app.get("/api/settings/telegram")
@@ -597,19 +841,22 @@ def mount_dashboard(app, agent):
         from ..config import get_api_key, key_preview
         tg_cfg = agent.config.get("channels", {}).get("telegram", {})
         token = tg_cfg.get("token") or get_api_key("telegram")
+        chat_id = tg_cfg.get("chat_id", "")
         return {
             "configured": bool(token),
             "token_preview": key_preview(token) if token else "",
+            "chat_id": str(chat_id) if chat_id else "",
             "mode": tg_cfg.get("mode", "polling"),
             "webhook_url": tg_cfg.get("webhook_url", ""),
+            "voice_transcription": tg_cfg.get("voice_transcription", "auto"),
         }
 
     @app.post("/api/settings/telegram")
     async def api_settings_telegram_save(body: dict):
-        """Save Telegram bot token."""
-        from ..config import save_provider_key, key_preview
+        """Save Telegram bot token and chat_id."""
+        from ..config import save_provider_key, save_config, key_preview
         token = body.get("token", "").strip()
-        mode = body.get("mode", "polling").strip()
+        chat_id = body.get("chat_id", "").strip()
 
         if not token:
             raise HTTPException(status_code=400, detail="Token required")
@@ -621,10 +868,17 @@ def mount_dashboard(app, agent):
         save_provider_key("telegram", token)
 
         # Update runtime config
-        agent.config.setdefault("channels", {}).setdefault("telegram", {})
-        agent.config["channels"]["telegram"]["token"] = token
-        agent.config["channels"]["telegram"]["mode"] = mode
-        logger.info("Telegram token saved (mode: %s)", mode)
+        tg = agent.config.setdefault("channels", {}).setdefault("telegram", {})
+        tg["token"] = token
+        tg["enabled"] = True
+        if chat_id:
+            tg["chat_id"] = chat_id
+        elif "chat_id" in tg:
+            del tg["chat_id"]
+
+        # Persist to config.json (without token — it's in keys.json)
+        save_config(agent.config)
+        logger.info("Telegram config saved (chat_id: %s)", chat_id or "all")
 
         return {"ok": True, "token_preview": key_preview(token)}
 
@@ -668,6 +922,57 @@ def mount_dashboard(app, agent):
             raise HTTPException(status_code=404, detail="No token saved")
         return {"ok": True}
 
+    # ── Voice Transcription Settings ─────────
+
+    @app.get("/api/settings/voice")
+    async def api_settings_voice():
+        """Get voice transcription mode and available backends."""
+        tg_cfg = agent.config.get("channels", {}).get("telegram", {})
+        mode = tg_cfg.get("voice_transcription", "auto")
+
+        # Check what's actually available
+        has_builtin = "transcribe_voice" in agent.tools._tools
+        mcp_tools = [n for n in agent.tools._tools
+                     if "transcribe" in n and "__" in n]
+        has_mcp = bool(mcp_tools)
+
+        # Determine active backend
+        if mode == "builtin" or (mode == "auto" and not has_mcp):
+            active = "builtin"
+        elif mode == "mcp" or (mode == "auto" and has_mcp):
+            active = "mcp"
+        else:
+            active = "builtin"
+
+        return {
+            "mode": mode,
+            "active": active,
+            "has_builtin": has_builtin or mode == "builtin",
+            "has_mcp": has_mcp or (agent._mcp_config and
+                                   any("whisper" in k.lower() or "transcri" in k.lower()
+                                       for k in agent._mcp_config)),
+            "mcp_tools": mcp_tools,
+        }
+
+    @app.post("/api/settings/voice")
+    async def api_settings_voice_save(body: dict):
+        """Switch voice transcription mode: auto, builtin, mcp."""
+        from ..config import save_config
+        mode = body.get("mode", "auto")
+        if mode not in ("auto", "builtin", "mcp"):
+            raise HTTPException(400, "Mode must be: auto, builtin, or mcp")
+
+        tg = agent.config.setdefault("channels", {}).setdefault("telegram", {})
+        tg["voice_transcription"] = mode
+        save_config(agent.config)
+
+        # Apply immediately — re-register tools based on new mode
+        if "transcribe_voice" not in agent.tools._tools:
+            agent._wire_voice_tool()
+        agent._apply_voice_transcription_mode()
+
+        return {"ok": True, "mode": mode}
+
     # ── RAG Document Management ─────────────
 
     @app.get("/api/rag/documents")
@@ -704,5 +1009,369 @@ def mount_dashboard(app, agent):
         if not ok:
             raise HTTPException(status_code=404, detail="Document not found")
         return {"status": "deleted"}
+
+    # ── Storage Management ──────────────────
+
+    @app.get("/api/storage/status")
+    async def api_storage_status():
+        """Get storage backend status."""
+        storage = getattr(agent, '_storage', None)
+        if not storage:
+            return {"enabled": False}
+        try:
+            stats = storage.get_stats()
+            return {"enabled": True, "connected": True, **stats}
+        except Exception as e:
+            return {"enabled": True, "connected": False, "error": str(e)}
+
+    @app.get("/api/storage/files")
+    async def api_storage_files(prefix: str = "", limit: int = 100):
+        """List files in storage."""
+        storage = getattr(agent, '_storage', None)
+        if not storage:
+            return []
+        return storage.list_files(prefix=prefix, limit=limit)
+
+    @app.post("/api/storage/upload")
+    async def api_storage_upload(body: dict):
+        """Upload file content to storage."""
+        storage = getattr(agent, '_storage', None)
+        if not storage:
+            raise HTTPException(status_code=400, detail="Storage not enabled")
+        key = body.get("key", "").strip()
+        content = body.get("content", "")
+        if not key:
+            raise HTTPException(status_code=400, detail="File key required")
+        try:
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            storage.upload(key, data)
+            return {"ok": True, "key": key, "size": len(data)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/storage/files/{key:path}")
+    async def api_storage_delete(key: str):
+        """Delete a file from storage."""
+        storage = getattr(agent, '_storage', None)
+        if not storage:
+            raise HTTPException(status_code=400, detail="Storage not enabled")
+        ok = storage.delete(key)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Delete failed")
+        return {"ok": True}
+
+    @app.get("/api/settings/storage")
+    async def api_settings_storage():
+        """Get storage configuration status."""
+        from ..config import get_api_key, key_preview
+        storage_cfg = agent.config.get("storage", {})
+        storage = getattr(agent, '_storage', None)
+        access_key = storage_cfg.get("access_key") or get_api_key("minio_access") or ""
+        return {
+            "enabled": storage_cfg.get("enabled", False),
+            "connected": storage is not None,
+            "endpoint": storage_cfg.get("endpoint", ""),
+            "bucket": storage_cfg.get("bucket", "liteagent"),
+            "access_key_preview": key_preview(access_key) if access_key else "",
+        }
+
+    @app.post("/api/settings/storage")
+    async def api_settings_storage_save(body: dict):
+        """Save storage configuration."""
+        from ..config import save_provider_key
+        from ..storage import create_storage
+
+        endpoint = body.get("endpoint", "").strip()
+        access_key = body.get("access_key", "").strip()
+        secret_key = body.get("secret_key", "").strip()
+        bucket = body.get("bucket", "liteagent").strip()
+
+        if not endpoint:
+            raise HTTPException(status_code=400, detail="Endpoint required")
+        if not access_key or not secret_key:
+            raise HTTPException(status_code=400, detail="Access key and secret key required")
+
+        # Save credentials
+        save_provider_key("minio_access", access_key)
+        save_provider_key("minio_secret", secret_key)
+
+        # Update config
+        agent.config.setdefault("storage", {}).update({
+            "enabled": True, "endpoint": endpoint,
+            "access_key": access_key, "secret_key": secret_key,
+            "bucket": bucket,
+        })
+
+        # Reconnect storage
+        try:
+            agent._storage = create_storage(agent.config)
+            return {"ok": True, "connected": agent._storage is not None}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/api/settings/storage/test")
+    async def api_settings_storage_test(body: dict):
+        """Test storage connection."""
+        endpoint = body.get("endpoint", "").strip()
+        access_key = body.get("access_key", "").strip()
+        secret_key = body.get("secret_key", "").strip()
+        bucket = body.get("bucket", "liteagent").strip()
+
+        if not endpoint or not access_key or not secret_key:
+            return {"ok": False, "error": "Missing credentials"}
+
+        try:
+            from ..storage import StorageBackend
+            import time
+            start = time.time()
+            s = StorageBackend({
+                "endpoint": endpoint, "access_key": access_key,
+                "secret_key": secret_key, "bucket": bucket,
+            })
+            stats = s.get_stats()
+            latency_ms = int((time.time() - start) * 1000)
+            return {"ok": True, "latency_ms": latency_ms, **stats}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Qdrant Settings ────────────────────
+
+    @app.get("/api/settings/qdrant")
+    async def api_settings_qdrant():
+        """Get Qdrant configuration status."""
+        from ..config import get_api_key, key_preview
+        rag_cfg = agent.config.get("rag", {})
+        qdrant_cfg = rag_cfg.get("qdrant", {})
+        api_key = qdrant_cfg.get("api_key") or get_api_key("qdrant") or ""
+        rag = getattr(agent, '_rag', None)
+        connected = rag.is_qdrant_connected() if rag else False
+        stats = rag.get_stats() if rag else {}
+        return {
+            "enabled": rag_cfg.get("enabled", False),
+            "connected": connected,
+            "url": qdrant_cfg.get("url", ""),
+            "collection": qdrant_cfg.get("collection", "liteagent_rag"),
+            "api_key_preview": key_preview(api_key) if api_key else "",
+            "stats": stats,
+        }
+
+    @app.post("/api/settings/qdrant")
+    async def api_settings_qdrant_save(body: dict):
+        """Save Qdrant configuration and reconnect RAG."""
+        from ..config import save_provider_key
+        from ..rag import RAGPipeline
+
+        url = body.get("url", "").strip()
+        api_key = body.get("api_key", "").strip()
+        collection = body.get("collection", "liteagent_rag").strip()
+
+        if not url:
+            raise HTTPException(status_code=400, detail="Qdrant URL required")
+
+        if api_key:
+            save_provider_key("qdrant", api_key)
+
+        # Update config
+        agent.config.setdefault("rag", {}).update({"enabled": True})
+        agent.config["rag"]["qdrant"] = {
+            "url": url, "api_key": api_key, "collection": collection,
+        }
+
+        # Reconnect RAG
+        try:
+            agent._rag = RAGPipeline(
+                agent.memory.db,
+                embedder=agent.memory._embedder,
+                config=agent.config["rag"])
+            agent._wire_rag_tool()
+            connected = agent._rag.is_qdrant_connected()
+            return {"ok": True, "connected": connected}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/api/settings/qdrant/test")
+    async def api_settings_qdrant_test(body: dict):
+        """Test Qdrant connection."""
+        url = body.get("url", "").strip()
+        api_key = body.get("api_key", "").strip()
+
+        if not url:
+            return {"ok": False, "error": "URL required"}
+
+        try:
+            from qdrant_client import QdrantClient
+            import time
+            start = time.time()
+            client = QdrantClient(url=url, api_key=api_key or None, timeout=5)
+            collections = client.get_collections()
+            latency_ms = int((time.time() - start) * 1000)
+            names = [c.name for c in collections.collections]
+            return {"ok": True, "latency_ms": latency_ms, "collections": names}
+        except ImportError:
+            return {"ok": False, "error": "qdrant-client not installed. Run: pip install liteagent[qdrant]"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── MCP Server Management ──────────────
+
+    @app.get("/api/mcp/config")
+    async def api_mcp_config():
+        """Get MCP server configuration (from config.json)."""
+        mcp_cfg = agent.config.get("tools", {}).get("mcp_servers", {})
+        servers = []
+        connected = agent.tools.get_mcp_server_info()
+        connected_names = {s.get("name", "") for s in connected}
+        for name, cfg in mcp_cfg.items():
+            servers.append({
+                "name": name,
+                "command": cfg.get("command", ""),
+                "args": cfg.get("args", []),
+                "env": {k: "***" for k in cfg.get("env", {})},
+                "connected": name in connected_names,
+            })
+        return servers
+
+    @app.post("/api/mcp/servers")
+    async def api_mcp_add_server(body: dict):
+        """Add an MCP server to config and reload."""
+        name = body.get("name", "").strip()
+        command = body.get("command", "").strip()
+        args = body.get("args", [])
+        env = body.get("env", {})
+
+        if not name:
+            raise HTTPException(status_code=400, detail="Server name required")
+        if not command:
+            raise HTTPException(status_code=400, detail="Command required")
+
+        # Support JSON mode: if body has "json_config", parse it
+        json_config = body.get("json_config", "").strip()
+        if json_config:
+            try:
+                parsed = json.loads(json_config)
+                if isinstance(parsed, dict):
+                    # Could be a single server config or {name: config}
+                    if "command" in parsed:
+                        command = parsed["command"]
+                        args = parsed.get("args", [])
+                        env = parsed.get("env", {})
+                    else:
+                        # Format: {"server_name": {"command": ..., "args": ...}}
+                        for srv_name, srv_cfg in parsed.items():
+                            name = srv_name
+                            command = srv_cfg.get("command", "")
+                            args = srv_cfg.get("args", [])
+                            env = srv_cfg.get("env", {})
+                            break
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+        # Add to config
+        agent.config.setdefault("tools", {}).setdefault("mcp_servers", {})
+        agent.config["tools"]["mcp_servers"][name] = {
+            "command": command, "args": args, "env": env,
+        }
+        agent._mcp_config = agent.config["tools"]["mcp_servers"]
+
+        # Reload MCP
+        try:
+            await agent.reload_mcp()
+            servers = agent.tools.get_mcp_server_info()
+            return {"ok": True, "servers": servers}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.delete("/api/mcp/servers/{name}")
+    async def api_mcp_delete_server(name: str):
+        """Remove an MCP server from config and reload."""
+        mcp_cfg = agent.config.get("tools", {}).get("mcp_servers", {})
+        if name not in mcp_cfg:
+            raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+        del mcp_cfg[name]
+        agent._mcp_config = mcp_cfg
+        try:
+            await agent.reload_mcp()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Logs Viewer ─────────────────────────
+
+    @app.get("/api/logs")
+    async def api_logs(level: str = "all", limit: int = 50, search: str = ""):
+        """Read recent structured log entries."""
+        try:
+            from ..logging_config import read_log_lines
+            entries = read_log_lines(limit=min(limit, 200))
+            # Filter by level
+            if level and level != "all":
+                entries = [e for e in entries if e.get("level", "").upper() == level.upper()]
+            # Filter by search
+            if search:
+                search_l = search.lower()
+                entries = [e for e in entries
+                           if search_l in e.get("message", "").lower()
+                           or search_l in e.get("module", "").lower()]
+            return entries
+        except Exception as e:
+            logger.warning("Log read failed: %s", e)
+            return []
+
+    # ── Backup Management ─────────────────────
+
+    @app.get("/api/backups")
+    async def api_backups():
+        """List available backups."""
+        from ..backup import list_backups
+        return list_backups()
+
+    @app.post("/api/backup")
+    async def api_backup_create():
+        """Create a new backup."""
+        from ..backup import backup
+        config_path = agent.config.get("_config_path")
+        path = backup(config_path)
+        return {"ok": True, "path": str(path), "name": path.name}
+
+    @app.get("/api/backup/download")
+    async def api_backup_download(name: str = ""):
+        """Download a backup file."""
+        from ..backup import BACKUP_DIR
+        if not name:
+            # Download latest
+            from ..backup import list_backups
+            backups = list_backups()
+            if not backups:
+                raise HTTPException(404, "No backups available")
+            name = backups[0]["name"]
+        backup_path = BACKUP_DIR / name
+        if not backup_path.exists() or ".." in name:
+            raise HTTPException(404, "Backup not found")
+        return FileResponse(str(backup_path), filename=name,
+                            media_type="application/gzip")
+
+    # ── Scheduler Run Now ─────────────────────
+
+    @app.post("/api/ops/scheduler/{name}/run")
+    async def api_scheduler_run_now(name: str):
+        """Trigger immediate execution of a scheduled job."""
+        sched = getattr(agent, '_scheduler', None)
+        if not sched:
+            raise HTTPException(400, "Scheduler not running")
+        result = await sched.run_now(name)
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+
+    # ── Config Reload ─────────────────────────
+
+    @app.post("/api/config/reload")
+    async def api_config_reload():
+        """Force hot-reload of config.json."""
+        watcher = getattr(app.state, 'config_watcher', None)
+        if not watcher:
+            raise HTTPException(400, "Config watcher not running")
+        changes = await watcher.force_reload()
+        return {"ok": True, "changes": changes}
 
     logger.info("Dashboard routes mounted")

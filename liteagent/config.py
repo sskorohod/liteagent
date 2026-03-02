@@ -1,5 +1,6 @@
 """Configuration loader — JSON config + env vars + logging setup."""
 
+import copy
 import json
 import logging
 import os
@@ -26,7 +27,10 @@ PROVIDER_ENV_VARS = {
 
 
 def load_provider_keys() -> dict[str, str]:
-    """Load API keys from ~/.liteagent/keys.json."""
+    """Load API keys — from encrypted vault if enabled, else keys.json."""
+    from .vault import vault_enabled, load_keys
+    if vault_enabled():
+        return load_keys()
     if KEYS_PATH.exists():
         try:
             return json.loads(KEYS_PATH.read_text())
@@ -36,7 +40,11 @@ def load_provider_keys() -> dict[str, str]:
 
 
 def save_provider_key(provider: str, key: str) -> None:
-    """Save API key to ~/.liteagent/keys.json with chmod 600."""
+    """Save API key — to vault if enabled, else keys.json."""
+    from .vault import vault_enabled, vault_set
+    if vault_enabled():
+        vault_set(provider, key)
+        return
     KEYS_DIR.mkdir(parents=True, exist_ok=True)
     keys = load_provider_keys()
     keys[provider] = key
@@ -48,7 +56,10 @@ def save_provider_key(provider: str, key: str) -> None:
 
 
 def delete_provider_key(provider: str) -> bool:
-    """Remove API key from keys.json. Returns True if key existed."""
+    """Remove API key. Returns True if key existed."""
+    from .vault import vault_enabled, vault_delete
+    if vault_enabled():
+        return vault_delete(provider)
     keys = load_provider_keys()
     if provider in keys:
         del keys[provider]
@@ -79,18 +90,44 @@ def key_preview(key: str) -> str:
     return key[:6] + "..." + key[-4:]
 
 
+# ══════════════════════════════════════════
+# AUTH TOKEN (bearer token for API/dashboard)
+# ══════════════════════════════════════════
+
+AUTH_TOKEN_PATH = KEYS_DIR / "auth_token"
+
+
+def get_or_create_auth_token() -> str:
+    """Load or generate the API bearer token.
+
+    Stored in ~/.liteagent/auth_token with chmod 600.
+    Generated once on first use, persists across restarts.
+    """
+    import secrets
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    if AUTH_TOKEN_PATH.exists():
+        token = AUTH_TOKEN_PATH.read_text().strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    AUTH_TOKEN_PATH.write_text(token)
+    try:
+        os.chmod(AUTH_TOKEN_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except OSError:
+        pass
+    return token
+
+
 DEFAULT_CONFIG_PATHS = [
-    Path("config.json"),
-    Path("~/.liteagent/config.json").expanduser(),
+    Path(__file__).resolve().parent.parent / "config.json",     # project root (next to liteagent/)
+    Path("~/.liteagent/config.json").expanduser(),              # user home fallback
 ]
 
 
 def setup_logging(config: dict) -> None:
-    """Configure logging from config."""
-    log_cfg = config.get("logging", {})
-    level = getattr(logging, log_cfg.get("level", "WARNING").upper(), logging.WARNING)
-    fmt = log_cfg.get("format", "%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-    logging.basicConfig(level=level, format=fmt)
+    """Configure logging — structured JSON file + human-readable console."""
+    from .logging_config import setup_structured_logging
+    setup_structured_logging(config)
 
 
 def load_config(config_path: str | None = None) -> dict[str, Any]:
@@ -109,6 +146,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
     if path and path.exists():
         with open(path) as f:
             config = json.load(f)
+        config["_config_path"] = str(path.resolve())
         logger.info("Config loaded from %s", path)
     else:
         logger.info("No config file found, using defaults")
@@ -135,32 +173,75 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
 # CONFIG WRITING
 # ══════════════════════════════════════════
 
-DEFAULT_CONFIG_WRITE_PATH = Path("config.json")
+# Legacy: tests monkeypatch this to redirect writes to tmp_path
+DEFAULT_CONFIG_WRITE_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
+
+# Paths to secret fields that should NEVER be written to config.json.
+# Each tuple represents a nested key path, e.g. ("channels", "telegram", "token").
+_SECRET_PATHS = [
+    ("channels", "telegram", "token"),
+    ("storage", "access_key"),
+    ("storage", "secret_key"),
+    ("rag", "qdrant", "api_key"),
+    ("providers", "anthropic", "api_key"),
+    ("providers", "openai", "api_key"),
+    ("providers", "gemini", "api_key"),
+]
+
+
+def _strip_secrets(config: dict) -> dict:
+    """Deep-copy config and remove all secret fields before writing to disk."""
+    clean = copy.deepcopy(config)
+    for path in _SECRET_PATHS:
+        obj = clean
+        for key in path[:-1]:
+            if isinstance(obj, dict) and key in obj:
+                obj = obj[key]
+            else:
+                break
+        else:
+            if isinstance(obj, dict) and path[-1] in obj:
+                del obj[path[-1]]
+    return clean
 
 
 def save_config(config: dict, config_path: str | None = None):
-    """Write config dict back to config.json."""
-    path = Path(config_path) if config_path else DEFAULT_CONFIG_WRITE_PATH
-    # Don't write internal/transient keys
-    _SKIP_KEYS = {"_resolved"}
-    clean = {k: v for k, v in config.items() if k not in _SKIP_KEYS}
+    """Write config dict back to the file it was loaded from.
+
+    Secrets (tokens, API keys) are automatically stripped —
+    they are stored separately in ~/.liteagent/keys.json.
+    """
+    if config_path:
+        path = Path(config_path)
+    elif config.get("_config_path"):
+        path = Path(config["_config_path"])
+    else:
+        path = DEFAULT_CONFIG_WRITE_PATH
+    # Strip secrets, then remove internal/transient keys (underscore-prefixed)
+    stripped = _strip_secrets(config)
+    clean = {k: v for k, v in stripped.items() if not k.startswith("_")}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(clean, f, indent=2, ensure_ascii=False)
     logger.info("Config saved to %s", path)
 
 
 _KNOWN_TOP_KEYS = {"agent", "memory", "tools", "channels", "cost", "providers", "logging",
-                   "scheduler", "agents", "features", "rag"}
-_KNOWN_AGENT_KEYS = {"name", "soul", "max_iterations", "default_model", "models", "provider"}
+                   "scheduler", "agents", "features", "rag", "storage",
+                   "hooks", "plugins", "boot", "health"}
+_KNOWN_AGENT_KEYS = {"name", "soul", "max_iterations", "default_model", "models", "provider", "timezone"}
 _KNOWN_COST_KEYS = {"cascade_routing", "prompt_caching", "context_compression", "budget_daily_usd", "track_usage"}
 _KNOWN_MEMORY_KEYS = {"db_path", "max_history_tokens", "keep_recent_messages", "auto_learn",
-                      "extraction_model", "auto_prune", "prune_days", "prune_min_importance"}
+                      "extraction_model", "auto_prune", "prune_days", "prune_min_importance",
+                      "temporal_decay_rate", "temporal_decay_enabled"}
 
 
 def validate_config(config: dict) -> list[str]:
     """Validate config structure and return list of warnings."""
     warnings = []
     for key in config:
+        if key.startswith("_"):
+            continue  # internal keys
         if key not in _KNOWN_TOP_KEYS:
             warnings.append(f"Unknown top-level key: '{key}'")
 
@@ -203,8 +284,16 @@ def get_soul_prompt(config: dict) -> str:
     """Load soul.md system prompt."""
     soul_path = config.get("agent", {}).get("soul", "soul.md")
 
-    # Try relative to config, then absolute
-    for candidate in [Path(soul_path), Path(__file__).parent.parent / soul_path]:
+    candidates = [
+        Path(soul_path),                                    # CWD
+        Path(__file__).resolve().parent.parent / soul_path, # project root
+    ]
+    # Also try relative to config file location
+    cfg_path = config.get("_config_path")
+    if cfg_path:
+        candidates.insert(1, Path(cfg_path).parent / soul_path)
+
+    for candidate in candidates:
         if candidate.exists():
             return candidate.read_text()
 

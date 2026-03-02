@@ -39,30 +39,40 @@ tailwind.config = {
   .typing-dot:nth-child(2) { animation: bounce 1.2s infinite 0.2s; }
   .typing-dot:nth-child(3) { animation: bounce 1.2s infinite 0.4s; }
 
-  /* Chat message markdown styles */
-  .chat-msg { max-width: 80%; position: relative; line-height: 1.5; }
-  .chat-msg pre { background: #0a0a0b; border: 1px solid #27272a; border-radius: 6px; padding: 10px 12px; margin: 4px 0; overflow-x: auto; font-size: 12px; line-height: 1.4; }
-  .chat-msg code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 12px; }
-  .chat-msg p code { background: #27272a; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
-  .chat-msg h1, .chat-msg h2, .chat-msg h3 { font-weight: 600; margin: 6px 0 3px 0; }
-  .chat-msg h1 { font-size: 1.2em; }
-  .chat-msg h2 { font-size: 1.1em; }
-  .chat-msg h3 { font-size: 1em; }
-  .chat-msg ul, .chat-msg ol { padding-left: 18px; margin: 3px 0; }
-  .chat-msg li { margin: 1px 0; }
-  .chat-msg blockquote { border-left: 2px solid #6366f1; padding-left: 10px; margin: 4px 0; color: #a1a1aa; }
-  .chat-msg a { color: #818cf8; text-decoration: underline; }
+  /* Chat message styles */
+  .chat-msg { max-width: 80%; position: relative; line-height: 1.55; word-wrap: break-word; }
+  .chat-msg .msg-content > *:first-child { margin-top: 0; }
+  .chat-msg .msg-content > *:last-child { margin-bottom: 0; }
+  .chat-msg pre { background: #111113; border: 1px solid #27272a; border-radius: 8px; padding: 10px 14px; margin: 6px 0; overflow-x: auto; font-size: 12px; line-height: 1.45; }
+  .chat-msg code { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace; font-size: 0.88em; }
+  .chat-msg p code { background: #27272a; padding: 1px 6px; border-radius: 4px; color: #c4b5fd; }
+  .chat-msg h1, .chat-msg h2, .chat-msg h3 { font-weight: 600; color: #f4f4f5; margin: 8px 0 2px 0; }
+  .chat-msg h1 { font-size: 1.15em; }
+  .chat-msg h2 { font-size: 1.05em; }
+  .chat-msg h3 { font-size: 0.95em; color: #d4d4d8; }
+  .chat-msg ul, .chat-msg ol { padding-left: 20px; margin: 4px 0; }
+  .chat-msg li { margin: 1px 0; padding-left: 2px; }
+  .chat-msg li::marker { color: #52525b; }
+  .chat-msg blockquote { border-left: 2px solid #4f46e5; padding-left: 12px; margin: 6px 0; color: #a1a1aa; font-style: italic; }
+  .thinking-block { margin: 8px 0; border: 1px solid #27272a; border-radius: 8px; overflow: hidden; }
+  .thinking-block summary { cursor: pointer; padding: 5px 10px; font-size: 0.8em; color: #71717a; background: #18181b; user-select: none; letter-spacing: 0.02em; }
+  .thinking-block summary:hover { background: #1f1f23; color: #a1a1aa; }
+  .thinking-content { padding: 8px 12px; font-size: 0.82em; color: #52525b; background: #0f0f11; max-height: 200px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+  .model-badge { margin-top: 6px; font-size: 0.7em; color: #3f3f46; user-select: none; letter-spacing: 0.03em; }
+  .chat-msg a { color: #818cf8; text-decoration: none; border-bottom: 1px solid #818cf830; transition: border-color 0.2s; }
+  .chat-msg a:hover { border-bottom-color: #818cf8; }
   .chat-msg strong { font-weight: 600; color: #e4e4e7; }
-  .chat-msg em { font-style: italic; }
-  .chat-msg p { margin: 2px 0; }
+  .chat-msg em { font-style: italic; color: #a1a1aa; }
+  .chat-msg p { margin: 3px 0; }
   .chat-msg p:first-child { margin-top: 0; }
   .chat-msg p:last-child { margin-bottom: 0; }
+  .chat-msg hr { border: none; border-top: 1px solid #27272a; margin: 8px 0; }
 
   /* Chat messages container — ensure last message is fully visible */
   #chat-messages { padding-bottom: 12px; }
 
   /* Copy button */
-  .copy-btn { position: absolute; top: 8px; right: 8px; opacity: 0; transition: opacity 0.2s; }
+  .copy-btn { position: absolute; top: 6px; right: 6px; opacity: 0; transition: opacity 0.15s; backdrop-filter: blur(4px); }
   .chat-msg:hover .copy-btn { opacity: 1; }
 
   /* Mobile */
@@ -118,33 +128,123 @@ tailwind.config = {
 
   <!-- Overview Tab -->
   <section id="tab-overview" class="tab-content hidden fade-in">
-    <h1 class="text-2xl font-semibold text-white mb-6">Overview</h1>
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8" id="kpi-grid">
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Calls</div>
-        <div class="text-2xl font-bold text-white" id="kpi-calls">&mdash;</div>
-      </div>
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Cost</div>
-        <div class="text-2xl font-bold text-white" id="kpi-cost">&mdash;</div>
-      </div>
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Today Cost</div>
-        <div class="text-2xl font-bold text-white" id="kpi-today">&mdash;</div>
-      </div>
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Memories</div>
-        <div class="text-2xl font-bold text-white" id="kpi-memories">&mdash;</div>
-      </div>
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Total Tokens</div>
-        <div class="text-2xl font-bold text-white" id="kpi-tokens">&mdash;</div>
-      </div>
-      <div class="bg-bg-card border border-border rounded-xl p-5">
-        <div class="text-muted text-xs uppercase tracking-wide mb-1">Tools</div>
-        <div class="text-2xl font-bold text-white" id="kpi-tools">&mdash;</div>
+    <!-- Header with live indicator -->
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-semibold text-white">Overview</h1>
+      <div class="flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" id="live-dot"></span>
+        <span class="text-xs text-muted" id="refresh-status">Auto-refresh: 5s</span>
       </div>
     </div>
+
+    <!-- KPI Cards (compact 6-column) -->
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6" id="kpi-grid">
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Total Calls</div>
+        <div class="text-xl font-bold text-white" id="kpi-calls">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Total Cost</div>
+        <div class="text-xl font-bold text-white" id="kpi-cost">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Today Cost</div>
+        <div class="text-xl font-bold text-white" id="kpi-today">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Memories</div>
+        <div class="text-xl font-bold text-white" id="kpi-memories">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Total Tokens</div>
+        <div class="text-xl font-bold text-white" id="kpi-tokens">&mdash;</div>
+      </div>
+      <div class="bg-bg-card border border-border rounded-xl p-3">
+        <div class="text-muted text-[10px] uppercase tracking-wide mb-0.5">Tools</div>
+        <div class="text-xl font-bold text-white" id="kpi-tools">&mdash;</div>
+      </div>
+    </div>
+
+    <!-- Main Grid: Live Activity + System Panel -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+
+      <!-- Left: Live Activity (2/3) -->
+      <div class="lg:col-span-2 space-y-5">
+
+        <!-- Active Requests -->
+        <div class="bg-bg-card border border-border rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="w-2 h-2 rounded-full bg-zinc-600" id="active-dot"></span>
+            <h2 class="text-sm font-medium text-white">Active Requests</h2>
+            <span class="text-xs text-muted" id="active-count">(0)</span>
+          </div>
+          <div id="active-requests-list">
+            <div class="text-xs text-muted py-2">No active requests</div>
+          </div>
+        </div>
+
+        <!-- Recent Activity Feed -->
+        <div class="bg-bg-card border border-border rounded-xl p-5">
+          <h2 class="text-sm font-medium text-white mb-3">Recent Activity</h2>
+          <div id="recent-activity-list" class="space-y-1 max-h-80 overflow-y-auto">
+            <div class="text-xs text-muted py-2">Loading...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: System Panel (1/3) -->
+      <div class="space-y-5">
+
+        <!-- Provider & Model -->
+        <div class="bg-bg-card border border-border rounded-xl p-5">
+          <h2 class="text-[10px] font-medium text-muted uppercase tracking-wide mb-3">System</h2>
+          <div class="space-y-2">
+            <div class="flex justify-between text-sm">
+              <span class="text-muted">Provider</span>
+              <span class="text-white font-medium" id="sys-provider">--</span>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="text-muted">Model</span>
+              <span class="text-white font-mono text-xs" id="sys-model">--</span>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="text-muted">Cascade</span>
+              <span id="sys-cascade">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Budget -->
+        <div class="bg-bg-card border border-border rounded-xl p-5">
+          <h2 class="text-[10px] font-medium text-muted uppercase tracking-wide mb-3">Daily Budget</h2>
+          <div class="flex justify-between items-end mb-2">
+            <span class="text-lg font-bold text-white" id="sys-budget-spent">$0.00</span>
+            <span class="text-xs text-muted" id="sys-budget-limit">/ $5.00</span>
+          </div>
+          <div class="w-full bg-bg rounded-full h-2">
+            <div class="bg-accent rounded-full h-2 transition-all duration-500" id="sys-budget-bar" style="width: 0%"></div>
+          </div>
+          <div class="text-[10px] text-muted mt-1 text-right" id="sys-budget-pct">0%</div>
+        </div>
+
+        <!-- Features -->
+        <div class="bg-bg-card border border-border rounded-xl p-5">
+          <h2 class="text-[10px] font-medium text-muted uppercase tracking-wide mb-3">Features</h2>
+          <div id="sys-features" class="grid grid-cols-2 gap-1.5">
+            <div class="text-xs text-muted">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Scheduled Jobs -->
+    <div class="bg-bg-card border border-border rounded-xl p-5 mb-5">
+      <h2 class="text-sm font-medium text-white mb-3">Scheduled Jobs</h2>
+      <div id="scheduler-jobs" class="divide-y divide-border/30">
+        <div class="text-xs text-muted py-2">No jobs scheduled</div>
+      </div>
+    </div>
+
     <!-- Daily chart -->
     <div class="bg-bg-card border border-border rounded-xl p-6">
       <h2 class="text-sm font-medium text-muted mb-4">Daily Usage (14 days)</h2>
@@ -240,10 +340,20 @@ tailwind.config = {
         Clear Chat
       </button>
     </div>
-    <div class="flex-1 overflow-y-auto space-y-3 pr-2 min-h-0" id="chat-messages" style="scroll-behavior: smooth;">
+    <div class="flex-1 overflow-y-auto space-y-2.5 pr-2 min-h-0" id="chat-messages" style="scroll-behavior: smooth;">
       <div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>
     </div>
+    <!-- File attachments preview -->
+    <div id="chat-files-preview" class="hidden pt-2 shrink-0">
+      <div class="flex flex-wrap gap-2" id="chat-files-list"></div>
+    </div>
     <div class="flex gap-3 pt-3 shrink-0 border-t border-border mt-2">
+      <input type="file" id="chat-file-input" multiple class="hidden"
+        onchange="handleFileSelect(this.files)"
+        accept="image/*,.pdf,.txt,.csv,.json,.xml,.py,.js,.ts,.jsx,.tsx,.java,.c,.cpp,.h,.go,.rs,.rb,.php,.swift,.kt,.cs,.sh,.yaml,.yml,.toml,.ini,.sql,.md,.html,.css,.log">
+      <button onclick="document.getElementById('chat-file-input').click()" class="bg-bg-card border border-border rounded-xl px-3 py-3 text-muted hover:text-white hover:border-accent/50 transition-colors" title="Attach files">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>
+      </button>
       <input id="chat-input" type="text" placeholder="Type a message..."
         class="flex-1 bg-bg-card border border-border rounded-xl px-4 py-3 text-sm text-white placeholder-muted focus:outline-none focus:border-accent transition-colors"
         onkeydown="if(event.key==='Enter' && !chatBusy)sendChat()">
@@ -278,6 +388,121 @@ tailwind.config = {
         </button>
       </div>
       <div id="provider-status" class="mt-3 text-xs"></div>
+
+      <!-- Routing Mode Toggle -->
+      <div class="mt-5 pt-5 border-t border-border">
+        <div class="flex items-center justify-between">
+          <div>
+            <h3 class="text-sm font-medium text-white">Model Routing</h3>
+            <p id="routing-description" class="text-xs text-muted mt-1">
+              Auto: default model for simple tasks, escalates to complex models as needed
+            </p>
+          </div>
+          <div class="flex items-center gap-3">
+            <span id="routing-label-fixed" class="text-xs text-muted">Fixed</span>
+            <button id="routing-toggle" onclick="toggleRouting()" class="relative w-11 h-6 rounded-full transition-colors bg-zinc-700">
+              <span id="routing-toggle-dot" class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform"></span>
+            </button>
+            <span id="routing-label-auto" class="text-xs text-white font-medium">Auto</span>
+          </div>
+        </div>
+        <!-- Cascade model config (shown only in Auto mode) -->
+        <div id="cascade-config" class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div>
+            <label class="text-[10px] text-muted block mb-1">Simple (score 0)</label>
+            <select id="cascade-simple"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-accent transition-colors">
+            </select>
+          </div>
+          <div>
+            <label class="text-[10px] text-muted block mb-1">Medium (score 1-2)</label>
+            <select id="cascade-medium"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-accent transition-colors">
+            </select>
+          </div>
+          <div>
+            <label class="text-[10px] text-muted block mb-1">Complex (score 3+)</label>
+            <select id="cascade-complex"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-accent transition-colors">
+            </select>
+          </div>
+        </div>
+        <div id="cascade-hint" class="mt-2 text-[10px] text-muted">
+          Models with <code class="text-accent">provider:</code> prefix use cloud API (paid). Local models are free.
+        </div>
+        <button onclick="saveCascadeConfig()" id="cascade-save-btn" class="mt-3 text-xs px-4 py-1.5 rounded-lg bg-accent/20 border border-accent/30 text-accent-light hover:bg-accent/30 transition-colors">
+          Save Routing
+        </button>
+        <span id="cascade-status" class="ml-3 text-xs"></span>
+      </div>
+    </div>
+
+    <!-- Planning (Internal Monologue) Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-sm font-medium text-white">Planning (Internal Monologue)</h2>
+          <p class="text-xs text-muted mt-1">Agent plans execution steps before complex tasks, reflects mid-loop</p>
+        </div>
+        <button id="planning-toggle" onclick="togglePlanning()" class="relative w-11 h-6 rounded-full transition-colors bg-zinc-700">
+          <span id="planning-toggle-dot" class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform"></span>
+        </button>
+      </div>
+      <div id="planning-config" class="mt-4 space-y-3" style="display:none">
+        <div>
+          <label class="text-[10px] text-muted block mb-1">Planning Model</label>
+          <select id="planning-model" class="bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white w-full focus:outline-none focus:border-accent transition-colors">
+            <option value="auto">Auto (cheapest for provider)</option>
+          </select>
+        </div>
+        <div class="flex items-center gap-4">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="planning-skip-simple" type="checkbox" checked class="accent-accent w-4 h-4">
+            <span class="text-xs text-zinc-300">Skip simple requests</span>
+          </label>
+        </div>
+        <div>
+          <label class="text-[10px] text-muted block mb-1">Reflect every N tool calls</label>
+          <input id="planning-reflect-n" type="number" min="1" max="10" value="3"
+            class="bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white w-20 focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <div class="flex items-center gap-3">
+          <button onclick="savePlanningConfig()" class="text-xs px-4 py-1.5 rounded-lg bg-accent/20 border border-accent/30 text-accent-light hover:bg-accent/30 transition-colors">
+            Save
+          </button>
+          <span id="planning-status" class="text-xs"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Local-Only Hours Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-sm font-medium text-white">Local-Only Hours</h2>
+          <p class="text-xs text-muted mt-1">During these hours, only free local models are used (no paid API calls)</p>
+        </div>
+        <button id="loh-toggle" onclick="toggleLocalOnlyHours()" class="relative w-11 h-6 rounded-full transition-colors bg-zinc-700">
+          <span id="loh-toggle-dot" class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform"></span>
+        </button>
+      </div>
+      <div id="loh-config" class="mt-4 flex items-center gap-3" style="display:none">
+        <div>
+          <label class="text-[10px] text-muted block mb-1">From</label>
+          <input id="loh-start" type="time" value="00:00"
+            class="bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <span class="text-muted mt-4">—</span>
+        <div>
+          <label class="text-[10px] text-muted block mb-1">To</label>
+          <input id="loh-end" type="time" value="08:00"
+            class="bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <button onclick="saveLocalOnlyHours()" class="mt-4 text-xs px-4 py-2 rounded-lg bg-accent/20 border border-accent/30 text-accent-light hover:bg-accent/30 transition-colors">
+          Save
+        </button>
+        <span id="loh-status" class="mt-4 text-xs"></span>
+      </div>
     </div>
 
     <!-- API Keys Card -->
@@ -296,25 +521,154 @@ tailwind.config = {
       <div class="space-y-3">
         <div>
           <label class="text-xs text-muted block mb-1.5">Bot Token <span class="text-zinc-600">(from @BotFather)</span></label>
-          <div class="flex gap-2">
-            <input id="tg-token" type="password" placeholder="123456789:ABCdefGHI..."
-              class="flex-1 bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
-            <button onclick="testTelegram()" class="text-xs px-3 py-2 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
-              Test
-            </button>
-            <button onclick="saveTelegram()" class="text-xs px-3 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
-              Save
-            </button>
-          </div>
+          <input id="tg-token" type="password" placeholder="123456789:ABCdefGHI..."
+            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1.5">Chat ID <span class="text-zinc-600">(only respond to this chat)</span></label>
+          <input id="tg-chat-id" type="text" placeholder="123456789 (leave empty for all chats)"
+            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <div class="flex gap-2">
+          <button onclick="saveTelegram()" class="text-xs px-4 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
+            Save
+          </button>
+          <button onclick="testTelegram()" class="text-xs px-3 py-2 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+            Test
+          </button>
         </div>
         <div id="tg-result" class="text-xs"></div>
         <div class="text-xs text-zinc-600">
-          1. Open <a href="https://t.me/BotFather" target="_blank" class="text-accent hover:underline">@BotFather</a> in Telegram
-          2. Send <code class="bg-bg px-1 py-0.5 rounded">/newbot</code>
-          3. Paste the token above
-          4. Run: <code class="bg-bg px-1 py-0.5 rounded">python -m liteagent --channel telegram</code>
+          1. Open <a href="https://t.me/BotFather" target="_blank" class="text-accent hover:underline">@BotFather</a> → <code class="bg-bg px-1 py-0.5 rounded">/newbot</code> → paste token
+          2. Get chat_id: send any message to bot, then open <code class="bg-bg px-1 py-0.5 rounded">https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code>
+          3. Run: <code class="bg-bg px-1 py-0.5 rounded">python3.11 -m liteagent --channel telegram</code>
         </div>
       </div>
+    </div>
+
+    <!-- Storage (MinIO/S3) Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-medium text-muted">Storage (MinIO/S3)</h2>
+        <span id="storage-status-badge" class="text-[10px] px-2 py-0.5 rounded-full border"></span>
+      </div>
+      <div class="space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-muted block mb-1.5">Endpoint</label>
+            <input id="storage-endpoint" type="text" placeholder="http://192.168.1.244:9000"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">Bucket</label>
+            <input id="storage-bucket" type="text" placeholder="liteagent" value="liteagent"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-muted block mb-1.5">Access Key</label>
+            <input id="storage-access-key" type="password" placeholder="access key"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">Secret Key</label>
+            <input id="storage-secret-key" type="password" placeholder="secret key"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="testStorage()" class="text-xs px-3 py-2 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+            Test
+          </button>
+          <button onclick="saveStorage()" class="text-xs px-3 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
+            Save
+          </button>
+        </div>
+        <div id="storage-result" class="text-xs"></div>
+      </div>
+    </div>
+
+    <!-- Qdrant Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-medium text-muted">Qdrant (Vector DB)</h2>
+        <span id="qdrant-status-badge" class="text-[10px] px-2 py-0.5 rounded-full border"></span>
+      </div>
+      <div class="space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-muted block mb-1.5">URL</label>
+            <input id="qdrant-url" type="text" placeholder="http://192.168.1.244:6333"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">Collection</label>
+            <input id="qdrant-collection" type="text" placeholder="liteagent_rag" value="liteagent_rag"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1.5">API Key</label>
+          <input id="qdrant-api-key" type="password" placeholder="qdrant api key"
+            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+        </div>
+        <div class="flex gap-2">
+          <button onclick="testQdrant()" class="text-xs px-3 py-2 rounded-lg border border-border text-muted hover:text-white hover:border-accent/50 transition-colors">
+            Test
+          </button>
+          <button onclick="saveQdrant()" class="text-xs px-3 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
+            Save
+          </button>
+        </div>
+        <div id="qdrant-result" class="text-xs"></div>
+      </div>
+    </div>
+
+    <!-- MCP Servers Card -->
+    <div class="bg-bg-card border border-border rounded-xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-medium text-muted">MCP Servers</h2>
+        <span id="mcp-count-badge" class="text-[10px] px-2 py-0.5 rounded-full border border-border text-muted"></span>
+      </div>
+      <div id="mcp-servers-list" class="space-y-2 mb-4"></div>
+      <details class="group">
+        <summary class="text-xs text-accent cursor-pointer hover:underline">+ Add MCP Server</summary>
+        <div class="mt-3 space-y-3 bg-bg rounded-lg p-4 border border-border">
+          <div class="flex gap-2 mb-2">
+            <button onclick="toggleMcpMode('form')" id="mcp-mode-form" class="text-xs px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/50 text-accent">Form</button>
+            <button onclick="toggleMcpMode('json')" id="mcp-mode-json" class="text-xs px-3 py-1.5 rounded-lg border border-border text-muted">JSON</button>
+          </div>
+          <div id="mcp-form-mode">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="text-xs text-muted block mb-1">Name</label>
+                <input id="mcp-name" type="text" placeholder="my-server"
+                  class="w-full bg-bg-card border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+              </div>
+              <div>
+                <label class="text-xs text-muted block mb-1">Command</label>
+                <input id="mcp-command" type="text" placeholder="npx -y @modelcontextprotocol/server-filesystem"
+                  class="w-full bg-bg-card border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-muted block mb-1 mt-2">Args <span class="text-zinc-600">(comma-separated)</span></label>
+              <input id="mcp-args" type="text" placeholder="/path/to/dir"
+                class="w-full bg-bg-card border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-accent transition-colors">
+            </div>
+          </div>
+          <div id="mcp-json-mode" class="hidden">
+            <label class="text-xs text-muted block mb-1">JSON Config</label>
+            <textarea id="mcp-json-input" rows="6" placeholder='{"server_name": {"command": "npx", "args": ["-y", "@example/mcp-server"]}}'
+              class="w-full bg-bg-card border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 font-mono focus:outline-none focus:border-accent transition-colors"></textarea>
+          </div>
+          <button onclick="addMcpServer()" class="text-xs px-4 py-2 rounded-lg bg-accent/20 border border-accent/50 text-accent hover:bg-accent/30 transition-colors">
+            Add Server
+          </button>
+          <div id="mcp-add-result" class="text-xs"></div>
+        </div>
+      </details>
     </div>
 
     <!-- Config JSON (read-only) -->
@@ -333,6 +687,8 @@ tailwind.config = {
 let currentTab = 'overview';
 let charts = {};
 let chatBusy = false;
+let ws = null;
+let wsReconnectTimer = null;
 
 // =======================================
 // API HELPERS
@@ -363,6 +719,8 @@ function fmt(n) {
 // TAB SWITCHING
 // =======================================
 function switchTab(name) {
+  // Stop overview polling when leaving
+  if (currentTab === 'overview' && name !== 'overview') stopOverviewPolling();
   currentTab = name;
   document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
   document.getElementById('tab-' + name)?.classList.remove('hidden');
@@ -390,19 +748,237 @@ function switchTab(name) {
 }
 
 // =======================================
-// OVERVIEW
+// OVERVIEW — OPERATIONS DASHBOARD
 // =======================================
+let _overviewInterval = null;
+
 async function loadOverview() {
-  const data = await api('/api/overview');
-  if (!data) return;
-  document.getElementById('kpi-calls').textContent = fmt(data.total_calls);
-  document.getElementById('kpi-cost').textContent = '$' + data.total_cost_usd.toFixed(2);
-  document.getElementById('kpi-today').textContent = '$' + data.today_cost_usd.toFixed(4);
-  document.getElementById('kpi-memories').textContent = fmt(data.memory_count);
-  document.getElementById('kpi-tokens').textContent = fmt(data.total_tokens);
-  document.getElementById('kpi-tools').textContent = data.tools_count;
-  const daily = await api('/api/usage/daily?days=14');
-  if (daily && daily.length) renderDailyChart(daily);
+  // Load all data in parallel
+  const [overview, system, active, recent, daily] = await Promise.all([
+    api('/api/overview'),
+    api('/api/ops/system'),
+    api('/api/ops/active'),
+    api('/api/ops/recent?limit=15'),
+    api('/api/usage/daily?days=14'),
+  ]);
+
+  // KPI cards
+  if (overview && !overview.detail) {
+    document.getElementById('kpi-calls').textContent = fmt(overview.total_calls);
+    document.getElementById('kpi-cost').textContent = '$' + overview.total_cost_usd.toFixed(2);
+    document.getElementById('kpi-today').textContent = '$' + overview.today_cost_usd.toFixed(4);
+    document.getElementById('kpi-memories').textContent = fmt(overview.memory_count);
+    document.getElementById('kpi-tokens').textContent = fmt(overview.total_tokens);
+    document.getElementById('kpi-tools').textContent = overview.tools_count;
+  }
+
+  if (system && !system.detail) renderSystemPanel(system);
+  if (active && !active.detail) renderActiveRequests(active);
+  if (recent && !recent.detail) renderRecentActivity(recent);
+  if (daily && Array.isArray(daily) && daily.length) renderDailyChart(daily);
+
+  // Start live polling
+  startOverviewPolling();
+}
+
+function startOverviewPolling() {
+  stopOverviewPolling();
+  _overviewInterval = setInterval(async () => {
+    if (currentTab !== 'overview') { stopOverviewPolling(); return; }
+    const [active, system] = await Promise.all([
+      api('/api/ops/active'),
+      api('/api/ops/system'),
+    ]);
+    if (active && !active.detail) renderActiveRequests(active);
+    if (system && !system.detail) renderSystemPanel(system);
+  }, 5000);
+}
+
+function stopOverviewPolling() {
+  if (_overviewInterval) { clearInterval(_overviewInterval); _overviewInterval = null; }
+}
+
+// ── System Panel ──
+function renderSystemPanel(sys) {
+  if (!sys || !sys.provider) return;
+  // Provider
+  document.getElementById('sys-provider').textContent = sys.provider.provider;
+  document.getElementById('sys-model').textContent = shortModel(sys.provider.model);
+  const cascadeEl = document.getElementById('sys-cascade');
+  cascadeEl.innerHTML = sys.provider.cascade_routing
+    ? '<span class="text-emerald-400 text-xs">ON</span>'
+    : '<span class="text-zinc-500 text-xs">OFF</span>';
+
+  // Budget
+  const b = sys.budget;
+  document.getElementById('sys-budget-spent').textContent = '$' + b.today_cost.toFixed(4);
+  document.getElementById('sys-budget-limit').textContent = '/ $' + b.daily_budget.toFixed(2);
+  const pct = Math.min(b.budget_pct, 100);
+  const bar = document.getElementById('sys-budget-bar');
+  bar.style.width = pct + '%';
+  bar.className = 'rounded-full h-2 transition-all duration-500 ' +
+    (pct > 90 ? 'bg-red-500' : pct > 60 ? 'bg-amber-500' : 'bg-accent');
+  document.getElementById('sys-budget-pct').textContent = pct.toFixed(1) + '%';
+
+  // Features
+  const featEl = document.getElementById('sys-features');
+  const featureLabels = {
+    dream_cycle: 'Dream', self_evolving_prompt: 'Evolve',
+    proactive_agent: 'Proactive', auto_tool_synthesis: 'Synthesis',
+    confidence_gate: 'Confidence', style_adaptation: 'Style',
+    skill_crystallization: 'Skills', counterfactual_replay: 'Replay',
+    internal_monologue: 'Monologue',
+  };
+  featEl.innerHTML = Object.entries(sys.features).map(([name, enabled]) =>
+    `<div class="flex items-center gap-1.5 text-xs">
+      <span class="w-1.5 h-1.5 rounded-full ${enabled ? 'bg-emerald-400' : 'bg-zinc-600'}"></span>
+      <span class="${enabled ? 'text-zinc-300' : 'text-zinc-600'}">${featureLabels[name] || name}</span>
+    </div>`
+  ).join('');
+
+  // Scheduler jobs
+  const jobsEl = document.getElementById('scheduler-jobs');
+  if (sys.scheduler_jobs && sys.scheduler_jobs.length) {
+    jobsEl.innerHTML = sys.scheduler_jobs.map(j => {
+      const nextStr = j.next_run ? _relTime(j.next_run) : '--';
+      const lastStr = j.last_run ? _relTime(j.last_run) : 'never';
+      const statusBadge = j.running
+        ? '<span class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-medium">RUNNING</span>'
+        : (j.status === 'failed'
+          ? '<span class="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 text-[10px] font-medium" title="' + _esc(j.last_error || '') + '">FAILED</span>'
+          : '');
+      const runBtn = j.running
+        ? ''
+        : `<button onclick="runSchedulerJob('${_esc(j.name)}')" class="text-[10px] px-2 py-0.5 rounded border border-accent/30 text-accent hover:bg-accent/10 transition-colors" title="Run now">▶</button>`;
+      const statsStr = (j.run_count || j.fail_count)
+        ? `<span class="text-[10px] text-zinc-600">${j.run_count || 0}✓ ${j.fail_count || 0}✗</span>`
+        : '';
+      return `
+        <div class="flex items-center justify-between py-2.5">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-mono text-accent">${_esc(j.name)}</span>
+            ${statusBadge}
+            ${statsStr}
+          </div>
+          <div class="flex items-center gap-3 text-[11px] text-muted">
+            <span class="font-mono">${_esc(j.cron_expr)}</span>
+            <span>last: ${lastStr}</span>
+            <span class="text-zinc-300">next: ${nextStr}</span>
+            ${runBtn}
+          </div>
+        </div>`;
+    }).join('');
+  } else {
+    jobsEl.innerHTML = '<div class="text-xs text-muted py-2">No jobs scheduled</div>';
+  }
+}
+
+// ── Active Requests ──
+function renderActiveRequests(data) {
+  const list = document.getElementById('active-requests-list');
+  const countEl = document.getElementById('active-count');
+  const dot = document.getElementById('active-dot');
+  const requests = data.requests || [];
+  const schedJobs = data.scheduler_jobs_running || [];
+  const total = requests.length + schedJobs.length;
+
+  countEl.textContent = `(${total})`;
+  dot.className = 'w-2 h-2 rounded-full ' +
+    (total > 0 ? 'bg-amber-400 animate-pulse' : 'bg-zinc-600');
+
+  if (total === 0) {
+    list.innerHTML = '<div class="text-xs text-muted py-2">No active requests</div>';
+    return;
+  }
+
+  let html = '';
+  for (const req of requests) {
+    const elapsed = ((Date.now() - new Date(req.started_at).getTime()) / 1000).toFixed(1);
+    html += `
+      <div class="flex items-center gap-3 py-2 border-b border-border/30 last:border-0">
+        <svg class="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle>
+          <path fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" class="opacity-75"></path>
+        </svg>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs text-zinc-300 truncate">${_esc(req.input_preview)}</div>
+          <div class="text-[10px] text-muted">${_esc(req.user_id)} | ${shortModel(req.model)} | ${elapsed}s</div>
+        </div>
+      </div>`;
+  }
+  for (const job of schedJobs) {
+    html += `
+      <div class="flex items-center gap-3 py-2 border-b border-border/30 last:border-0">
+        <svg class="w-3.5 h-3.5 animate-spin text-indigo-400 shrink-0" fill="none" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle>
+          <path fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" class="opacity-75"></path>
+        </svg>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs text-indigo-300">[scheduler] ${_esc(job.name)}</div>
+        </div>
+      </div>`;
+  }
+  list.innerHTML = html;
+}
+
+// ── Recent Activity ──
+function renderRecentActivity(data) {
+  const list = document.getElementById('recent-activity-list');
+  if (!data || !data.length) {
+    list.innerHTML = '<div class="text-xs text-muted py-2">No recent activity</div>';
+    return;
+  }
+  list.innerHTML = data.map(item => {
+    const dt = item.created_at ? new Date(item.created_at) : null;
+    const time = dt ? dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+    const date = dt ? dt.toLocaleDateString([], {month:'short', day:'numeric'}) : '';
+    const toolBadges = item.tool_calls.length
+      ? item.tool_calls.map(t =>
+          `<span class="px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 text-[10px]">${_esc(t)}</span>`
+        ).join(' ')
+      : '';
+    const confBadge = item.confidence != null
+      ? `<span class="text-[10px] ${item.confidence >= 7 ? 'text-emerald-400' : item.confidence >= 4 ? 'text-amber-400' : 'text-red-400'}">conf:${item.confidence}</span>`
+      : '';
+    const statusIcon = item.success
+      ? '<span class="text-emerald-400 text-[10px]">OK</span>'
+      : '<span class="text-red-400 text-[10px]">FAIL</span>';
+
+    return `
+      <div class="py-1.5 border-b border-border/20 last:border-0 hover:bg-bg-hover/50 rounded px-2 -mx-2 transition-colors">
+        <div class="flex items-center gap-2 mb-0.5">
+          <span class="text-[10px] text-muted w-20 shrink-0">${date} ${time}</span>
+          ${statusIcon}
+          <span class="text-xs text-zinc-300 truncate flex-1">${_esc(item.input_preview)}</span>
+          <span class="text-[10px] text-muted font-mono">${shortModel(item.model)}</span>
+        </div>
+        ${(toolBadges || confBadge) ? `<div class="flex items-center gap-2 ml-20">${toolBadges} ${confBadge}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+// ── Helpers ──
+function _relTime(isoStr) {
+  if (!isoStr) return '--';
+  const dt = new Date(isoStr);
+  const now = new Date();
+  const diffMs = dt - now;
+  const absMins = Math.abs(Math.round(diffMs / 60000));
+  if (absMins < 60) {
+    return diffMs > 0 ? `in ${absMins}m` : `${absMins}m ago`;
+  }
+  const hrs = Math.round(absMins / 60);
+  if (hrs < 24) {
+    return diffMs > 0 ? `in ${hrs}h` : `${hrs}h ago`;
+  }
+  const days = Math.round(hrs / 24);
+  return diffMs > 0 ? `in ${days}d` : `${days}d ago`;
+}
+
+function _esc(s) {
+  if (!s) return '';
+  if (typeof s !== 'string') s = String(s);
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function renderDailyChart(data) {
@@ -439,7 +1015,7 @@ function renderDailyChart(data) {
 // =======================================
 async function loadUsage(days) {
   const data = await api('/api/usage?days=' + days);
-  if (!data) return;
+  if (!data || !Array.isArray(data)) return;
   const tbody = document.getElementById('usage-table');
   tbody.innerHTML = data.map(r => `
     <tr class="border-b border-border hover:bg-bg-hover transition-colors">
@@ -467,7 +1043,7 @@ function shortModel(m) {
 
 function renderModelCharts(data) {
   const labels = data.map(r => shortModel(r.model));
-  const colors = ['#6366f1', '#22d3ee', '#f472b6', '#facc15', '#34d399', '#fb923c'];
+  const colors = ['#6366f1', '#22d3ee', '#f472b6', '#facc15', '#34d399', '#fb923c', '#a78bfa', '#f87171', '#2dd4bf', '#e879f9', '#fbbf24', '#60a5fa', '#4ade80', '#f97316', '#c084fc', '#38bdf8'];
   const ctxCost = document.getElementById('chart-model-cost');
   if (charts.modelCost) charts.modelCost.destroy();
   charts.modelCost = new Chart(ctxCost, {
@@ -516,7 +1092,7 @@ async function loadMemories() {
 
 async function deleteMemory(id) {
   const res = await api('/api/memories/' + id, { method: 'DELETE' });
-  if (res) {
+  if (res && !res.detail) {
     const el = document.getElementById('mem-' + id);
     if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 200); }
     const countEl = document.getElementById('memory-count');
@@ -607,8 +1183,18 @@ async function deleteCustomTool(name) {
 function renderMarkdown(text) {
   if (!text) return '';
 
+  // Normalize: collapse 3+ newlines into 2, trim leading/trailing whitespace
+  text = text.replace(/\n{3,}/g, '\n\n').trim();
+
   // Escape HTML first
   let html = escapeHtml(text);
+
+  // Thinking blocks (<think>...</think>) — process BEFORE other markdown
+  html = html.replace(/&lt;think&gt;([\s\S]*?)&lt;\/think&gt;/g, (_, inner) => {
+    // Clean up inner whitespace
+    inner = inner.replace(/^(<br>|\s)+/, '').replace(/(<br>|\s)+$/, '');
+    return `<details class="thinking-block"><summary>💭 Thinking...</summary><div class="thinking-content">${inner}</div></details>`;
+  });
 
   // Code blocks (``` ... ```)
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
@@ -649,8 +1235,11 @@ function renderMarkdown(text) {
   // Wrap in paragraph
   html = '<p>' + html + '</p>';
 
-  // Clean up empty paragraphs
-  html = html.replace(/<p><\/p>/g, '');
+  // Clean up empty paragraphs and redundant breaks
+  html = html.replace(/<p>\s*<\/p>/g, '');
+  html = html.replace(/(<br>\s*){3,}/g, '<br><br>');
+  html = html.replace(/<p>\s*<br>/g, '<p>');
+  html = html.replace(/<br>\s*<\/p>/g, '</p>');
   html = html.replace(/<p>(<h[123]>)/g, '$1');
   html = html.replace(/(<\/h[123]>)<\/p>/g, '$1');
   html = html.replace(/<p>(<pre>)/g, '$1');
@@ -659,6 +1248,8 @@ function renderMarkdown(text) {
   html = html.replace(/(<\/ul>)<\/p>/g, '$1');
   html = html.replace(/<p>(<blockquote>)/g, '$1');
   html = html.replace(/(<\/blockquote>)<\/p>/g, '$1');
+  html = html.replace(/<p>(<details)/g, '$1');
+  html = html.replace(/(<\/details>)<\/p>/g, '$1');
 
   return html;
 }
@@ -667,14 +1258,21 @@ function renderMarkdown(text) {
 // CHAT — STREAMING
 // =======================================
 async function loadHistory() {
-  const data = await api('/api/history');
   const container = document.getElementById('chat-messages');
-  if (!data || !data.length) {
+  // Don't reload if chat already has real messages (preserves streaming state,
+  // tool cards, and in-progress responses when user switches tabs)
+  const hasMessages = container.children.length > 0
+    && !container.querySelector('.text-center.py-8');
+  if (hasMessages) {
+    scrollToBottom();
+    return;
+  }
+  const data = await api('/api/history');
+  if (!data || !Array.isArray(data) || !data.length) {
     container.innerHTML = '<div class="text-muted text-sm text-center py-8">Start a conversation with your agent</div>';
     return;
   }
   container.innerHTML = data.map(m => renderMessage(m.role, m.content)).join('');
-  // Ensure last message is fully visible
   scrollToBottom();
 }
 
@@ -682,17 +1280,19 @@ function renderMessage(role, content) {
   const isUser = role === 'user';
   const id = 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   if (isUser) {
+    // content can be string or array with file descriptions
+    const text = typeof content === 'string' ? content : (content.text || content);
     return `
       <div class="flex justify-end" id="${id}">
-        <div class="chat-msg bg-accent/15 border border-accent/20 rounded-lg px-3.5 py-2.5 text-sm text-zinc-200">
-          ${escapeHtml(content)}
+        <div class="chat-msg bg-accent/10 border border-accent/15 rounded-2xl rounded-br-md px-4 py-2.5 text-[13px] text-zinc-200">
+          ${escapeHtml(text)}
         </div>
       </div>`;
   }
   return `
     <div class="flex justify-start" id="${id}">
-      <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5 text-[13px] text-zinc-300">
-        <button class="copy-btn text-xs px-1.5 py-0.5 rounded bg-bg-hover border border-border text-muted hover:text-white transition-colors"
+      <div class="chat-msg bg-[#141416] border border-[#1e1e22] rounded-2xl rounded-bl-md px-4 py-3 text-[13px] text-zinc-300">
+        <button class="copy-btn text-[10px] px-1.5 py-0.5 rounded-md bg-bg-hover/60 border border-border text-zinc-600 hover:text-zinc-300 transition-colors"
           onclick="copyMessage(this)">Copy</button>
         <div class="msg-content">${renderMarkdown(content)}</div>
       </div>
@@ -706,13 +1306,54 @@ function scrollToBottom() {
   });
 }
 
+// ── File attachment state ──
+let pendingFiles = [];
+
+function handleFileSelect(fileList) {
+  for (const f of fileList) {
+    if (f.size > 10 * 1024 * 1024) { alert(`File "${f.name}" too large (max 10MB)`); continue; }
+    pendingFiles.push(f);
+  }
+  renderPendingFiles();
+  document.getElementById('chat-file-input').value = '';
+}
+
+function renderPendingFiles() {
+  const container = document.getElementById('chat-files-list');
+  const preview = document.getElementById('chat-files-preview');
+  if (!pendingFiles.length) { preview.classList.add('hidden'); return; }
+  preview.classList.remove('hidden');
+  container.innerHTML = pendingFiles.map((f, i) => {
+    const icon = f.type.startsWith('image/') ? '🖼' : f.type === 'application/pdf' ? '📄' : '📎';
+    const size = (f.size / 1024).toFixed(1);
+    return `<div class="flex items-center gap-1.5 bg-bg-card border border-border rounded-lg px-2.5 py-1.5 text-xs text-zinc-300">
+      <span>${icon}</span>
+      <span class="max-w-[120px] truncate">${escapeHtml(f.name)}</span>
+      <span class="text-zinc-600">${size}K</span>
+      <button onclick="removeFile(${i})" class="text-zinc-600 hover:text-red-400 ml-1">&times;</button>
+    </div>`;
+  }).join('');
+}
+
+function removeFile(idx) {
+  pendingFiles.splice(idx, 1);
+  renderPendingFiles();
+}
+
 async function sendChat() {
   if (chatBusy) return;
   const input = document.getElementById('chat-input');
   const msg = input.value.trim();
-  if (!msg) return;
+  if (!msg && !pendingFiles.length) return;
+  if (!msg) { alert('Please enter a message'); return; }
   input.value = '';
   chatBusy = true;
+
+  // If files attached, use multimodal endpoint
+  const hasFiles = pendingFiles.length > 0;
+  const filesToSend = [...pendingFiles];
+  pendingFiles = [];
+  renderPendingFiles();
 
   const container = document.getElementById('chat-messages');
   // Remove placeholder
@@ -726,7 +1367,7 @@ async function sendChat() {
   const typingId = 'typing-' + Date.now();
   container.insertAdjacentHTML('beforeend', `
     <div id="${typingId}" class="flex justify-start">
-      <div class="chat-msg bg-bg-card border border-border rounded-lg px-3.5 py-2.5">
+      <div class="chat-msg bg-[#141416] border border-[#1e1e22] rounded-2xl rounded-bl-md px-4 py-3">
         <span class="typing-dot"></span>
         <span class="typing-dot"></span>
         <span class="typing-dot"></span>
@@ -734,7 +1375,45 @@ async function sendChat() {
     </div>`);
   scrollToBottom();
 
-  // SSE streaming
+  // If files attached, use multimodal (non-streaming) endpoint
+  if (hasFiles) {
+    try {
+      const formData = new FormData();
+      formData.append('message', msg);
+      formData.append('user_id', 'dashboard-user');
+      for (const f of filesToSend) formData.append('files', f);
+
+      // Show file badges in user message
+      const fileInfo = filesToSend.map(f => {
+        const icon = f.type.startsWith('image/') ? '🖼' : f.type === 'application/pdf' ? '📄' : '📎';
+        return `${icon} ${f.name}`;
+      }).join(', ');
+      // Append file info to the user message bubble
+      const lastUserMsg = container.querySelector('.justify-end:last-of-type .chat-msg');
+      if (lastUserMsg) {
+        lastUserMsg.insertAdjacentHTML('beforeend',
+          `<div class="text-[10px] text-zinc-500 mt-1">${escapeHtml(fileInfo)}</div>`);
+      }
+
+      const res = await fetch('/chat/multimodal', { method: 'POST', body: formData });
+      const data = await res.json();
+      document.getElementById(typingId)?.remove();
+
+      if (data && data.response) {
+        container.insertAdjacentHTML('beforeend', renderMessage('assistant', data.response));
+      } else if (data && data.detail) {
+        container.insertAdjacentHTML('beforeend', renderMessage('assistant', 'Error: ' + data.detail));
+      }
+      scrollToBottom();
+    } catch (e) {
+      document.getElementById(typingId)?.remove();
+      container.insertAdjacentHTML('beforeend', renderMessage('assistant', 'Error: ' + e.message));
+    }
+    chatBusy = false;
+    return;
+  }
+
+  // SSE streaming (text-only messages)
   const msgId = 'stream-' + Date.now();
   let streamText = '';
   let streamEl = null;
@@ -746,7 +1425,8 @@ async function sendChat() {
     let toolCounter = 0;
 
     eventSource.onmessage = function(event) {
-      const data = JSON.parse(event.data);
+      let data;
+      try { data = JSON.parse(event.data); } catch(e) { console.error('SSE parse error:', e); return; }
 
       if (data.done) {
         eventSource.close();
@@ -754,6 +1434,13 @@ async function sendChat() {
         if (streamEl) {
           const contentEl = streamEl.querySelector('.msg-content');
           if (contentEl) contentEl.innerHTML = renderMarkdown(streamText);
+          // Add provider/model badge
+          if (data.provider || data.model) {
+            const badge = document.createElement('div');
+            badge.className = 'model-badge';
+            badge.textContent = [data.provider, data.model].filter(Boolean).join(' / ');
+            streamEl.querySelector('.chat-msg')?.appendChild(badge);
+          }
         }
         chatBusy = false;
         return;
@@ -921,8 +1608,19 @@ async function loadConfig() {
   providerData = await api('/api/settings/providers');
   if (providerData) renderProviderSettings(providerData);
 
+  // Load routing mode (Auto/Fixed)
+  loadRoutingConfig();
+
+  // Load planning (internal monologue) settings
+  loadPlanningConfig();
+
   // Load Telegram settings
   loadTelegramStatus();
+
+  // Load Storage, Qdrant, MCP status
+  loadStorageStatus();
+  loadQdrantStatus();
+  loadMcpConfig();
 
   // Load config JSON (read-only)
   const cfg = await api('/api/config');
@@ -1027,6 +1725,262 @@ async function applyProviderSettings() {
   }
 }
 
+// ── Routing Mode (Auto/Fixed) ──
+let _cascadeRouting = true;
+
+function updateRoutingUI(isAuto) {
+  _cascadeRouting = isAuto;
+  const toggle = document.getElementById('routing-toggle');
+  const dot = document.getElementById('routing-toggle-dot');
+  const labelAuto = document.getElementById('routing-label-auto');
+  const labelFixed = document.getElementById('routing-label-fixed');
+  const desc = document.getElementById('routing-description');
+  const cascadeCfg = document.getElementById('cascade-config');
+  const cascadeHint = document.getElementById('cascade-hint');
+  const cascadeBtn = document.getElementById('cascade-save-btn');
+
+  if (isAuto) {
+    toggle.className = 'relative w-11 h-6 rounded-full transition-colors bg-accent';
+    dot.style.transform = 'translateX(20px)';
+    labelAuto.className = 'text-xs text-white font-medium';
+    labelFixed.className = 'text-xs text-muted';
+    desc.textContent = 'Auto: default model for simple tasks, escalates to complex models as needed';
+    cascadeCfg.style.display = '';
+    cascadeHint.style.display = '';
+    cascadeBtn.style.display = '';
+  } else {
+    toggle.className = 'relative w-11 h-6 rounded-full transition-colors bg-zinc-700';
+    dot.style.transform = 'translateX(0)';
+    labelAuto.className = 'text-xs text-muted';
+    labelFixed.className = 'text-xs text-white font-medium';
+    desc.textContent = 'Fixed: always uses the default model selected above for all tasks';
+    cascadeCfg.style.display = 'none';
+    cascadeHint.style.display = 'none';
+    cascadeBtn.style.display = 'none';
+  }
+}
+
+async function toggleRouting() {
+  const newMode = !_cascadeRouting;
+  updateRoutingUI(newMode);
+  await api('/api/settings/routing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cascade_routing: newMode }),
+  });
+}
+
+function populateCascadeDropdowns(selectedModels) {
+  // Build options from all providers
+  if (!providerData) return;
+  const options = [];
+  for (const [prov, info] of Object.entries(providerData.providers)) {
+    const models = info.models || [];
+    for (const m of models) {
+      if (prov === providerData.active_provider || prov === 'ollama') {
+        // Local/active provider: no prefix needed
+        options.push({ value: m, label: `${m}`, group: providerLabel(prov) });
+      }
+      // Always add prefixed version for cross-provider
+      if (prov !== 'ollama' && prov !== providerData.active_provider) {
+        options.push({ value: `${prov}:${m}`, label: `${prov}:${m}`, group: providerLabel(prov) });
+      }
+    }
+  }
+  // Deduplicate
+  const seen = new Set();
+  const unique = options.filter(o => { if (seen.has(o.value)) return false; seen.add(o.value); return true; });
+
+  for (const level of ['simple', 'medium', 'complex']) {
+    const sel = document.getElementById('cascade-' + level);
+    const current = selectedModels[level] || '';
+    // Ensure current value is in options
+    let hasCurrentValue = unique.some(o => o.value === current);
+    let html = '';
+    if (current && !hasCurrentValue) {
+      html += `<option value="${current}" selected>${current}</option>`;
+    }
+    html += unique.map(o =>
+      `<option value="${o.value}" ${o.value === current ? 'selected' : ''}>${o.label}</option>`
+    ).join('');
+    sel.innerHTML = html;
+  }
+}
+
+async function loadRoutingConfig() {
+  const res = await api('/api/settings/routing');
+  if (res) {
+    updateRoutingUI(res.cascade_routing);
+    if (res.models) {
+      populateCascadeDropdowns(res.models);
+    }
+    // Local-only hours
+    if (res.local_only_hours) {
+      updateLohUI(res.local_only_hours.enabled || false);
+      document.getElementById('loh-start').value = res.local_only_hours.start || '00:00';
+      document.getElementById('loh-end').value = res.local_only_hours.end || '08:00';
+    }
+  }
+}
+
+async function saveCascadeConfig() {
+  const statusEl = document.getElementById('cascade-status');
+  statusEl.innerHTML = '<span class="text-muted">Saving...</span>';
+  const res = await api('/api/settings/routing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cascade_routing: _cascadeRouting,
+      models: {
+        simple: document.getElementById('cascade-simple').value.trim(),
+        medium: document.getElementById('cascade-medium').value.trim(),
+        complex: document.getElementById('cascade-complex').value.trim(),
+      }
+    }),
+  });
+  if (res && res.ok) {
+    statusEl.innerHTML = '<span class="text-emerald-400">&#10003; Saved</span>';
+    setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
+  } else {
+    statusEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error'}</span>`;
+  }
+}
+
+// ── Planning (Internal Monologue) ──
+let _planningEnabled = false;
+
+function updatePlanningUI(enabled) {
+  _planningEnabled = enabled;
+  const toggle = document.getElementById('planning-toggle');
+  const dot = document.getElementById('planning-toggle-dot');
+  const config = document.getElementById('planning-config');
+  if (enabled) {
+    toggle.classList.remove('bg-zinc-700');
+    toggle.classList.add('bg-accent');
+    dot.style.transform = 'translateX(20px)';
+    config.style.display = 'block';
+  } else {
+    toggle.classList.remove('bg-accent');
+    toggle.classList.add('bg-zinc-700');
+    dot.style.transform = 'translateX(0)';
+    config.style.display = 'none';
+  }
+}
+
+async function togglePlanning() {
+  const newState = !_planningEnabled;
+  updatePlanningUI(newState);
+  await api('/api/settings/planning', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ enabled: newState }),
+  });
+}
+
+async function loadPlanningConfig() {
+  const res = await api('/api/settings/planning');
+  if (res) {
+    updatePlanningUI(res.enabled);
+    // Populate model dropdown
+    const sel = document.getElementById('planning-model');
+    sel.innerHTML = '<option value="auto">Auto (cheapest for provider)</option>';
+    if (providerData && providerData.available_models) {
+      for (const m of providerData.available_models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        if (m === res.planning_model) opt.selected = true;
+        sel.appendChild(opt);
+      }
+    }
+    if (res.planning_model && res.planning_model !== 'auto') {
+      // Ensure the saved model is shown even if not in available_models
+      if (!sel.querySelector(`option[value="${res.planning_model}"]`)) {
+        const opt = document.createElement('option');
+        opt.value = res.planning_model;
+        opt.textContent = res.planning_model;
+        opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.value = res.planning_model;
+    }
+    document.getElementById('planning-skip-simple').checked = res.skip_simple !== false;
+    document.getElementById('planning-reflect-n').value = res.reflect_every_n_tools || 3;
+  }
+}
+
+async function savePlanningConfig() {
+  const statusEl = document.getElementById('planning-status');
+  statusEl.innerHTML = '<span class="text-muted">Saving...</span>';
+  const res = await api('/api/settings/planning', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      enabled: _planningEnabled,
+      planning_model: document.getElementById('planning-model').value,
+      skip_simple: document.getElementById('planning-skip-simple').checked,
+      reflect_every_n_tools: parseInt(document.getElementById('planning-reflect-n').value) || 3,
+    }),
+  });
+  if (res && res.ok) {
+    statusEl.innerHTML = '<span class="text-emerald-400">&#10003; Saved</span>';
+    setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
+  } else {
+    statusEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error'}</span>`;
+  }
+}
+
+// ── Local-Only Hours ──
+let _lohEnabled = false;
+
+function updateLohUI(enabled) {
+  _lohEnabled = enabled;
+  const toggle = document.getElementById('loh-toggle');
+  const dot = document.getElementById('loh-toggle-dot');
+  const cfg = document.getElementById('loh-config');
+  if (enabled) {
+    toggle.className = 'relative w-11 h-6 rounded-full transition-colors bg-accent';
+    dot.style.transform = 'translateX(20px)';
+    cfg.style.display = '';
+  } else {
+    toggle.className = 'relative w-11 h-6 rounded-full transition-colors bg-zinc-700';
+    dot.style.transform = 'translateX(0)';
+    cfg.style.display = 'none';
+  }
+}
+
+async function toggleLocalOnlyHours() {
+  const newState = !_lohEnabled;
+  updateLohUI(newState);
+  await api('/api/settings/routing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ local_only_hours: { enabled: newState } }),
+  });
+}
+
+async function saveLocalOnlyHours() {
+  const statusEl = document.getElementById('loh-status');
+  statusEl.innerHTML = '<span class="text-muted">Saving...</span>';
+  const res = await api('/api/settings/routing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      local_only_hours: {
+        enabled: _lohEnabled,
+        start: document.getElementById('loh-start').value,
+        end: document.getElementById('loh-end').value,
+      }
+    }),
+  });
+  if (res && res.ok) {
+    statusEl.innerHTML = '<span class="text-emerald-400">&#10003; Saved</span>';
+    setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
+  } else {
+    statusEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error'}</span>`;
+  }
+}
+
 async function saveProviderKey(name) {
   const input = document.getElementById('key-input-' + name);
   const key = input.value.trim();
@@ -1092,10 +2046,14 @@ async function loadTelegramStatus() {
     badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-zinc-500/15 text-zinc-400 border-zinc-500/30';
     badge.textContent = 'Not configured';
   }
+  if (data.chat_id) {
+    document.getElementById('tg-chat-id').value = data.chat_id;
+  }
 }
 
 async function saveTelegram() {
   const token = document.getElementById('tg-token').value.trim();
+  const chatId = document.getElementById('tg-chat-id').value.trim();
   const resultEl = document.getElementById('tg-result');
   if (!token) { resultEl.innerHTML = '<span class="text-red-400">Enter a token</span>'; return; }
   resultEl.innerHTML = '<span class="text-muted">Saving...</span>';
@@ -1103,15 +2061,15 @@ async function saveTelegram() {
   const res = await api('/api/settings/telegram', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({token}),
+    body: JSON.stringify({token, chat_id: chatId}),
   });
 
   if (res && res.ok) {
-    resultEl.innerHTML = `<span class="text-emerald-400">Token saved (${res.token_preview})</span>`;
+    resultEl.innerHTML = `<span class="text-emerald-400">Saved (${res.token_preview})${chatId ? ', chat: ' + chatId : ', all chats'}</span>`;
     document.getElementById('tg-token').value = '';
     loadTelegramStatus();
   } else {
-    resultEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error saving token'}</span>`;
+    resultEl.innerHTML = `<span class="text-red-400">${res?.detail || 'Error saving'}</span>`;
   }
 }
 
@@ -1134,21 +2092,371 @@ async function testTelegram() {
 }
 
 // =======================================
+// STORAGE (MinIO/S3)
+// =======================================
+async function loadStorageStatus() {
+  const data = await api('/api/settings/storage');
+  const badge = document.getElementById('storage-status-badge');
+  if (!data) return;
+  if (data.connected) {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+    badge.textContent = 'Connected';
+    if (data.endpoint) document.getElementById('storage-endpoint').placeholder = data.endpoint;
+    if (data.bucket) document.getElementById('storage-bucket').value = data.bucket;
+    if (data.access_key_preview) document.getElementById('storage-access-key').placeholder = data.access_key_preview;
+  } else if (data.enabled) {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-red-500/15 text-red-400 border-red-500/30';
+    badge.textContent = 'Disconnected';
+  } else {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-zinc-500/15 text-zinc-400 border-zinc-500/30';
+    badge.textContent = 'Not configured';
+  }
+}
+
+async function testStorage() {
+  const el = document.getElementById('storage-result');
+  el.innerHTML = '<span class="text-muted">Testing...</span>';
+  const res = await api('/api/settings/storage/test', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      endpoint: document.getElementById('storage-endpoint').value.trim(),
+      access_key: document.getElementById('storage-access-key').value.trim(),
+      secret_key: document.getElementById('storage-secret-key').value.trim(),
+      bucket: document.getElementById('storage-bucket').value.trim(),
+    }),
+  });
+  if (res && res.ok) {
+    el.innerHTML = `<span class="text-emerald-400">Connected (${res.latency_ms}ms) — ${res.file_count} files, ${(res.total_size_bytes / 1024).toFixed(1)} KB</span>`;
+  } else {
+    el.innerHTML = `<span class="text-red-400">${res?.error || 'Connection failed'}</span>`;
+  }
+}
+
+async function saveStorage() {
+  const el = document.getElementById('storage-result');
+  el.innerHTML = '<span class="text-muted">Saving...</span>';
+  const res = await api('/api/settings/storage', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      endpoint: document.getElementById('storage-endpoint').value.trim(),
+      access_key: document.getElementById('storage-access-key').value.trim(),
+      secret_key: document.getElementById('storage-secret-key').value.trim(),
+      bucket: document.getElementById('storage-bucket').value.trim(),
+    }),
+  });
+  if (res && res.ok) {
+    el.innerHTML = `<span class="text-emerald-400">Saved${res.connected ? ' & connected' : ''}</span>`;
+    loadStorageStatus();
+  } else {
+    el.innerHTML = `<span class="text-red-400">${res?.error || res?.detail || 'Error'}</span>`;
+  }
+}
+
+// =======================================
+// QDRANT
+// =======================================
+async function loadQdrantStatus() {
+  const data = await api('/api/settings/qdrant');
+  const badge = document.getElementById('qdrant-status-badge');
+  if (!data) return;
+  if (data.connected) {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+    const vecs = data.stats?.qdrant_vectors || 0;
+    badge.textContent = `Connected (${vecs} vectors)`;
+    if (data.url) document.getElementById('qdrant-url').placeholder = data.url;
+    if (data.collection) document.getElementById('qdrant-collection').value = data.collection;
+    if (data.api_key_preview) document.getElementById('qdrant-api-key').placeholder = data.api_key_preview;
+  } else if (data.enabled) {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-red-500/15 text-red-400 border-red-500/30';
+    badge.textContent = 'Disconnected';
+  } else {
+    badge.className = 'text-[10px] px-2 py-0.5 rounded-full border bg-zinc-500/15 text-zinc-400 border-zinc-500/30';
+    badge.textContent = 'Not configured';
+  }
+}
+
+async function testQdrant() {
+  const el = document.getElementById('qdrant-result');
+  el.innerHTML = '<span class="text-muted">Testing...</span>';
+  const res = await api('/api/settings/qdrant/test', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      url: document.getElementById('qdrant-url').value.trim(),
+      api_key: document.getElementById('qdrant-api-key').value.trim(),
+    }),
+  });
+  if (res && res.ok) {
+    el.innerHTML = `<span class="text-emerald-400">Connected (${res.latency_ms}ms) — collections: ${res.collections?.join(', ') || 'none'}</span>`;
+  } else {
+    el.innerHTML = `<span class="text-red-400">${res?.error || 'Connection failed'}</span>`;
+  }
+}
+
+async function saveQdrant() {
+  const el = document.getElementById('qdrant-result');
+  el.innerHTML = '<span class="text-muted">Saving...</span>';
+  const res = await api('/api/settings/qdrant', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      url: document.getElementById('qdrant-url').value.trim(),
+      api_key: document.getElementById('qdrant-api-key').value.trim(),
+      collection: document.getElementById('qdrant-collection').value.trim(),
+    }),
+  });
+  if (res && res.ok) {
+    el.innerHTML = `<span class="text-emerald-400">Saved${res.connected ? ' & connected' : ''}</span>`;
+    loadQdrantStatus();
+  } else {
+    el.innerHTML = `<span class="text-red-400">${res?.error || res?.detail || 'Error'}</span>`;
+  }
+}
+
+// =======================================
+// MCP SERVERS
+// =======================================
+async function loadMcpConfig() {
+  const data = await api('/api/mcp/config');
+  const badge = document.getElementById('mcp-count-badge');
+  const list = document.getElementById('mcp-servers-list');
+  if (!data || !Array.isArray(data)) {
+    badge.textContent = '0 servers';
+    list.innerHTML = '<div class="text-xs text-zinc-600">No MCP servers configured</div>';
+    return;
+  }
+  badge.textContent = `${data.length} server${data.length !== 1 ? 's' : ''}`;
+  if (data.length === 0) {
+    list.innerHTML = '<div class="text-xs text-zinc-600">No MCP servers configured</div>';
+    return;
+  }
+  list.innerHTML = data.map(s => `
+    <div class="flex items-center justify-between bg-bg rounded-lg px-3 py-2 border border-border">
+      <div>
+        <span class="text-sm text-white font-medium">${escapeHtml(s.name)}</span>
+        <span class="text-xs text-muted ml-2">${escapeHtml(s.command)}</span>
+        ${s.connected ? '<span class="ml-2 text-[10px] text-emerald-400">connected</span>' : '<span class="ml-2 text-[10px] text-zinc-500">disconnected</span>'}
+      </div>
+      <button onclick="removeMcpServer('${escapeHtml(s.name)}')" class="text-xs px-2 py-1 rounded border border-red-400/20 text-red-400 hover:border-red-400/50 transition-colors">
+        Remove
+      </button>
+    </div>
+  `).join('');
+}
+
+function toggleMcpMode(mode) {
+  const formEl = document.getElementById('mcp-form-mode');
+  const jsonEl = document.getElementById('mcp-json-mode');
+  const formBtn = document.getElementById('mcp-mode-form');
+  const jsonBtn = document.getElementById('mcp-mode-json');
+  if (mode === 'json') {
+    formEl.classList.add('hidden'); jsonEl.classList.remove('hidden');
+    jsonBtn.className = 'text-xs px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/50 text-accent';
+    formBtn.className = 'text-xs px-3 py-1.5 rounded-lg border border-border text-muted';
+  } else {
+    jsonEl.classList.add('hidden'); formEl.classList.remove('hidden');
+    formBtn.className = 'text-xs px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/50 text-accent';
+    jsonBtn.className = 'text-xs px-3 py-1.5 rounded-lg border border-border text-muted';
+  }
+}
+
+async function addMcpServer() {
+  const el = document.getElementById('mcp-add-result');
+  el.innerHTML = '<span class="text-muted">Adding...</span>';
+
+  const jsonInput = document.getElementById('mcp-json-input').value.trim();
+  let body;
+  if (jsonInput && !document.getElementById('mcp-json-mode').classList.contains('hidden')) {
+    body = { name: 'from-json', command: 'placeholder', json_config: jsonInput };
+  } else {
+    const name = document.getElementById('mcp-name').value.trim();
+    const command = document.getElementById('mcp-command').value.trim();
+    const argsStr = document.getElementById('mcp-args').value.trim();
+    const args = argsStr ? argsStr.split(',').map(a => a.trim()).filter(Boolean) : [];
+    body = { name, command, args };
+  }
+
+  const res = await api('/api/mcp/servers', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (res && res.ok) {
+    el.innerHTML = '<span class="text-emerald-400">Server added</span>';
+    document.getElementById('mcp-name').value = '';
+    document.getElementById('mcp-command').value = '';
+    document.getElementById('mcp-args').value = '';
+    document.getElementById('mcp-json-input').value = '';
+    loadMcpConfig();
+  } else {
+    el.innerHTML = `<span class="text-red-400">${res?.error || res?.detail || 'Failed'}</span>`;
+  }
+}
+
+async function removeMcpServer(name) {
+  const res = await api('/api/mcp/servers/' + encodeURIComponent(name), { method: 'DELETE' });
+  loadMcpConfig();
+}
+
+// =======================================
+// SCHEDULER RUN NOW
+// =======================================
+async function runSchedulerJob(name) {
+  const res = await api(`/api/ops/scheduler/${encodeURIComponent(name)}/run`, {method: 'POST'});
+  if (res && res.status === 'triggered') {
+    // Refresh system panel
+    const system = await api('/api/ops/system');
+    if (system && !system.detail) renderSystemPanel(system);
+  } else if (res && res.detail) {
+    alert(res.detail);
+  }
+}
+
+// =======================================
 // UTILS
 // =======================================
 function escapeHtml(s) {
   if (!s) return '';
   if (typeof s !== 'string') s = String(s);
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// =======================================
+// WEBSOCKET
+// =======================================
+let wsRetryDelay = 3000;
+const WS_MAX_RETRY = 30000;
+
+function connectWS() {
+  if (ws && ws.readyState <= 1) return; // already connected or connecting
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+  } catch(e) {
+    // WebSocket not supported or blocked
+    return;
+  }
+
+  ws.onopen = () => {
+    wsRetryDelay = 3000; // reset backoff on success
+    document.getElementById('sidebar-status').textContent = 'Live';
+    document.getElementById('sidebar-status').className = 'text-xs mt-1 text-emerald-400';
+    // Send periodic pings
+    ws._pingTimer = setInterval(() => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({type: 'ping'}));
+    }, 30000);
+  };
+
+  ws.onmessage = ({data}) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'pong') return;
+      handleWSEvent(msg.type, msg.data);
+    } catch(e) { /* ignore parse errors */ }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('sidebar-status').textContent = 'Reconnecting...';
+    document.getElementById('sidebar-status').className = 'text-xs mt-1 text-amber-400';
+    if (ws._pingTimer) clearInterval(ws._pingTimer);
+    // Exponential backoff: 3s → 6s → 12s → ... → 30s max
+    wsReconnectTimer = setTimeout(connectWS, wsRetryDelay);
+    wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_RETRY);
+  };
+
+  ws.onerror = () => { /* onclose will fire */ };
+}
+
+function handleWSEvent(type, data) {
+  if (currentTab !== 'overview') return; // only update overview in real-time
+  switch(type) {
+    case 'request_started':
+    case 'request_done':
+    case 'request_queued':
+      // Refresh active requests panel
+      api('/api/ops/active').then(d => { if (d && !d.detail) renderActiveRequests(d); });
+      break;
+    case 'scheduler_job_started':
+    case 'scheduler_job_done':
+      // Refresh system panel (scheduler section)
+      api('/api/ops/system').then(d => { if (d && !d.detail) renderSystemPanel(d); });
+      break;
+    case 'config_reloaded':
+      // Reload overview data
+      loadOverview();
+      break;
+  }
+}
+
+// =======================================
+// AUTH
+// =======================================
+async function checkAuth() {
+  try {
+    const data = await api('/api/auth/check');
+    if (!data || data.detail) return true; // endpoint missing or error → no auth
+    if (data.auth_required && !data.authenticated) {
+      showLoginOverlay();
+      return false;
+    }
+  } catch(e) { /* auth endpoint unavailable, skip */ }
+  return true;
+}
+
+function showLoginOverlay() {
+  let overlay = document.getElementById('login-overlay');
+  if (!overlay) {
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="login-overlay" class="fixed inset-0 z-50 bg-black/80 flex items-center justify-center">
+        <div class="bg-bg-card border border-border rounded-2xl p-8 w-80">
+          <h2 class="text-lg font-semibold text-white mb-4">Login</h2>
+          <input id="login-password" type="password" placeholder="Password"
+            class="w-full bg-bg border border-border rounded-lg px-4 py-3 text-sm text-white placeholder-muted focus:outline-none focus:border-accent mb-3"
+            onkeydown="if(event.key==='Enter')doLogin()">
+          <button onclick="doLogin()" class="w-full bg-accent hover:bg-accent-dim text-white py-2.5 rounded-lg text-sm font-medium transition-colors">
+            Sign In
+          </button>
+          <div id="login-error" class="text-xs text-red-400 mt-2"></div>
+        </div>
+      </div>`);
+  }
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('login-password')?.focus();
+}
+
+async function doLogin() {
+  const pwd = document.getElementById('login-password').value;
+  const res = await api('/api/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pwd}),
+  });
+  if (res && res.ok) {
+    document.getElementById('login-overlay')?.classList.add('hidden');
+    init();
+  } else {
+    document.getElementById('login-error').textContent = (res && res.detail) || 'Invalid password';
+  }
 }
 
 // =======================================
 // INIT
 // =======================================
 async function init() {
-  const health = await api('/health');
-  document.getElementById('sidebar-status').textContent = health ? 'Connected' : 'Offline';
-  document.getElementById('sidebar-status').className = 'text-xs mt-1 ' + (health ? 'text-emerald-400' : 'text-red-400');
+  // Check auth first
+  const authed = await checkAuth();
+  if (!authed) return;
+
+  try {
+    const res = await fetch('/health');
+    const up = res.ok;
+    document.getElementById('sidebar-status').textContent = up ? 'Connected' : 'Offline';
+    document.getElementById('sidebar-status').className = 'text-xs mt-1 ' + (up ? 'text-emerald-400' : 'text-red-400');
+  } catch {
+    document.getElementById('sidebar-status').textContent = 'Offline';
+    document.getElementById('sidebar-status').className = 'text-xs mt-1 text-red-400';
+  }
+
+  // Connect WebSocket for live updates
+  connectWS();
+
   switchTab('overview');
 }
 

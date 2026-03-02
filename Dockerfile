@@ -13,6 +13,13 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . .
 
+# Create non-root user for security
+RUN groupadd -r liteagent && useradd -r -g liteagent -d /app -s /sbin/nologin liteagent \
+    && mkdir -p /data /config /home/liteagent/.liteagent \
+    && chown -R liteagent:liteagent /app /data /config /home/liteagent
+USER liteagent
+ENV HOME=/home/liteagent
+
 # Data and config mount points
 VOLUME ["/data", "/config"]
 ENV LITEAGENT_CONFIG=/config/config.json

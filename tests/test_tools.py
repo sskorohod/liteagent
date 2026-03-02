@@ -56,7 +56,9 @@ class TestToolRegistry:
 
         results = await registry.execute([MockBlock()])
         assert len(results) == 1
-        assert results[0]["content"] == "hello"
+        # Tool output is wrapped in XML anti-injection markers
+        assert "hello" in results[0]["content"]
+        assert "<tool_output" in results[0]["content"]
 
     @pytest.mark.asyncio
     async def test_execute_async_tool(self):
@@ -73,7 +75,8 @@ class TestToolRegistry:
             id = "test-id-2"
 
         results = await registry.execute([MockBlock()])
-        assert results[0]["content"] == "async: world"
+        assert "async: world" in results[0]["content"]
+        assert "<tool_output" in results[0]["content"]
 
     @pytest.mark.asyncio
     async def test_execute_unknown_tool(self):
@@ -103,7 +106,8 @@ class TestToolRegistry:
             id = "test-id-4"
 
         results = await registry.execute([MockBlock()])
-        assert len(results[0]["content"]) <= 10000
+        # Content is capped at 10k + XML wrapper (~50 chars overhead)
+        assert len(results[0]["content"]) <= 10100
 
 
 class TestBuiltinTools:
@@ -128,7 +132,8 @@ class TestBuiltinTools:
 
     def test_exec_command_timeout(self, tool_registry):
         handler = tool_registry._handlers["exec_command"]
-        result = handler(command="sleep 10", timeout=1)
+        # Use python3 (in allowlist) instead of sleep (not in allowlist)
+        result = handler(command='python3 -c "import time; time.sleep(10)"', timeout=1)
         assert "timed out" in result
 
     def test_exec_command_blocks_dangerous(self, tool_registry):

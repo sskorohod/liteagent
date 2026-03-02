@@ -79,7 +79,11 @@ def get_pricing(model: str) -> dict[str, float]:
     """Get pricing for a model, with fallback."""
     if model in MODEL_PRICING:
         return MODEL_PRICING[model]
-    if model.startswith("ollama/"):
+    # Ollama models: "ollama/" prefix, or present in discovered list,
+    # or local model format like "qwen3:32b", "llama3.1:latest"
+    if (model.startswith("ollama/")
+            or model in PROVIDER_MODELS.get("ollama", [])
+            or ":" in model):
         return MODEL_PRICING["ollama/*"]
     return {"input": 3.0, "output": 15.0, "cache_read": 0.3}  # safe fallback
 
@@ -95,6 +99,9 @@ class AnthropicProvider:
         import anthropic
         self.client = anthropic.AsyncAnthropic()
         self._last_stream_response: LLMResponse | None = None
+
+    def supports_model(self, model: str) -> bool:
+        return model.startswith("claude-") or model.startswith("anthropic/")
 
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
@@ -162,6 +169,9 @@ class OpenAIProvider:
             kwargs["api_key"] = key
         self.client = openai.AsyncOpenAI(**kwargs)
         self._last_stream_response: LLMResponse | None = None
+
+    def supports_model(self, model: str) -> bool:
+        return model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3")
 
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
@@ -286,18 +296,41 @@ class OpenAIProvider:
                 oai.append(m)
 
             elif role == "user" and isinstance(content, list):
-                # May contain tool_result blocks
+                # May contain text, image, document, or tool_result blocks.
+                # Build a single multimodal user message with parts array.
+                parts = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
+                        # Flush accumulated parts as user message first
+                        if parts:
+                            oai.append({"role": "user", "content": parts})
+                            parts = []
                         oai.append({
                             "role": "tool",
                             "tool_call_id": block.get("tool_use_id", ""),
                             "content": block.get("content", ""),
                         })
                     elif isinstance(block, dict) and block.get("type") == "text":
-                        oai.append({"role": "user", "content": block.get("text", "")})
+                        parts.append({"type": "text", "text": block.get("text", "")})
+                    elif isinstance(block, dict) and block.get("type") == "image":
+                        # Convert Anthropic image block → OpenAI vision format
+                        source = block.get("source", {})
+                        media = source.get("media_type", "image/jpeg")
+                        data = source.get("data", "")
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media};base64,{data}"},
+                        })
+                    elif isinstance(block, dict) and block.get("type") == "document":
+                        # OpenAI doesn't support PDF blocks natively; note it
+                        parts.append({
+                            "type": "text",
+                            "text": "[PDF document attached — content passed as document block]",
+                        })
                     else:
-                        oai.append({"role": "user", "content": str(block)})
+                        parts.append({"type": "text", "text": str(block)})
+                if parts:
+                    oai.append({"role": "user", "content": parts})
             else:
                 oai.append({"role": role, "content": content if isinstance(content, str)
                             else str(content)})
@@ -356,12 +389,133 @@ class OpenAIProvider:
 # ══════════════════════════════════════════
 
 class OllamaProvider(OpenAIProvider):
-    """Ollama local models via OpenAI-compatible API."""
+    """Ollama local models via OpenAI-compatible API.
+
+    Overrides stream() to handle reasoning/thinking models (qwen3, etc.)
+    where tokens arrive in a 'reasoning' field that the OpenAI SDK ignores.
+    """
 
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         import openai
         self.client = openai.AsyncOpenAI(base_url=base_url, api_key="ollama")
+        self._base_url = base_url
         self._last_stream_response: LLMResponse | None = None
+
+    def supports_model(self, model: str) -> bool:
+        # Ollama accepts any model name — local models don't have a known prefix
+        return True
+
+    async def stream(self, model: str, max_tokens: int, messages: list,
+                     system=None, tools=None, temperature=None) -> AsyncGenerator:
+        """Stream with reasoning/thinking model support (qwen3, etc.).
+
+        Uses httpx directly to access 'reasoning' field that openai SDK drops.
+        """
+        import httpx
+
+        oai_messages = self._convert_messages(messages, system)
+        body: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": oai_messages,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = self._convert_tools(tools)
+        if temperature is not None:
+            body["temperature"] = temperature
+
+        url = self._base_url.rstrip("/") + "/chat/completions"
+
+        full_text = ""
+        reasoning_text = ""
+        tool_calls_data: dict = {}
+        finish_reason = "stop"
+        reasoning_started = False
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0)
+        ) as client:
+            async with client.stream(
+                "POST", url, json=body,
+                headers={"Authorization": "Bearer ollama"},
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+
+                    # Reasoning tokens (thinking models like qwen3)
+                    reasoning = (
+                        delta.get("reasoning", "")
+                        or delta.get("reasoning_content", "")
+                    )
+                    if reasoning:
+                        if not reasoning_started:
+                            reasoning_started = True
+                            yield "<think>"
+                        reasoning_text += reasoning
+                        yield reasoning
+
+                    # Content tokens
+                    content = delta.get("content", "")
+                    if content:
+                        if reasoning_started and not full_text:
+                            yield "</think>\n"
+                        full_text += content
+                        yield content
+
+                    # Tool calls
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_data:
+                            tool_calls_data[idx] = {
+                                "id": "", "name": "", "arguments": "",
+                            }
+                        if tc.get("id"):
+                            tool_calls_data[idx]["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            tool_calls_data[idx]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            tool_calls_data[idx]["arguments"] += fn["arguments"]
+
+        # Build final response
+        blocks: list = []
+        if full_text:
+            blocks.append(TextBlock(text=full_text))
+        elif reasoning_text:
+            # Model used all tokens for thinking — expose reasoning as content
+            blocks.append(TextBlock(text=reasoning_text))
+
+        for tc_data in tool_calls_data.values():
+            try:
+                args = json.loads(tc_data["arguments"])
+            except Exception:
+                args = {}
+            blocks.append(ToolUseBlock(
+                id=tc_data["id"], name=tc_data["name"], input=args))
+
+        stop = "tool_use" if (
+            finish_reason in ("tool_calls", "stop") and tool_calls_data
+        ) else "end_turn"
+        self._last_stream_response = LLMResponse(
+            content=blocks, stop_reason=stop, usage=TokenUsage())
 
 
 # ══════════════════════════════════════════
@@ -377,6 +531,9 @@ class GeminiProvider:
         genai.configure(api_key=api_key)
         self._genai = genai
         self._last_stream_response: LLMResponse | None = None
+
+    def supports_model(self, model: str) -> bool:
+        return model.startswith("gemini-") or model.startswith("models/")
 
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
@@ -440,7 +597,7 @@ class GeminiProvider:
 
     @staticmethod
     def _convert_messages(messages: list) -> list:
-        """Convert to Gemini format."""
+        """Convert to Gemini format (supports text + image + document blocks)."""
         contents = []
         for msg in messages:
             role = "user" if msg["role"] == "user" else "model"
@@ -448,14 +605,32 @@ class GeminiProvider:
             if isinstance(content, str):
                 contents.append({"role": role, "parts": [content]})
             elif isinstance(content, list):
-                text_parts = []
+                parts = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                        parts.append(block.get("text", ""))
+                    elif isinstance(block, dict) and block.get("type") == "image":
+                        # Gemini inline_data format for images
+                        source = block.get("source", {})
+                        parts.append({
+                            "inline_data": {
+                                "mime_type": source.get("media_type", "image/jpeg"),
+                                "data": source.get("data", ""),
+                            }
+                        })
+                    elif isinstance(block, dict) and block.get("type") == "document":
+                        # Gemini supports PDF via inline_data
+                        source = block.get("source", {})
+                        parts.append({
+                            "inline_data": {
+                                "mime_type": source.get("media_type", "application/pdf"),
+                                "data": source.get("data", ""),
+                            }
+                        })
                     elif hasattr(block, 'type') and block.type == "text":
-                        text_parts.append(block.text)
-                if text_parts:
-                    contents.append({"role": role, "parts": text_parts})
+                        parts.append(block.text)
+                if parts:
+                    contents.append({"role": role, "parts": parts})
         return contents
 
 
@@ -549,7 +724,11 @@ def create_test_provider(provider_name: str, api_key: str, base_url: str | None 
 
 
 def create_provider(config: dict):
-    """Create LLM provider from config."""
+    """Create LLM provider from config.
+
+    If the configured provider's API key is missing, falls back to
+    the first provider that has a key available.
+    """
     from .config import get_api_key, PROVIDER_ENV_VARS
 
     agent_cfg = config.get("agent", {})
@@ -562,6 +741,31 @@ def create_provider(config: dict):
         key = get_api_key(provider_name)
         if key:
             os.environ[env_var] = key
+
+    # Check if the configured provider has a key (ollama doesn't need one)
+    if provider_name != "ollama" and env_var and not get_api_key(provider_name):
+        # Try to fallback to a provider that has a key
+        fallback = _find_fallback_provider(provider_name, config)
+        if fallback:
+            fb_name, fb_model = fallback
+            logger.warning(
+                "No API key for '%s'. Falling back to '%s' (model: %s). "
+                "Set the key via: liteagent --config or OPENAI_API_KEY env var.",
+                provider_name, fb_name, fb_model)
+            provider_name = fb_name
+            agent_cfg["provider"] = fb_name
+            agent_cfg["default_model"] = fb_model
+            # Load fallback key into env
+            fb_env = PROVIDER_ENV_VARS.get(fb_name)
+            if fb_env:
+                fb_key = get_api_key(fb_name)
+                if fb_key:
+                    os.environ[fb_env] = fb_key
+        else:
+            raise ValueError(
+                f"No API key found for provider '{provider_name}'. "
+                f"Set it via: liteagent --config, or set the "
+                f"{env_var} environment variable.")
 
     if provider_name == "anthropic":
         return AnthropicProvider()
@@ -588,3 +792,22 @@ def create_provider(config: dict):
     else:
         raise ValueError(f"Unknown provider: {provider_name}. "
                          f"Supported: anthropic, openai, ollama, gemini")
+
+
+def _find_fallback_provider(current: str, config: dict):
+    """Find a provider with an available API key (for auto-fallback)."""
+    from .config import get_api_key
+
+    # Preferred fallback order
+    fallback_order = [
+        ("anthropic", "claude-sonnet-4-20250514"),
+        ("openai", "gpt-4o-mini"),
+        ("gemini", "gemini-2.0-flash"),
+    ]
+    for name, default_model in fallback_order:
+        if name == current:
+            continue
+        key = get_api_key(name)
+        if key:
+            return (name, default_model)
+    return None

@@ -21,6 +21,30 @@ _CONTRADICTION_WORDS = {
 }
 
 
+class OllamaEmbedder:
+    """Embedder that uses Ollama /api/embeddings endpoint. Compatible with SentenceTransformer API."""
+
+    def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434"):
+        import numpy as np
+        self._model = model
+        self._url = f"{base_url}/api/embeddings"
+        self._np = np
+        # Probe dimension
+        test = self.encode("test")
+        self.dim = len(test)
+
+    def encode(self, text: str):
+        """Encode text to numpy vector via Ollama API."""
+        import urllib.request
+        import json as _json
+        body = _json.dumps({"model": self._model, "prompt": text}).encode()
+        req = urllib.request.Request(self._url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read())
+        return self._np.array(data["embedding"], dtype="float32")
+
+
 class MemorySystem:
     """Persistent memory with semantic recall and auto-learning."""
 
@@ -28,9 +52,19 @@ class MemorySystem:
         db_path = Path(config.get("memory", {}).get("db_path", "~/.liteagent/memory.db")).expanduser()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(db_path), check_same_thread=False)
+        # Restrict DB file permissions (owner read/write only)
+        if db_path.exists():
+            try:
+                import stat
+                os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)  # 600
+            except OSError:
+                pass  # Windows doesn't support chmod
         self.db.execute("PRAGMA journal_mode=WAL")
         self.provider = provider or client  # backward compat
+        self._config = config  # full config (for temporal_decay settings etc.)
         self.config = config.get("memory", {})
+        # Pass through default_model for extraction (so Ollama uses its own model)
+        self.config["_default_model"] = config.get("agent", {}).get("default_model", "")
         self._session_state: dict[str, Any] = {}
         self._conversations: dict[str, list] = {}  # user_id → messages
         self._features_config = config.get("features", {})
@@ -166,14 +200,40 @@ class MemorySystem:
         self.db.commit()
 
     def _init_embedder(self):
-        """Try to load sentence-transformers for semantic search, fallback to None."""
+        """Initialize embedder: Ollama → sentence-transformers → None."""
+        import importlib
+
+        # 1. Try Ollama embeddings (free, local)
+        parent_cfg = {k: v for k, v in self.config.items() if not k.startswith("_")}
+        # Access parent config via the _default_model key to detect Ollama
+        # Check if Ollama is running by looking at providers config
+        ollama_url = None
+        try:
+            # self.config is memory sub-config, need to detect Ollama from env
+            import urllib.request
+            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    import json as _json
+                    data = _json.loads(resp.read())
+                    models = [m["name"] for m in data.get("models", [])]
+                    # Prefer dedicated embedding models
+                    embed_models = [m for m in models if "embed" in m or "minilm" in m]
+                    if embed_models:
+                        emb = OllamaEmbedder(model=embed_models[0])
+                        logger.info("Using Ollama embeddings: %s (dim=%d)", embed_models[0], emb.dim)
+                        return emb
+        except Exception:
+            pass
+
+        # 2. Try sentence-transformers
         try:
             from sentence_transformers import SentenceTransformer
             model = SentenceTransformer("all-MiniLM-L6-v2")
             logger.info("Loaded embedding model: all-MiniLM-L6-v2")
             return model
         except ImportError:
-            logger.debug("sentence-transformers not installed, using keyword matching")
+            logger.debug("No embedder available (install sentence-transformers or pull an Ollama embed model)")
             return None
 
     def _embed(self, text: str) -> bytes | None:
@@ -334,7 +394,7 @@ class MemorySystem:
     def recall(self, query: str, user_id: str, top_k: int = 5) -> list[dict]:
         """Find relevant memories using embeddings (if available) or keyword matching."""
         rows = self.db.execute(
-            """SELECT content, type, importance, created_at, embedding
+            """SELECT id, content, type, importance, created_at, accessed_at, embedding
                FROM memories WHERE user_id = ? AND archived_at IS NULL
                ORDER BY importance DESC, created_at DESC
                LIMIT 50""",
@@ -343,6 +403,11 @@ class MemorySystem:
         if not rows:
             return []
 
+        # Temporal decay config
+        mem_cfg = self._config.get("memory", {}) if hasattr(self, '_config') else {}
+        use_temporal_decay = mem_cfg.get("temporal_decay_enabled", True)
+        decay_rate = mem_cfg.get("temporal_decay_rate", 0.01)
+
         # Try embedding-based scoring
         query_embedding = None
         if self._embedder is not None:
@@ -350,7 +415,8 @@ class MemorySystem:
 
         query_words = set(query.lower().split())
         scored = []
-        for content, mtype, importance, created_at, emb_blob in rows:
+        accessed_ids = []
+        for row_id, content, mtype, importance, created_at, accessed_at, emb_blob in rows:
             # Semantic score (embedding cosine similarity)
             semantic_score = 0.0
             if query_embedding is not None and emb_blob:
@@ -371,9 +437,16 @@ class MemorySystem:
             else:
                 relevance = keyword_score
 
-            recency = self._recency_score(created_at)
-            score = relevance * 0.6 + importance * 0.3 + recency * 0.1
+            # Temporal decay (exponential) or linear recency
+            if use_temporal_decay:
+                decay = self._temporal_decay_score(created_at, accessed_at, decay_rate)
+                score = relevance * 0.5 + importance * 0.25 + decay * 0.25
+            else:
+                recency = self._recency_score(created_at)
+                score = relevance * 0.6 + importance * 0.3 + recency * 0.1
+
             scored.append({
+                "id": row_id,
                 "content": content,
                 "type": mtype,
                 "score": score,
@@ -381,7 +454,19 @@ class MemorySystem:
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+        top_results = scored[:top_k]
+
+        # Touch-on-access: update accessed_at for retrieved memories
+        accessed_ids = [r["id"] for r in top_results if r.get("id")]
+        if accessed_ids:
+            now = datetime.now().isoformat()
+            for mid in accessed_ids:
+                self.db.execute(
+                    "UPDATE memories SET accessed_at = ? WHERE id = ?",
+                    (now, mid))
+            self.db.commit()
+
+        return top_results
 
     async def remember(self, content: str, user_id: str,
                        memory_type: str = "fact", importance: float = 0.5):
@@ -421,16 +506,6 @@ class MemorySystem:
             (user_id, content, memory_type, importance, content_hash,
              datetime.now().isoformat(), datetime.now().isoformat(), embedding))
         self.db.commit()
-
-    def get_all_memories(self, user_id: str) -> list[dict]:
-        """Get all memories for a user (for debugging/display)."""
-        rows = self.db.execute(
-            """SELECT content, type, importance, created_at
-               FROM memories WHERE user_id = ?
-               ORDER BY importance DESC, created_at DESC""",
-            (user_id,)).fetchall()
-        return [{"content": r[0], "type": r[1], "importance": r[2], "created_at": r[3]}
-                for r in rows]
 
     def forget(self, user_id: str, content_fragment: str):
         """Delete memories matching a fragment."""
@@ -550,7 +625,7 @@ class MemorySystem:
         )
 
         try:
-            model = self.config.get("extraction_model", "claude-haiku-4-5-20251001")
+            model = self.config.get("extraction_model") or self.config.get("_default_model", "claude-haiku-4-5-20251001")
             result = await self.provider.complete(
                 model=model,
                 max_tokens=20,
@@ -650,7 +725,7 @@ class MemorySystem:
         )
 
         try:
-            model = self.config.get("extraction_model", "claude-haiku-4-5-20251001")
+            model = self.config.get("extraction_model") or self.config.get("_default_model", "claude-haiku-4-5-20251001")
             result = await self.provider.complete(
                 model=model,
                 max_tokens=300,
@@ -831,11 +906,29 @@ class MemorySystem:
 
     @staticmethod
     def _recency_score(created_at: str) -> float:
-        """Score 0-1 based on how recent the memory is."""
+        """Score 0-1 based on how recent the memory is (linear decay)."""
         try:
             dt = datetime.fromisoformat(created_at)
             days_ago = (datetime.now() - dt).days
             return max(0, 1 - days_ago / 365)
+        except (ValueError, TypeError):
+            return 0.5
+
+    @staticmethod
+    def _temporal_decay_score(created_at: str, accessed_at: str | None = None,
+                              decay_rate: float = 0.01) -> float:
+        """Exponential temporal decay: score = exp(-decay_rate * days_since_access).
+
+        Unlike linear recency:
+        - Uses accessed_at (not just created_at), so re-accessed memories stay fresh
+        - Exponential curve preserves recent memories while gracefully forgetting old ones
+        - Default decay_rate=0.01 gives half-life of ~69 days
+        """
+        import math
+        try:
+            last_seen = datetime.fromisoformat(accessed_at or created_at)
+            days_since = max(0, (datetime.now() - last_seen).total_seconds() / 86400)
+            return math.exp(-decay_rate * days_since)
         except (ValueError, TypeError):
             return 0.5
 

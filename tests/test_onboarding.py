@@ -293,6 +293,8 @@ class TestAgentOnboardingIntegration:
 
         os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
         config = load_config()
+        config["agent"]["provider"] = "anthropic"
+        config["agent"]["default_model"] = "claude-sonnet-4-20250514"
         agent = LiteAgent(config)
         # Force onboarding mode
         agent.memory.set_state("app:onboarding_complete", None)
@@ -312,6 +314,8 @@ class TestAgentOnboardingIntegration:
 
         os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
         config = load_config()
+        config["agent"]["provider"] = "anthropic"
+        config["agent"]["default_model"] = "claude-sonnet-4-20250514"
         agent = LiteAgent(config)
         agent.memory.set_state("app:onboarding_complete", True)
 
@@ -326,6 +330,8 @@ class TestAgentOnboardingIntegration:
 
         os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
         config = load_config()
+        config["agent"]["provider"] = "anthropic"
+        config["agent"]["default_model"] = "claude-sonnet-4-20250514"
         agent = LiteAgent(config)
         agent.memory.db.execute("DELETE FROM app_state WHERE key='app:onboarding_complete'")
         agent.memory.db.commit()
@@ -341,6 +347,8 @@ class TestAgentOnboardingIntegration:
 
         os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-fake")
         config = load_config()
+        config["agent"]["provider"] = "anthropic"
+        config["agent"]["default_model"] = "claude-sonnet-4-20250514"
         agent = LiteAgent(config)
 
         # First register it
