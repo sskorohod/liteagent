@@ -3417,6 +3417,36 @@ class LiteAgent:
             except (json.JSONDecodeError, ValueError):
                 pass
 
+        # Strategy 5: XML/function tag format (qwen3-coder, etc.)
+        # Pattern: <function=tool_name>\n<parameter=key>value</parameter>\n</function>
+        if obj is None and "<function=" in text:
+            fn_match = re.search(
+                r'<function=(\w+)>(.*?)</function>', text, re.DOTALL)
+            if fn_match:
+                fn_name = fn_match.group(1)
+                fn_body = fn_match.group(2)
+                params = {}
+                for pm in re.finditer(
+                        r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', fn_body, re.DOTALL):
+                    params[pm.group(1)] = pm.group(2).strip()
+                if fn_name and params:
+                    obj = {"name": fn_name, "arguments": params}
+                    logger.info("Parsed XML-style tool call: %s(%s)", fn_name, list(params.keys()))
+
+        # Strategy 6: tool_call XML format
+        # Pattern: <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
+        if obj is None and "<tool_call>" in text:
+            tc_match = re.search(
+                r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL)
+            if tc_match:
+                try:
+                    obj = json.loads(tc_match.group(1))
+                except (json.JSONDecodeError, ValueError):
+                    try:
+                        obj = ast.literal_eval(tc_match.group(1))
+                    except Exception:
+                        pass
+
         if obj is None:
             return None
 
