@@ -667,39 +667,8 @@ def register_builtin_tools(registry: ToolRegistry, enabled: list[str] | None = N
                 output += f"\n[exit code: {result.returncode}]"
             return output.strip()[:10000] or "(no output)"
 
-    if "web_search" in enabled:
-        @registry.tool(name="web_search", description="Search the web for current information, facts, and research. Returns top results with titles and descriptions.")
-        def web_search(query: str) -> str:
-            """query: Search query string"""
-            import urllib.request
-            import urllib.parse
-
-            api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
-            if not api_key:
-                return ("Web search not configured. "
-                        "Set BRAVE_SEARCH_API_KEY environment variable to enable.")
-
-            try:
-                url = (f"https://api.search.brave.com/res/v1/web/search"
-                       f"?q={urllib.parse.quote(query)}&count=5")
-                req = urllib.request.Request(url, headers={
-                    "X-Subscription-Token": api_key,
-                    "Accept": "application/json",
-                })
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read())
-
-                results = []
-                for r in data.get("web", {}).get("results", [])[:5]:
-                    title = r.get("title", "")
-                    desc = r.get("description", "")
-                    link = r.get("url", "")
-                    results.append(f"**{title}**\n{desc}\nURL: {link}")
-
-                return "\n\n".join(results) or "No results found."
-            except Exception as e:
-                logger.warning("Web search failed: %s", e)
-                return f"Web search error: {e}"
+    # NOTE: web_search builtin removed — superseded by web.py multi-provider
+    # search registered via _wire_web_tools() in agent.py
 
     if "memory_search" in enabled:
         @registry.tool(name="memory_search", description="Search your long-term memory for facts about the user, past conversations, and learned knowledge.")

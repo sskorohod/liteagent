@@ -312,6 +312,12 @@ class LiteAgent:
         if web_cfg.get("enabled", True):
             self._wire_web_tools()
 
+        # Browser automation (Playwright) — disabled by default (heavyweight)
+        self._browser_engine = None
+        browser_cfg = config.get("browser", {})
+        if browser_cfg.get("enabled", False):
+            self._wire_browser_tools()
+
         # Skill system (modular prompt injection with progressive disclosure)
         self.skill_registry = SkillRegistry()
         self.skill_registry.load_all(config)
@@ -655,13 +661,17 @@ class LiteAgent:
                 max_entries=cache_cfg.get("max_entries", 200))
 
         async def web_fetch_handler(url: str, max_length: int = 10000) -> str:
-            from .web import web_fetch
+            from .web import web_fetch, wrap_untrusted_content
             result = await web_fetch(url, config=agent.config.get("web", {}),
                                      cache=agent._web_cache)
             if result.error:
                 return f"Error fetching {url}: {result.error}"
             content = result.content[:max_length]
             truncated = " (truncated)" if len(result.content) > max_length else ""
+            # Wrap with untrusted content markers (prompt injection defense)
+            security_cfg = agent.config.get("web", {}).get("security", {})
+            if security_cfg.get("wrap_untrusted", True):
+                content = wrap_untrusted_content(content, result.url)
             footer = (f"\n---\nSource: {result.url} | "
                       f"Extractor: {result.extractor} | "
                       f"{result.extracted_length} chars{truncated}"
@@ -824,6 +834,254 @@ class LiteAgent:
             self.tools._tools[td["name"]] = td
             self.tools._handlers[td["name"]] = handler
         logger.info("Web tools registered: web_fetch, web_search, web_crawl, web_extract")
+
+    def _wire_browser_tools(self):
+        """Register browser automation tools (Playwright-based)."""
+        agent = self
+        browser_cfg = self.config.get("browser", {})
+
+        from .browser import BrowserEngine
+        self._browser_engine = BrowserEngine(browser_cfg)
+
+        async def browser_launch_handler() -> str:
+            r = await agent._browser_engine.launch()
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_close_handler() -> str:
+            r = await agent._browser_engine.close()
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_new_tab_handler(url: str = "about:blank") -> str:
+            r = await agent._browser_engine.new_tab(url)
+            if r.success:
+                return json.dumps(r.data, ensure_ascii=False)
+            return f"Error: {r.error}"
+
+        async def browser_close_tab_handler(tab_id: int) -> str:
+            r = await agent._browser_engine.close_tab(tab_id)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_list_tabs_handler() -> str:
+            r = await agent._browser_engine.list_tabs()
+            if r.success:
+                return json.dumps(r.data, ensure_ascii=False)
+            return f"Error: {r.error}"
+
+        async def browser_navigate_handler(tab_id: int, url: str) -> str:
+            r = await agent._browser_engine.navigate(tab_id, url)
+            if r.success:
+                return json.dumps(r.data, ensure_ascii=False)
+            return f"Error: {r.error}"
+
+        async def browser_screenshot_handler(tab_id: int,
+                                              full_page: bool = False) -> str:
+            r = await agent._browser_engine.screenshot(tab_id, full_page)
+            if r.success:
+                # Queue screenshot file for delivery
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False,
+                                                  dir="/tmp") as f:
+                    import base64 as _b64
+                    f.write(_b64.b64decode(r.data["image_base64"]))
+                    path = f.name
+                from .file_queue import enqueue_file
+                enqueue_file(path, caption="Browser screenshot")
+                return f"Screenshot taken ({r.data['size']} bytes), queued for delivery"
+            return f"Error: {r.error}"
+
+        async def browser_click_handler(tab_id: int, selector: str) -> str:
+            r = await agent._browser_engine.click(tab_id, selector)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_type_handler(tab_id: int, selector: str,
+                                        text: str, clear: bool = True) -> str:
+            r = await agent._browser_engine.type_text(tab_id, selector, text, clear)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_select_handler(tab_id: int, selector: str,
+                                          value: str) -> str:
+            r = await agent._browser_engine.select_option(tab_id, selector, value)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_scroll_handler(tab_id: int, direction: str = "down",
+                                          amount: int = 500) -> str:
+            r = await agent._browser_engine.scroll(tab_id, direction, amount)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_evaluate_handler(tab_id: int, expression: str) -> str:
+            r = await agent._browser_engine.evaluate(tab_id, expression)
+            if r.success:
+                return json.dumps(r.data, ensure_ascii=False, default=str) if r.data is not None else "(undefined)"
+            return f"Error: {r.error}"
+
+        async def browser_accessibility_handler(tab_id: int) -> str:
+            r = await agent._browser_engine.get_accessibility_tree(tab_id)
+            return str(r.data)[:15000] if r.success else f"Error: {r.error}"
+
+        async def browser_console_handler(tab_id: int,
+                                           level: str = "all") -> str:
+            r = await agent._browser_engine.get_console(tab_id, level)
+            if r.success:
+                return json.dumps(r.data, ensure_ascii=False)
+            return f"Error: {r.error}"
+
+        async def browser_get_text_handler(tab_id: int,
+                                            selector: str = "body") -> str:
+            r = await agent._browser_engine.get_text(tab_id, selector)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_wait_for_handler(tab_id: int, selector: str,
+                                            timeout: int = 10000) -> str:
+            r = await agent._browser_engine.wait_for(tab_id, selector, timeout)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_hover_handler(tab_id: int, selector: str) -> str:
+            r = await agent._browser_engine.hover(tab_id, selector)
+            return r.data if r.success else f"Error: {r.error}"
+
+        async def browser_pdf_handler(tab_id: int) -> str:
+            r = await agent._browser_engine.pdf(tab_id)
+            if r.success:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False,
+                                                  dir="/tmp") as f:
+                    import base64 as _b64
+                    f.write(_b64.b64decode(r.data["pdf_base64"]))
+                    path = f.name
+                from .file_queue import enqueue_file
+                enqueue_file(path, caption="Browser PDF")
+                return f"PDF generated ({r.data['size']} bytes), queued for delivery"
+            return f"Error: {r.error}"
+
+        tools_defs = [
+            {"name": "browser_launch",
+             "description": "Launch the browser. Must be called before using other browser tools.",
+             "input_schema": {"type": "object", "properties": {}},
+             "_handler": browser_launch_handler},
+            {"name": "browser_close",
+             "description": "Close the browser and free resources.",
+             "input_schema": {"type": "object", "properties": {}},
+             "_handler": browser_close_handler},
+            {"name": "browser_new_tab",
+             "description": "Open a new browser tab, optionally navigating to a URL. Returns tab_id.",
+             "input_schema": {"type": "object", "properties": {
+                 "url": {"type": "string", "description": "URL to open (default: about:blank)"},
+             }},
+             "_handler": browser_new_tab_handler},
+            {"name": "browser_close_tab",
+             "description": "Close a browser tab by its ID.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID to close"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_close_tab_handler},
+            {"name": "browser_list_tabs",
+             "description": "List all open browser tabs with their IDs, URLs, and titles.",
+             "input_schema": {"type": "object", "properties": {}},
+             "_handler": browser_list_tabs_handler},
+            {"name": "browser_navigate",
+             "description": "Navigate a browser tab to a URL.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "url": {"type": "string", "description": "URL to navigate to"},
+             }, "required": ["tab_id", "url"]},
+             "_handler": browser_navigate_handler},
+            {"name": "browser_screenshot",
+             "description": "Take a screenshot of a browser tab. The image is queued for delivery.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "full_page": {"type": "boolean", "description": "Capture full page (default: false)"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_screenshot_handler},
+            {"name": "browser_click",
+             "description": "Click an element by CSS selector.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector of element to click"},
+             }, "required": ["tab_id", "selector"]},
+             "_handler": browser_click_handler},
+            {"name": "browser_type",
+             "description": "Type text into an input element.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector of input"},
+                 "text": {"type": "string", "description": "Text to type"},
+                 "clear": {"type": "boolean", "description": "Clear field before typing (default: true)"},
+             }, "required": ["tab_id", "selector", "text"]},
+             "_handler": browser_type_handler},
+            {"name": "browser_select",
+             "description": "Select a dropdown option by value or label.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector of select element"},
+                 "value": {"type": "string", "description": "Option value or label"},
+             }, "required": ["tab_id", "selector", "value"]},
+             "_handler": browser_select_handler},
+            {"name": "browser_scroll",
+             "description": "Scroll the page up or down.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "direction": {"type": "string", "description": "'up' or 'down' (default: down)"},
+                 "amount": {"type": "integer", "description": "Pixels to scroll (default: 500)"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_scroll_handler},
+            {"name": "browser_evaluate",
+             "description": "Execute JavaScript in the page context and return the result.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "expression": {"type": "string", "description": "JavaScript expression to evaluate"},
+             }, "required": ["tab_id", "expression"]},
+             "_handler": browser_evaluate_handler},
+            {"name": "browser_accessibility",
+             "description": "Get accessibility tree snapshot — a structured view of the page for understanding layout and interactive elements.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_accessibility_handler},
+            {"name": "browser_console",
+             "description": "Read browser console messages (logs, errors, warnings).",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "level": {"type": "string", "description": "'all', 'error', or 'warning' (default: all)"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_console_handler},
+            {"name": "browser_get_text",
+             "description": "Extract visible text content from a page or specific element.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector (default: body)"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_get_text_handler},
+            {"name": "browser_wait_for",
+             "description": "Wait for an element to appear on the page.",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector to wait for"},
+                 "timeout": {"type": "integer", "description": "Max wait time in ms (default: 10000)"},
+             }, "required": ["tab_id", "selector"]},
+             "_handler": browser_wait_for_handler},
+            {"name": "browser_hover",
+             "description": "Hover over an element (useful for revealing tooltips/menus).",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+                 "selector": {"type": "string", "description": "CSS selector to hover over"},
+             }, "required": ["tab_id", "selector"]},
+             "_handler": browser_hover_handler},
+            {"name": "browser_pdf",
+             "description": "Generate a PDF of the current page (headless only).",
+             "input_schema": {"type": "object", "properties": {
+                 "tab_id": {"type": "integer", "description": "Tab ID"},
+             }, "required": ["tab_id"]},
+             "_handler": browser_pdf_handler},
+        ]
+
+        for td in tools_defs:
+            handler = td.pop("_handler")
+            self.tools._tools[td["name"]] = td
+            self.tools._handlers[td["name"]] = handler
+
+        tool_names = [td["name"] for td in tools_defs]
+        logger.info("Browser tools registered: %s", ", ".join(
+            t for t in self.tools._tools if t.startswith("browser_")))
 
     def store_voice(self, voice_id: str, audio_bytes: bytes, config: dict | None = None):
         """Store voice audio bytes for transcription via agent tool.

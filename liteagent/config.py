@@ -384,7 +384,7 @@ def save_config(config: dict, config_path: str | None = None):
 _KNOWN_TOP_KEYS = {"agent", "memory", "tools", "channels", "cost", "providers", "logging",
                    "scheduler", "agents", "features", "rag", "storage",
                    "hooks", "plugins", "boot", "health", "voice", "skills",
-                   "knowledge_base", "web", "night_worker"}
+                   "knowledge_base", "web", "night_worker", "browser"}
 _KNOWN_AGENT_KEYS = {"name", "soul", "max_iterations", "default_model", "models", "provider", "timezone"}
 _KNOWN_COST_KEYS = {"cascade_routing", "prompt_caching", "context_compression", "budget_daily_usd", "track_usage"}
 _KNOWN_MEMORY_KEYS = {"db_path", "max_history_tokens", "keep_recent_messages", "auto_learn",
@@ -408,10 +408,15 @@ _KNOWN_WEB_KEYS = {"enabled", "user_agent", "timeout", "max_content_size",
 _KNOWN_WEB_CACHE_KEYS = {"enabled", "ttl", "max_entries"}
 _KNOWN_WEB_FETCH_KEYS = {"strategies", "firecrawl"}
 _KNOWN_WEB_SEARCH_KEYS = {"providers", "default_count", "max_count", "fallback",
-                           "brave", "duckduckgo", "tavily", "searxng", "perplexity"}
+                           "brave", "duckduckgo", "tavily", "searxng", "perplexity",
+                           "grok", "gemini", "kimi"}
 _KNOWN_WEB_CRAWL_KEYS = {"max_depth", "max_pages", "rate_limit_ms", "respect_robots_txt"}
 _KNOWN_WEB_SECURITY_KEYS = {"ssrf_protection", "strip_invisible_unicode",
-                             "blocked_domains", "allowed_domains"}
+                             "blocked_domains", "allowed_domains",
+                             "sanitize_hidden_elements", "max_html_depth",
+                             "wrap_untrusted"}
+_KNOWN_BROWSER_KEYS = {"enabled", "headless", "viewport", "user_agent",
+                       "timeout", "executable_path"}
 
 
 def validate_config(config: dict) -> list[str]:
@@ -480,6 +485,10 @@ def validate_config(config: dict) -> list[str]:
     for key in web_cfg.get("security", {}):
         if key not in _KNOWN_WEB_SECURITY_KEYS:
             warnings.append(f"Unknown web.security key: '{key}'")
+
+    for key in config.get("browser", {}):
+        if key not in _KNOWN_BROWSER_KEYS:
+            warnings.append(f"Unknown browser key: '{key}'")
 
     return warnings
 

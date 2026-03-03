@@ -196,6 +196,129 @@ def _check_domain_policy(url: str, blocked: list[str] | None = None,
     return None
 
 
+# ── Hidden style patterns for HTML sanitization (prompt injection defense)
+_HIDDEN_STYLE_PATTERNS = [
+    re.compile(r'display\s*:\s*none', re.I),
+    re.compile(r'visibility\s*:\s*hidden', re.I),
+    re.compile(r'opacity\s*:\s*0(?:\.0+)?(?:\s*;|\s*$)', re.I),
+    re.compile(r'font-size\s*:\s*0(?:px|em|rem|pt|%)?\s*(?:;|$)', re.I),
+    re.compile(r'(?:width|height)\s*:\s*0(?:px)?\s*.*?(?:overflow\s*:\s*hidden)', re.I | re.DOTALL),
+    re.compile(r'(?:left|top)\s*:\s*-\d{4,}px', re.I),
+    re.compile(r'text-indent\s*:\s*-\d{4,}px', re.I),
+    re.compile(r'clip-path\s*:\s*inset\(\s*(?:100|50)\s*%', re.I),
+    re.compile(r'transform\s*:\s*scale\(\s*0\s*\)', re.I),
+]
+
+_HIDDEN_CLASS_NAMES = {
+    "sr-only", "visually-hidden", "d-none", "hidden", "invisible",
+    "screen-reader-only", "offscreen", "clip-hide",
+}
+
+# Max safe HTML nesting depth (DoS protection)
+MAX_HTML_NESTING_DEPTH = 512
+
+
+def sanitize_html_for_llm(html: str) -> str:
+    """Remove hidden HTML elements that could contain prompt injection payloads.
+
+    Strips elements with: display:none, visibility:hidden, aria-hidden=true,
+    opacity:0, zero-size with overflow:hidden, off-screen positioning, etc.
+    Falls back to original HTML if BeautifulSoup is not available.
+    """
+    try:
+        from bs4 import BeautifulSoup, Comment
+    except ImportError:
+        return html
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove HTML comments (can hide injections)
+    for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        comment.extract()
+
+    removed = 0
+    # Walk bottom-up to handle nested hidden elements
+    for elem in reversed(soup.find_all(True)):
+        if _should_remove_element(elem):
+            elem.decompose()
+            removed += 1
+
+    if removed > 0:
+        logger.debug("Sanitized %d hidden elements from HTML", removed)
+    return str(soup)
+
+
+def _should_remove_element(elem) -> bool:
+    """Check if an HTML element is hidden and should be removed."""
+    # Always-remove elements (non-visual by nature)
+    if elem.name in ("template", "noscript"):
+        return True
+
+    # aria-hidden="true"
+    if elem.get("aria-hidden") == "true":
+        return True
+
+    # HTML hidden attribute
+    if elem.has_attr("hidden"):
+        return True
+
+    # Hidden input
+    if elem.name == "input" and elem.get("type", "").lower() == "hidden":
+        return True
+
+    # Hidden class names
+    classes = elem.get("class", [])
+    if isinstance(classes, list):
+        class_str = " ".join(classes).lower()
+    else:
+        class_str = str(classes).lower()
+    if any(cls in class_str for cls in _HIDDEN_CLASS_NAMES):
+        return True
+
+    # Inline style hiding patterns
+    style = elem.get("style", "")
+    if style:
+        for pattern in _HIDDEN_STYLE_PATTERNS:
+            if pattern.search(style):
+                return True
+
+    return False
+
+
+def check_html_depth(html: str, max_depth: int = MAX_HTML_NESTING_DEPTH) -> bool:
+    """Return True if HTML nesting depth is within safe limits (DoS protection)."""
+    depth = 0
+    max_found = 0
+    i = 0
+    length = len(html)
+    while i < length:
+        if html[i] == '<':
+            end = html.find('>', i)
+            if end == -1:
+                break
+            tag_content = html[i + 1:end]
+            if tag_content.startswith('/'):
+                depth = max(0, depth - 1)
+            elif not tag_content.endswith('/') and not tag_content.startswith('!'):
+                depth += 1
+                if depth > max_found:
+                    max_found = depth
+                    if max_found > max_depth:
+                        return False
+            i = end + 1
+        else:
+            i += 1
+    return True
+
+
+def wrap_untrusted_content(content: str, source_url: str) -> str:
+    """Wrap web-fetched content with untrusted-source markers for LLM safety."""
+    safe_url = source_url.replace('"', '&quot;')
+    return (f'<web_content source="{safe_url}" trust="untrusted">\n'
+            f'{content}\n'
+            f'</web_content>')
+
+
 # ══════════════════════════════════════════════════════════════════════
 # HTTP client (async with fallback)
 # ══════════════════════════════════════════════════════════════════════
@@ -220,12 +343,20 @@ async def _async_get(url: str, *,
             follow_redirects=True,
             max_redirects=max_redirects,
         ) as client:
-            resp = await client.get(url, headers=hdrs)
-            body = resp.content
-            if len(body) > max_size:
-                body = body[:max_size]
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            return body, resp.status_code, resp_headers
+            # Stream response for bandwidth efficiency on large pages
+            async with client.stream("GET", url, headers=hdrs) as resp:
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= max_size:
+                        break
+                body = b"".join(chunks)
+                if len(body) > max_size:
+                    body = body[:max_size]
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                return body, resp.status_code, resp_headers
     except ImportError:
         pass
 
@@ -487,6 +618,38 @@ async def web_fetch(url: str, *, config: dict | None = None,
 
     title = _get_title_from_html(html)
 
+    # CF-Markdown: if Cloudflare already converted to markdown, use as-is
+    cf_markdown = headers.get("cf-markdown")
+    if cf_markdown:
+        content = html
+        extractor = "cf-markdown"
+        # Skip to post-processing
+        if security_cfg.get("strip_invisible_unicode", True):
+            content = strip_invisible_unicode(content)
+        max_extract = cfg.get("max_extract_length", 50000)
+        if len(content) > max_extract:
+            content = content[:max_extract]
+        result = FetchResult(
+            url=url, title=title, content=content,
+            content_type=content_type, status_code=status,
+            extractor=extractor, content_length=len(html),
+            extracted_length=len(content),
+        )
+        if cache:
+            cache.set(cache_key, result, ttl=cfg.get("cache", {}).get("ttl", 300))
+        return result
+
+    # HTML nesting depth check (DoS protection)
+    max_depth = security_cfg.get("max_html_depth", MAX_HTML_NESTING_DEPTH)
+    if not check_html_depth(html, max_depth):
+        logger.warning("HTML nesting depth exceeds %d for %s", max_depth, url)
+        return FetchResult(url=url, status_code=status,
+                           error=f"HTML nesting depth exceeds safe limit ({max_depth})")
+
+    # HTML sanitization: remove hidden elements (prompt injection defense)
+    if security_cfg.get("sanitize_hidden_elements", True):
+        html = sanitize_html_for_llm(html)
+
     # Extraction chain
     strategies = fetch_cfg.get("strategies",
                                 ["trafilatura", "readability", "beautifulsoup", "raw"])
@@ -716,6 +879,133 @@ async def _search_perplexity(query: str, count: int, api_key: str) -> list[Searc
     return results[:count]
 
 
+async def _search_grok(query: str, count: int, api_key: str) -> list[SearchResult]:
+    """Grok (xAI) search via responses API with web_search tool."""
+    data, status = await _async_post_json(
+        "https://api.x.ai/v1/responses",
+        payload={
+            "model": "grok-3-fast",
+            "tools": [{"type": "web_search"}],
+            "input": query,
+        },
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    if status != 200:
+        raise RuntimeError(f"Grok search HTTP {status}")
+
+    results = []
+    for item in data.get("output", []):
+        # Extract structured search results
+        if item.get("type") == "web_search_call":
+            for sr in item.get("results", [])[:count]:
+                results.append(SearchResult(
+                    title=sr.get("title", ""),
+                    url=sr.get("url", ""),
+                    snippet=sr.get("snippet", ""),
+                    source="grok",
+                ))
+    # Capture the AI-generated text response
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for block in item.get("content", []):
+                if block.get("type") == "output_text" and block.get("text"):
+                    results.insert(0, SearchResult(
+                        title="Grok AI Answer",
+                        url="",
+                        snippet=block["text"][:2000],
+                        source="grok",
+                    ))
+                    break
+            break
+    return results[:count]
+
+
+async def _search_gemini(query: str, count: int, api_key: str) -> list[SearchResult]:
+    """Gemini Grounded Search via generativelanguage API."""
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-2.0-flash:generateContent?key={api_key}")
+    data, status = await _async_post_json(
+        url,
+        payload={
+            "contents": [{"parts": [{"text": query}]}],
+            "tools": [{"google_search": {}}],
+        },
+        timeout=30,
+    )
+    if status != 200:
+        # Strip API key from error messages
+        raise RuntimeError(f"Gemini search HTTP {status}")
+
+    results = []
+    candidates = data.get("candidates", [])
+    if candidates:
+        # Extract grounding metadata (actual search result URLs)
+        grounding = candidates[0].get("groundingMetadata", {})
+        for chunk in grounding.get("groundingChunks", [])[:count]:
+            web = chunk.get("web", {})
+            if web.get("uri"):
+                results.append(SearchResult(
+                    title=web.get("title", ""),
+                    url=web["uri"],
+                    snippet="",
+                    source="gemini",
+                ))
+        # Capture the generated text as first result
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if parts:
+            answer = parts[0].get("text", "")
+            if answer:
+                results.insert(0, SearchResult(
+                    title="Gemini AI Answer",
+                    url="",
+                    snippet=answer[:2000],
+                    source="gemini",
+                ))
+    return results[:count]
+
+
+async def _search_kimi(query: str, count: int, api_key: str) -> list[SearchResult]:
+    """Kimi (Moonshot AI) search via chat completions with $web_search builtin."""
+    data, status = await _async_post_json(
+        "https://api.moonshot.ai/v1/chat/completions",
+        payload={
+            "model": "kimi-latest",
+            "messages": [{"role": "user", "content": query}],
+            "tools": [{"type": "builtin_function",
+                       "function": {"name": "$web_search"}}],
+        },
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    if status != 200:
+        raise RuntimeError(f"Kimi search HTTP {status}")
+
+    results = []
+    # Extract search_results from response
+    search_results = data.get("search_results", [])
+    for sr in search_results[:count]:
+        results.append(SearchResult(
+            title=sr.get("title", ""),
+            url=sr.get("url", ""),
+            snippet=sr.get("content", ""),
+            source="kimi",
+        ))
+    # Extract the AI answer
+    answer = ""
+    if data.get("choices"):
+        msg = data["choices"][0].get("message", {})
+        answer = msg.get("content", "")
+    if answer:
+        results.insert(0, SearchResult(
+            title="Kimi AI Answer",
+            url="",
+            snippet=answer[:2000],
+            source="kimi",
+        ))
+    return results[:count]
+
+
 # Provider registry
 SEARCH_PROVIDERS: dict[str, dict] = {
     "brave": {"fn": _search_brave, "key_env": "BRAVE_SEARCH_API_KEY", "needs_key": True},
@@ -723,6 +1013,9 @@ SEARCH_PROVIDERS: dict[str, dict] = {
     "tavily": {"fn": _search_tavily, "key_env": "TAVILY_API_KEY", "needs_key": True},
     "searxng": {"fn": _search_searxng, "key_env": None, "needs_key": False},
     "perplexity": {"fn": _search_perplexity, "key_env": "PERPLEXITY_API_KEY", "needs_key": True},
+    "grok": {"fn": _search_grok, "key_env": "XAI_API_KEY", "needs_key": True},
+    "gemini": {"fn": _search_gemini, "key_env": "GOOGLE_API_KEY", "needs_key": True},
+    "kimi": {"fn": _search_kimi, "key_env": "MOONSHOT_API_KEY", "needs_key": True},
 }
 
 

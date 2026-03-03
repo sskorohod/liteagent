@@ -13,10 +13,12 @@ from liteagent.web import (
     _extract_raw_text, _get_title_from_html, _decode_entities,
     web_fetch, web_search, web_crawl, web_extract,
     _search_brave, _search_duckduckgo, _search_tavily, _search_searxng,
-    _search_perplexity,
+    _search_perplexity, _search_grok, _search_gemini, _search_kimi,
     _detect_available_providers, SEARCH_PROVIDERS,
     _extract_trafilatura, _extract_readability, _extract_beautifulsoup,
     _async_get,
+    sanitize_html_for_llm, _should_remove_element, check_html_depth,
+    wrap_untrusted_content, MAX_HTML_NESTING_DEPTH,
 )
 
 
@@ -821,3 +823,460 @@ class TestDataClasses:
         assert r.links == []
         assert r.tables == []
         assert r.og_tags == {}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# HTML sanitization tests (Phase 1: enhanced security)
+# ══════════════════════════════════════════════════════════════════════
+
+_bs4_available = False
+try:
+    import bs4
+    _bs4_available = True
+except ImportError:
+    pass
+
+bs4_required = pytest.mark.skipif(not _bs4_available, reason="beautifulsoup4 not installed")
+
+
+@bs4_required
+class TestSanitizeHtml:
+    def test_removes_display_none(self):
+        html = '<div><p style="display:none">hidden injection</p><p>visible</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "hidden injection" not in result
+        assert "visible" in result
+
+    def test_removes_visibility_hidden(self):
+        html = '<div><span style="visibility: hidden">secret</span><span>public</span></div>'
+        result = sanitize_html_for_llm(html)
+        assert "secret" not in result
+        assert "public" in result
+
+    def test_removes_aria_hidden(self):
+        html = '<div><span aria-hidden="true">screen reader only</span><p>content</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "screen reader only" not in result
+        assert "content" in result
+
+    def test_removes_html_hidden_attribute(self):
+        html = '<div><p hidden>hidden paragraph</p><p>visible paragraph</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "hidden paragraph" not in result
+        assert "visible paragraph" in result
+
+    def test_removes_hidden_input(self):
+        html = '<form><input type="hidden" value="inject_me"><input type="text" value="normal"></form>'
+        result = sanitize_html_for_llm(html)
+        assert "inject_me" not in result
+        assert "normal" in result
+
+    def test_removes_sr_only_class(self):
+        html = '<div><span class="sr-only">screen reader text</span><p>normal</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "screen reader text" not in result
+        assert "normal" in result
+
+    def test_removes_d_none_class(self):
+        html = '<div class="d-none">bootstrap hidden</div><div>visible</div>'
+        result = sanitize_html_for_llm(html)
+        assert "bootstrap hidden" not in result
+        assert "visible" in result
+
+    def test_removes_opacity_zero(self):
+        html = '<div><p style="opacity: 0">transparent</p><p>opaque</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "transparent" not in result
+        assert "opaque" in result
+
+    def test_removes_offscreen_positioning(self):
+        html = '<div><span style="left: -9999px">offscreen</span><span>onscreen</span></div>'
+        result = sanitize_html_for_llm(html)
+        assert "offscreen" not in result
+        assert "onscreen" in result
+
+    def test_removes_text_indent_offscreen(self):
+        html = '<div><p style="text-indent: -99999px">indent hidden</p><p>visible</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "indent hidden" not in result
+        assert "visible" in result
+
+    def test_removes_clip_path_inset(self):
+        html = '<div><span style="clip-path: inset(100%)">clipped</span><span>shown</span></div>'
+        result = sanitize_html_for_llm(html)
+        assert "clipped" not in result
+        assert "shown" in result
+
+    def test_removes_transform_scale_zero(self):
+        html = '<div><p style="transform: scale(0)">scaled</p><p>normal</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "scaled" not in result
+        assert "normal" in result
+
+    def test_removes_noscript_and_template(self):
+        html = '<div><template>template content</template><noscript>noscript</noscript><p>real</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "template content" not in result
+        assert "noscript" not in result
+        assert "real" in result
+
+    def test_removes_html_comments(self):
+        html = '<div><!-- hidden comment with instructions --><p>visible</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "hidden comment" not in result
+        assert "visible" in result
+
+    def test_preserves_normal_content(self):
+        html = '<div><h1>Title</h1><p>Normal paragraph with content.</p></div>'
+        result = sanitize_html_for_llm(html)
+        assert "Title" in result
+        assert "Normal paragraph" in result
+
+    def test_font_size_zero(self):
+        html = '<div><span style="font-size: 0px">tiny</span><span>normal</span></div>'
+        result = sanitize_html_for_llm(html)
+        assert "tiny" not in result
+        assert "normal" in result
+
+    def test_multiple_hidden_elements(self):
+        html = '''<div>
+            <p style="display:none">hidden1</p>
+            <p aria-hidden="true">hidden2</p>
+            <p class="visually-hidden">hidden3</p>
+            <p>visible content</p>
+        </div>'''
+        result = sanitize_html_for_llm(html)
+        assert "hidden1" not in result
+        assert "hidden2" not in result
+        assert "hidden3" not in result
+        assert "visible content" in result
+
+
+class TestSanitizeHtmlFallback:
+    def test_fallback_without_beautifulsoup(self):
+        html = '<div><p style="display:none">hidden</p><p>visible</p></div>'
+        with patch.dict("sys.modules", {"bs4": None}):
+            result = sanitize_html_for_llm(html)
+            # Without bs4, returns original HTML unchanged
+            assert result == html
+
+
+@bs4_required
+class TestShouldRemoveElement:
+    def _make_elem(self, tag="div", style=None, classes=None, attrs=None):
+        """Create a BeautifulSoup element for testing."""
+        from bs4 import BeautifulSoup
+        html_parts = [f"<{tag}"]
+        if style:
+            html_parts.append(f' style="{style}"')
+        if classes:
+            html_parts.append(f' class="{" ".join(classes)}"')
+        if attrs:
+            for k, v in attrs.items():
+                html_parts.append(f' {k}="{v}"')
+        html_parts.append(f">content</{tag}>")
+        soup = BeautifulSoup("".join(html_parts), "html.parser")
+        return soup.find(tag)
+
+    def test_template_tag(self):
+        elem = self._make_elem("template")
+        assert _should_remove_element(elem) is True
+
+    def test_noscript_tag(self):
+        elem = self._make_elem("noscript")
+        assert _should_remove_element(elem) is True
+
+    def test_aria_hidden(self):
+        elem = self._make_elem(attrs={"aria-hidden": "true"})
+        assert _should_remove_element(elem) is True
+
+    def test_hidden_attribute(self):
+        elem = self._make_elem(attrs={"hidden": ""})
+        assert _should_remove_element(elem) is True
+
+    def test_hidden_input(self):
+        elem = self._make_elem("input", attrs={"type": "hidden"})
+        assert _should_remove_element(elem) is True
+
+    def test_sr_only_class(self):
+        elem = self._make_elem(classes=["sr-only"])
+        assert _should_remove_element(elem) is True
+
+    def test_normal_div_not_removed(self):
+        elem = self._make_elem()
+        assert _should_remove_element(elem) is False
+
+    def test_normal_paragraph(self):
+        elem = self._make_elem("p", style="color: red; font-weight: bold")
+        assert _should_remove_element(elem) is False
+
+
+class TestCheckHtmlDepth:
+    def test_shallow_html(self):
+        html = "<div><p><span>text</span></p></div>"
+        assert check_html_depth(html) is True
+
+    def test_deeply_nested_html(self):
+        html = "<div>" * 600 + "content" + "</div>" * 600
+        assert check_html_depth(html) is False
+
+    def test_exactly_at_limit(self):
+        # At exactly the limit, depth == max_depth, check is `> max_depth` so it passes
+        html = "<div>" * MAX_HTML_NESTING_DEPTH + "ok" + "</div>" * MAX_HTML_NESTING_DEPTH
+        assert check_html_depth(html) is True  # depth == limit is OK
+
+    def test_just_under_limit(self):
+        depth = MAX_HTML_NESTING_DEPTH - 1
+        html = "<div>" * depth + "ok" + "</div>" * depth
+        assert check_html_depth(html) is True
+
+    def test_empty_html(self):
+        assert check_html_depth("") is True
+
+    def test_flat_html(self):
+        html = "<p>one</p><p>two</p><p>three</p>"
+        assert check_html_depth(html) is True
+
+    def test_custom_max_depth(self):
+        html = "<div><div><div><div>deep</div></div></div></div>"
+        assert check_html_depth(html, max_depth=3) is False
+        assert check_html_depth(html, max_depth=10) is True
+
+    def test_self_closing_tags_ignored(self):
+        html = "<div><br/><img/><p>text</p></div>"
+        assert check_html_depth(html) is True
+
+    def test_comments_ignored(self):
+        html = "<div><!-- comment --><p>text</p></div>"
+        assert check_html_depth(html) is True
+
+
+class TestWrapUntrustedContent:
+    def test_basic_wrapping(self):
+        content = "Hello world"
+        result = wrap_untrusted_content(content, "https://example.com")
+        assert '<web_content source="https://example.com" trust="untrusted">' in result
+        assert "Hello world" in result
+        assert "</web_content>" in result
+
+    def test_escapes_quotes_in_url(self):
+        content = "text"
+        result = wrap_untrusted_content(content, 'https://example.com/page?a="b"')
+        assert '&quot;' in result
+        assert "text" in result
+
+    def test_preserves_content(self):
+        content = "Line 1\nLine 2\n# Heading\n- List item"
+        result = wrap_untrusted_content(content, "https://example.com")
+        assert "Line 1\nLine 2" in result
+        assert "# Heading" in result
+
+    def test_wrapping_structure(self):
+        result = wrap_untrusted_content("content", "https://x.com")
+        lines = result.strip().split("\n")
+        assert lines[0].startswith("<web_content")
+        assert lines[-1] == "</web_content>"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# New search providers (Phase 2: Grok, Gemini, Kimi)
+# ══════════════════════════════════════════════════════════════════════
+
+class TestSearchGrok:
+    async def test_grok_search_success(self):
+        grok_resp = {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "results": [
+                        {"title": "Result 1", "url": "https://r1.com", "snippet": "Desc 1"},
+                        {"title": "Result 2", "url": "https://r2.com", "snippet": "Desc 2"},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "AI summary of results"},
+                    ],
+                },
+            ]
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (grok_resp, 200)
+            results = await _search_grok("test query", 5, "fake-xai-key")
+            assert len(results) >= 2
+            # First result should be AI answer
+            assert results[0].title == "Grok AI Answer"
+            assert results[0].source == "grok"
+            # Actual search results
+            search_results = [r for r in results if r.url]
+            assert len(search_results) == 2
+            assert search_results[0].source == "grok"
+
+    async def test_grok_search_http_error(self):
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = ({}, 429)
+            with pytest.raises(RuntimeError, match="HTTP 429"):
+                await _search_grok("test", 5, "key")
+
+    async def test_grok_search_no_results(self):
+        grok_resp = {"output": []}
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (grok_resp, 200)
+            results = await _search_grok("obscure query", 5, "key")
+            assert results == []
+
+    async def test_grok_search_count_limit(self):
+        grok_resp = {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "results": [
+                        {"title": f"R{i}", "url": f"https://r{i}.com", "snippet": f"D{i}"}
+                        for i in range(10)
+                    ],
+                },
+            ]
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (grok_resp, 200)
+            results = await _search_grok("test", 3, "key")
+            assert len(results) <= 3
+
+
+class TestSearchGemini:
+    async def test_gemini_search_success(self):
+        gemini_resp = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "AI grounded answer"}],
+                },
+                "groundingMetadata": {
+                    "groundingChunks": [
+                        {"web": {"uri": "https://site1.com", "title": "Site 1"}},
+                        {"web": {"uri": "https://site2.com", "title": "Site 2"}},
+                    ],
+                },
+            }]
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (gemini_resp, 200)
+            results = await _search_gemini("test query", 5, "fake-google-key")
+            assert len(results) >= 2
+            # First result should be AI answer
+            assert results[0].title == "Gemini AI Answer"
+            assert results[0].source == "gemini"
+            # Grounding results
+            urls = [r.url for r in results if r.url]
+            assert "https://site1.com" in urls
+
+    async def test_gemini_search_http_error(self):
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = ({}, 403)
+            with pytest.raises(RuntimeError, match="HTTP 403"):
+                await _search_gemini("test", 5, "bad-key")
+
+    async def test_gemini_search_no_candidates(self):
+        gemini_resp = {"candidates": []}
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (gemini_resp, 200)
+            results = await _search_gemini("test", 5, "key")
+            assert results == []
+
+    async def test_gemini_search_no_grounding(self):
+        gemini_resp = {
+            "candidates": [{
+                "content": {"parts": [{"text": "Answer without sources"}]},
+                # No groundingMetadata
+            }]
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (gemini_resp, 200)
+            results = await _search_gemini("test", 5, "key")
+            assert len(results) == 1
+            assert results[0].title == "Gemini AI Answer"
+
+
+class TestSearchKimi:
+    async def test_kimi_search_success(self):
+        kimi_resp = {
+            "choices": [{
+                "message": {"content": "Kimi AI answer to your query"},
+            }],
+            "search_results": [
+                {"title": "Kimi Result 1", "url": "https://kr1.com", "content": "KR1 desc"},
+                {"title": "Kimi Result 2", "url": "https://kr2.com", "content": "KR2 desc"},
+            ],
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (kimi_resp, 200)
+            results = await _search_kimi("test query", 5, "fake-moonshot-key")
+            assert len(results) >= 2
+            # First should be AI answer
+            assert results[0].title == "Kimi AI Answer"
+            assert results[0].source == "kimi"
+            # Search results
+            search_results = [r for r in results if r.url]
+            assert len(search_results) == 2
+
+    async def test_kimi_search_http_error(self):
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = ({}, 500)
+            with pytest.raises(RuntimeError, match="HTTP 500"):
+                await _search_kimi("test", 5, "key")
+
+    async def test_kimi_search_no_results(self):
+        kimi_resp = {"choices": [], "search_results": []}
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (kimi_resp, 200)
+            results = await _search_kimi("test", 5, "key")
+            assert results == []
+
+    async def test_kimi_search_count_limit(self):
+        kimi_resp = {
+            "choices": [{"message": {"content": "answer"}}],
+            "search_results": [
+                {"title": f"KR{i}", "url": f"https://kr{i}.com", "content": f"desc{i}"}
+                for i in range(10)
+            ],
+        }
+        with patch("liteagent.web._async_post_json", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (kimi_resp, 200)
+            results = await _search_kimi("test", 3, "key")
+            assert len(results) <= 3
+
+
+class TestNewSearchProvidersInRegistry:
+    def test_grok_in_registry(self):
+        assert "grok" in SEARCH_PROVIDERS
+        assert SEARCH_PROVIDERS["grok"]["key_env"] == "XAI_API_KEY"
+        assert SEARCH_PROVIDERS["grok"]["needs_key"] is True
+
+    def test_gemini_in_registry(self):
+        assert "gemini" in SEARCH_PROVIDERS
+        assert SEARCH_PROVIDERS["gemini"]["key_env"] == "GOOGLE_API_KEY"
+        assert SEARCH_PROVIDERS["gemini"]["needs_key"] is True
+
+    def test_kimi_in_registry(self):
+        assert "kimi" in SEARCH_PROVIDERS
+        assert SEARCH_PROVIDERS["kimi"]["key_env"] == "MOONSHOT_API_KEY"
+        assert SEARCH_PROVIDERS["kimi"]["needs_key"] is True
+
+    def test_all_providers_have_fn(self):
+        for name, info in SEARCH_PROVIDERS.items():
+            assert callable(info["fn"]), f"Provider {name} missing callable fn"
+
+    async def test_detect_grok_with_env(self):
+        with patch.dict("os.environ", {"XAI_API_KEY": "test-key"}):
+            providers = _detect_available_providers({})
+            assert "grok" in providers
+
+    async def test_detect_gemini_with_env(self):
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
+            providers = _detect_available_providers({})
+            assert "gemini" in providers
+
+    async def test_detect_kimi_with_env(self):
+        with patch.dict("os.environ", {"MOONSHOT_API_KEY": "test-key"}):
+            providers = _detect_available_providers({})
+            assert "kimi" in providers
