@@ -884,12 +884,12 @@ async def _search_grok(query: str, count: int, api_key: str) -> list[SearchResul
     data, status = await _async_post_json(
         "https://api.x.ai/v1/responses",
         payload={
-            "model": "grok-3-fast",
+            "model": "grok-4-1-fast-reasoning",
             "tools": [{"type": "web_search"}],
-            "input": query,
+            "input": [{"role": "user", "content": query}],
         },
         headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
+        timeout=60,
     )
     if status != 200:
         raise RuntimeError(f"Grok search HTTP {status}")
@@ -924,7 +924,7 @@ async def _search_grok(query: str, count: int, api_key: str) -> list[SearchResul
 async def _search_gemini(query: str, count: int, api_key: str) -> list[SearchResult]:
     """Gemini Grounded Search via generativelanguage API."""
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.0-flash:generateContent?key={api_key}")
+           f"gemini-2.5-flash:generateContent?key={api_key}")
     data, status = await _async_post_json(
         url,
         payload={
@@ -1009,12 +1009,12 @@ async def _search_kimi(query: str, count: int, api_key: str) -> list[SearchResul
 # Provider registry
 SEARCH_PROVIDERS: dict[str, dict] = {
     "brave": {"fn": _search_brave, "key_env": "BRAVE_SEARCH_API_KEY", "needs_key": True},
+    "gemini": {"fn": _search_gemini, "key_env": "GOOGLE_API_KEY", "needs_key": True},
+    "grok": {"fn": _search_grok, "key_env": "XAI_API_KEY", "needs_key": True},
     "duckduckgo": {"fn": _search_duckduckgo, "key_env": None, "needs_key": False},
     "tavily": {"fn": _search_tavily, "key_env": "TAVILY_API_KEY", "needs_key": True},
-    "searxng": {"fn": _search_searxng, "key_env": None, "needs_key": False},
     "perplexity": {"fn": _search_perplexity, "key_env": "PERPLEXITY_API_KEY", "needs_key": True},
-    "grok": {"fn": _search_grok, "key_env": "XAI_API_KEY", "needs_key": True},
-    "gemini": {"fn": _search_gemini, "key_env": "GOOGLE_API_KEY", "needs_key": True},
+    "searxng": {"fn": _search_searxng, "key_env": None, "needs_key": False},
     "kimi": {"fn": _search_kimi, "key_env": "MOONSHOT_API_KEY", "needs_key": True},
 }
 
