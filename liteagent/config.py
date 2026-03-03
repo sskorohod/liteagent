@@ -24,7 +24,11 @@ PROVIDER_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
     "grok": "XAI_API_KEY",
     "gemini": "GOOGLE_API_KEY",
+    "kimi": "MOONSHOT_API_KEY",
     "qwen": "DASHSCOPE_API_KEY",
+    "brave": "BRAVE_SEARCH_API_KEY",
+    "tavily": "TAVILY_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
     "ollama": None,  # No key needed
 }
 

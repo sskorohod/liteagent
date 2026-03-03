@@ -1019,6 +1019,22 @@ SEARCH_PROVIDERS: dict[str, dict] = {
 }
 
 
+def _resolve_search_key(name: str, info: dict, search_cfg: dict) -> str:
+    """Resolve API key for a search provider from multiple sources.
+
+    Priority: search config inline → env var → keys.json (via config module).
+    """
+    provider_cfg = search_cfg.get(name, {})
+    api_key = provider_cfg.get("api_key") or os.environ.get(info.get("key_env") or "", "")
+    if not api_key:
+        try:
+            from .config import get_api_key
+            api_key = get_api_key(name) or ""
+        except Exception:
+            pass
+    return api_key
+
+
 def _detect_available_providers(config: dict) -> list[str]:
     """Detect which search providers are available based on API keys and config."""
     search_cfg = config.get("search", {})
@@ -1029,9 +1045,7 @@ def _detect_available_providers(config: dict) -> list[str]:
     available = []
     for name, info in SEARCH_PROVIDERS.items():
         if info["needs_key"]:
-            key_env = info["key_env"]
-            provider_cfg = search_cfg.get(name, {})
-            api_key = provider_cfg.get("api_key") or os.environ.get(key_env or "", "")
+            api_key = _resolve_search_key(name, info, search_cfg)
             if api_key:
                 available.append(name)
         else:
@@ -1085,8 +1099,7 @@ async def web_search(query: str, *, config: dict | None = None,
         # Get API key
         api_key = ""
         if prov_info["needs_key"]:
-            provider_cfg = search_cfg.get(prov_name, {})
-            api_key = provider_cfg.get("api_key") or os.environ.get(prov_info["key_env"] or "", "")
+            api_key = _resolve_search_key(prov_name, prov_info, search_cfg)
             if not api_key:
                 last_error = f"{prov_name}: no API key"
                 if fallback:

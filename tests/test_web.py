@@ -14,7 +14,7 @@ from liteagent.web import (
     web_fetch, web_search, web_crawl, web_extract,
     _search_brave, _search_duckduckgo, _search_tavily, _search_searxng,
     _search_perplexity, _search_grok, _search_gemini, _search_kimi,
-    _detect_available_providers, SEARCH_PROVIDERS,
+    _detect_available_providers, _resolve_search_key, SEARCH_PROVIDERS,
     _extract_trafilatura, _extract_readability, _extract_beautifulsoup,
     _async_get,
     sanitize_html_for_llm, _should_remove_element, check_html_depth,
@@ -1280,3 +1280,58 @@ class TestNewSearchProvidersInRegistry:
         with patch.dict("os.environ", {"MOONSHOT_API_KEY": "test-key"}):
             providers = _detect_available_providers({})
             assert "kimi" in providers
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _resolve_search_key tests — keys.json integration
+# ══════════════════════════════════════════════════════════════════════
+
+class TestResolveSearchKey:
+    """Test _resolve_search_key resolves keys from multiple sources."""
+
+    def test_inline_config_has_priority(self):
+        """Inline config api_key takes priority over everything."""
+        info = {"key_env": "XAI_API_KEY", "needs_key": True}
+        search_cfg = {"grok": {"api_key": "inline-key-123"}}
+        with patch.dict("os.environ", {"XAI_API_KEY": "env-key"}):
+            result = _resolve_search_key("grok", info, search_cfg)
+        assert result == "inline-key-123"
+
+    def test_env_var_fallback(self):
+        """Env var is used when inline config is missing."""
+        info = {"key_env": "XAI_API_KEY", "needs_key": True}
+        with patch.dict("os.environ", {"XAI_API_KEY": "env-key-456"}):
+            result = _resolve_search_key("grok", info, {})
+        assert result == "env-key-456"
+
+    def test_keys_json_fallback(self):
+        """keys.json is used when both inline and env are missing."""
+        info = {"key_env": "XAI_API_KEY", "needs_key": True}
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("liteagent.config.get_api_key", return_value="keys-json-789"):
+                result = _resolve_search_key("grok", info, {})
+        assert result == "keys-json-789"
+
+    def test_returns_empty_when_no_key(self):
+        """Returns empty string when no key found anywhere."""
+        info = {"key_env": "NONEXISTENT_KEY_12345", "needs_key": True}
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("liteagent.config.get_api_key", return_value=None):
+                result = _resolve_search_key("nonexistent", info, {})
+        assert result == ""
+
+    def test_detect_providers_uses_keys_json(self):
+        """_detect_available_providers finds providers via keys.json."""
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("liteagent.config.get_api_key") as mock_gpk:
+                mock_gpk.side_effect = lambda name: "key-from-json" if name == "grok" else None
+                providers = _detect_available_providers({})
+                assert "grok" in providers
+
+    def test_detect_providers_gemini_via_keys_json(self):
+        """_detect_available_providers finds gemini via keys.json."""
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("liteagent.config.get_api_key") as mock_gpk:
+                mock_gpk.side_effect = lambda name: "gem-key" if name == "gemini" else None
+                providers = _detect_available_providers({})
+                assert "gemini" in providers
