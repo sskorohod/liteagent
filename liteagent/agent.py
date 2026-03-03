@@ -57,6 +57,10 @@ COMPLEXITY_MARKERS_MEDIUM = {
     "напиши", "объясни", "помоги с", "создай", "сделай",
     "write", "explain", "help with", "create", "build", "implement",
     "fix", "исправь", "обнови", "update",
+    # Web search / tool-dependent queries → need capable model
+    "новости", "найди", "поиск", "погугли", "загугли", "интернет",
+    "news", "search", "find", "look up", "google", "browse", "fetch",
+    "погода", "weather", "курс", "цена", "price",
 }
 
 
@@ -3232,6 +3236,17 @@ class LiteAgent:
             candidate = self.models.get("medium", self.default_model)
         else:
             candidate = self.models.get("simple", self.default_model)
+
+        # Tool-capability guard: small models often can't call tools reliably.
+        # If we're routing to "simple" and there are registered tools,
+        # promote to "medium" model which is more likely to support tool use.
+        if score < 1 and hasattr(self, "tools") and self.tools:
+            simple_model = self.models.get("simple", "")
+            medium_model = self.models.get("medium", self.default_model)
+            if simple_model and simple_model != medium_model and candidate == simple_model:
+                logger.info("Tool-capability guard: %s → %s (tools registered, "
+                            "simple model may not support tool calling)", candidate, medium_model)
+                candidate = medium_model
 
         # Local-only mode: force local model, skip cloud providers
         if local_only:
