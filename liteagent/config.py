@@ -328,8 +328,23 @@ def _migrate_inline_keys(config: dict) -> int:
     return migrated
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge override into base. Override wins on conflicts."""
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if (key in result and isinstance(result[key], dict)
+                and isinstance(value, dict)):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
 def save_config(config: dict, config_path: str | None = None):
     """Write config dict back to the file it was loaded from.
+
+    Uses deep-merge with the existing file to prevent data loss:
+    keys present on disk but missing from the in-memory config are preserved.
 
     Secrets (tokens, API keys) are automatically stripped —
     they are stored separately in ~/.liteagent/keys.json.
@@ -351,6 +366,16 @@ def save_config(config: dict, config_path: str | None = None):
     # Strip secrets, then remove internal/transient keys (underscore-prefixed)
     stripped = _strip_secrets(config)
     clean = {k: v for k, v in stripped.items() if not k.startswith("_")}
+
+    # Deep-merge with existing file to preserve keys not in memory
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                clean = _deep_merge(existing, clean)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not read existing config for merge: %s", e)
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(clean, f, indent=2, ensure_ascii=False)
     logger.info("Config saved to %s", path)
