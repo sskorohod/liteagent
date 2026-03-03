@@ -3,12 +3,77 @@
 import argparse
 import asyncio
 import atexit
+import os
 import signal
+import socket
 import sys
 
 from .config import load_config
 from .agent import LiteAgent
 from .channels.cli import run_cli
+
+
+def _check_port_and_kill_stale(host: str, port: int, *, force: bool = True) -> None:
+    """Check if port is in use. If force=True, kill the old process and wait.
+
+    Prevents 'Address already in use' errors when restarting the server.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(1)
+        sock.connect(("127.0.0.1" if host == "0.0.0.0" else host, port))
+        sock.close()
+    except (ConnectionRefusedError, OSError):
+        # Port is free
+        return
+
+    # Port is in use — find who holds it
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5)
+        pids = [int(p) for p in result.stdout.strip().split("\n") if p.strip().isdigit()]
+    except Exception:
+        pids = []
+
+    my_pid = os.getpid()
+    stale_pids = [p for p in pids if p != my_pid]
+
+    if not stale_pids:
+        print(f"[WARNING] Port {port} in use but couldn't identify process", flush=True)
+        return
+
+    if not force:
+        print(f"[ERROR] Port {port} already in use by PID(s): {stale_pids}. "
+              f"Kill manually or use --force-restart.", flush=True)
+        sys.exit(1)
+
+    for pid in stale_pids:
+        try:
+            print(f"[INFO] Killing stale process PID {pid} on port {port}", flush=True)
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    # Wait for port to be freed (up to 5 seconds)
+    import time
+    for _ in range(50):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1" if host == "0.0.0.0" else host, port))
+            s.close()
+            time.sleep(0.1)
+        except (ConnectionRefusedError, OSError):
+            return  # Port freed
+    # Force kill if SIGTERM didn't work
+    for pid in stale_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    time.sleep(1)
 
 
 def main():
@@ -175,6 +240,7 @@ def main():
                 import uvicorn
                 host = config.get("channels", {}).get("api", {}).get("host", "127.0.0.1")
                 port = config.get("channels", {}).get("api", {}).get("port", 8080)
+                _check_port_and_kill_stale(host, port)
                 uvicorn.run(app, host=host, port=port)
             else:
                 from .channels.telegram import run_telegram
@@ -220,6 +286,7 @@ def main():
                     app = create_app(agent)
                     host = api_cfg.get("host", "127.0.0.1")
                     port = api_cfg.get("port", 8080)
+                    _check_port_and_kill_stale(host, port)
 
                     uvi_config = uvicorn.Config(app, host=host, port=port)
                     server = uvicorn.Server(uvi_config)
