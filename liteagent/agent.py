@@ -2324,15 +2324,22 @@ class LiteAgent:
         logger.info("MCP servers reloaded: %d servers",
                     len(self.tools.get_mcp_server_info()))
 
+    @property
+    def _lock_timeout(self) -> float:
+        """Lock timeout depends on provider: local models need more time to load."""
+        provider_name = self.config.get("agent", {}).get("provider", "anthropic")
+        return 300.0 if provider_name == "ollama" else 60.0
+
     async def run(self, user_input: str | list, user_id: str = "default") -> str:
         """Run agent on user input with per-user serialization."""
         LiteAgent._ensure_locks()
         lock = await self._get_user_lock(user_id)
         q_id = self._track_queued(user_id)
+        _timeout = self._lock_timeout
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=60.0)
+            await asyncio.wait_for(lock.acquire(), timeout=_timeout)
         except asyncio.TimeoutError:
-            logger.warning("Request timeout: user %s waited >60s for lock", user_id)
+            logger.warning("Request timeout: user %s waited >%.0fs for lock", user_id, _timeout)
             return "⏳ Request queued too long. Please try again in a moment."
         finally:
             self._untrack_queued(q_id)
@@ -2420,11 +2427,14 @@ class LiteAgent:
 
         # Skip tools only for truly trivial messages (greetings, etc.)
         # Never skip if tool-capability guard promoted the model (tools are needed)
+        # Never skip for Ollama — local models use text-fallback tool parsing
+        _provider_name = self.config.get("agent", {}).get("provider", "anthropic")
         _tool_guard_active = (self.cascade_routing and complexity_score < 1
                               and hasattr(self, "tools") and self.tools._tools
                               and self.models.get("simple") != self.models.get("medium"))
         if (complexity_score <= 0 and len(text_for_memory) < 60
-                and not _skill_tool_names and not _tool_guard_active):
+                and not _skill_tool_names and not _tool_guard_active
+                and _provider_name != "ollama"):
             tool_defs = []
             logger.debug("Skipping tools for simple message")
         elif self.memory._embedder and len(self.tools._tools) > 8:
@@ -2587,9 +2597,10 @@ class LiteAgent:
         lock = await self._get_user_lock(user_id)
         q_id = self._track_queued(user_id)
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=60.0)
+            await asyncio.wait_for(lock.acquire(), timeout=self._lock_timeout)
         except asyncio.TimeoutError:
-            logger.warning("Stream timeout: user %s waited >60s for lock", user_id)
+            logger.warning("Stream timeout: user %s waited >%.0fs for lock",
+                           user_id, self._lock_timeout)
             yield "⏳ Request queued too long. Please try again in a moment."
             self._untrack_queued(q_id)
             return
