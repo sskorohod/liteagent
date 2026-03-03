@@ -33,7 +33,7 @@ class TelegramAPIClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"x-internal-token": self.internal_token} if self.internal_token else {},
-                timeout=httpx.Timeout(120.0, connect=10.0),
+                timeout=httpx.Timeout(300.0, connect=10.0),
             )
         return self._client
 
