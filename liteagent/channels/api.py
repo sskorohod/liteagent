@@ -126,6 +126,10 @@ def create_app(agent):
     if sched:
         sched._ws_hub = hub
 
+    # ── Internal auth token (for Telegram → API service-to-service calls) ──
+    internal_token = secrets.token_urlsafe(48)
+    app.state.internal_token = internal_token
+
     # ── CORS middleware ──
     try:
         from fastapi.middleware.cors import CORSMiddleware
@@ -176,6 +180,9 @@ def create_app(agent):
             path = request.url.path
             if path in PUBLIC_PATHS or path == "/" or path == "/dashboard":
                 return await call_next(request)
+            # Internal service bypass (Telegram → API)
+            if request.headers.get("x-internal-token") == internal_token:
+                return await call_next(request)
             # Check session cookie or Authorization header
             token = request.cookies.get("session", "")
             if not token:
@@ -207,9 +214,19 @@ def create_app(agent):
     rpm = rate_cfg.get("requests_per_minute", 60)
     limiter = RateLimiter(rpm=rpm)
 
+    # Dashboard-internal read-only paths exempt from rate limiting
+    _RATE_LIMIT_EXEMPT = frozenset((
+        "/api/settings/", "/api/config", "/api/features/",
+        "/api/mcp/", "/api/ops/", "/api/overview/",
+    ))
+
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
-        if request.url.path.startswith("/api/") or request.url.path == "/chat":
+        path = request.url.path
+        if path.startswith("/api/") or path == "/chat":
+            # Exempt dashboard GET reads from rate limiting
+            if request.method == "GET" and any(path.startswith(p) for p in _RATE_LIMIT_EXEMPT):
+                return await call_next(request)
             client_ip = request.client.host if request.client else "unknown"
             if not limiter.check(client_ip):
                 return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
@@ -283,6 +300,7 @@ def create_app(agent):
 
     class ChatResponse(BaseModel):
         response: str
+        files: list = []
 
     @app.post("/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest):
@@ -295,7 +313,20 @@ def create_app(agent):
             return StreamingResponse(generate(), media_type="text/event-stream")
 
         response = await agent.run(req.message, req.user_id)
-        return ChatResponse(response=response)
+
+        # Auto-TTS: synthesize voice if enabled
+        from ..voice import maybe_apply_tts
+        from ..file_queue import enqueue_file, get_file_queue, serialize_file_queue
+        tts_result = await maybe_apply_tts(response, agent.config, channel="api")
+        if tts_result and tts_result.success and tts_result.audio_path:
+            enqueue_file(
+                tts_result.audio_path,
+                mime_type=f"audio/{tts_result.output_format or 'mp3'}",
+                voice_compatible=tts_result.voice_compatible,
+            )
+
+        files = serialize_file_queue(get_file_queue())
+        return ChatResponse(response=response, files=files)
 
     @app.get("/chat/stream")
     async def chat_stream(message: str, user_id: str = "dashboard-user"):
@@ -363,7 +394,7 @@ def create_app(agent):
         result = agent.handle_command(cmd, user_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Unknown command")
-        return {"response": result}
+        return {"response": result, "files": []}
 
     @app.post("/chat/multimodal")
     async def chat_multimodal(
@@ -387,9 +418,157 @@ def create_app(agent):
                 file_descriptions.append(file_to_emoji(block, fname))
             except ValueError as e:
                 raise HTTPException(400, str(e))
+            # Auto-ingest uploaded files to S3
+            await agent.ingest_file(
+                data, fname, source="api", user_id=user_id, mime_type=ct)
 
         response = await agent.run(content_blocks, user_id)
-        return {"response": response, "files_processed": file_descriptions}
+
+        from ..file_queue import get_file_queue, serialize_file_queue
+        files = serialize_file_queue(get_file_queue())
+        return {"response": response, "files_processed": file_descriptions, "files": files}
+
+    @app.post("/chat/voice")
+    async def chat_voice(
+        audio: UploadFile = File(...),
+        user_id: str = Form("tg-user"),
+        duration: str = Form("0"),
+    ):
+        """Handle voice message: store audio for transcription, then run agent."""
+        import uuid as _uuid
+        import tempfile
+
+        audio_bytes = await audio.read()
+        voice_id = f"voice_{_uuid.uuid4().hex[:8]}"
+
+        # Save to temp file for MCP/tool access
+        tmp_path = f"{tempfile.gettempdir()}/{voice_id}.ogg"
+        with open(tmp_path, "wb") as f:
+            f.write(audio_bytes)
+
+        # Auto-ingest voice message to S3
+        await agent.ingest_file(
+            audio_bytes, f"{voice_id}.ogg",
+            source="voice", user_id=user_id, mime_type="audio/ogg",
+            description=f"Voice message ({duration}s)")
+
+        # Store in agent for built-in transcribe_voice tool
+        tg_cfg = agent.config.get("channels", {}).get("telegram", {})
+        if hasattr(agent, 'store_voice'):
+            agent.store_voice(voice_id, audio_bytes, tg_cfg)
+
+        # Build transcription prompt with tool hints
+        tool_hint = "Use any available transcription tool."
+        if hasattr(agent, 'tools'):
+            tool_names = list(agent.tools._tools.keys())
+            mcp_voice = [n for n in tool_names if "transcribe_voice" in n]
+            builtin_voice = "transcribe_voice" in tool_names
+            if mcp_voice:
+                tool_hint = (f"Use tool '{mcp_voice[0]}' with argument "
+                             f"path=\"{tmp_path}\" to transcribe.")
+            elif builtin_voice:
+                tool_hint = (f"Use tool 'transcribe_voice' with argument "
+                             f"voice_id=\"{voice_id}\" to transcribe.")
+
+        voice_msg = (
+            f"[User sent a voice message ({duration}s). "
+            f"Audio file: {tmp_path} | voice_id: {voice_id}. "
+            f"{tool_hint} "
+            f"Transcribe the audio, then respond directly to the user's request. "
+            f"Do NOT repeat or show the transcription text to the user — "
+            f"just answer as if they typed the message themselves.]"
+        )
+
+        response = await agent.run(voice_msg, user_id)
+
+        # Auto-TTS for inbound audio (mode=inbound or always)
+        from ..voice import maybe_apply_tts
+        from ..file_queue import enqueue_file, get_file_queue, serialize_file_queue
+        tts_result = await maybe_apply_tts(
+            response, agent.config, channel="telegram", inbound_audio=True,
+        )
+        if tts_result and tts_result.success and tts_result.audio_path:
+            enqueue_file(
+                tts_result.audio_path,
+                mime_type=f"audio/{tts_result.output_format or 'opus'}",
+                voice_compatible=tts_result.voice_compatible,
+            )
+
+        files = serialize_file_queue(get_file_queue())
+        return {"response": response, "files": files}
+
+    # ── TTS endpoints ─────────
+
+    @app.post("/tts/convert")
+    async def tts_convert(body: dict):
+        """Convert text to speech using configured TTS provider."""
+        text = body.get("text", "").strip()
+        if not text:
+            raise HTTPException(400, "text is required")
+        channel = body.get("channel", "api")
+
+        from ..voice import text_to_speech, resolve_voice_config
+        voice_cfg = resolve_voice_config(agent.config)
+        result = await text_to_speech(text, voice_cfg, agent.config, channel=channel)
+
+        if not result.success:
+            raise HTTPException(500, result.error or "TTS conversion failed")
+
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            result.audio_path,
+            media_type=f"audio/{result.output_format or 'mp3'}",
+            filename=f"tts.{result.output_format or 'mp3'}",
+        )
+
+    @app.get("/tts/status")
+    async def tts_status():
+        """Get TTS configuration status and last attempt info."""
+        from ..voice import resolve_voice_config, get_last_tts_attempt, _get_tts_api_key
+        voice_cfg = resolve_voice_config(agent.config)
+        tts = voice_cfg["tts"]
+        return {
+            "auto": tts["auto"],
+            "provider": tts["provider"],
+            "has_openai": bool(_get_tts_api_key("openai", agent.config)),
+            "has_elevenlabs": bool(_get_tts_api_key("elevenlabs", agent.config)),
+            "has_edge": tts["edge"]["enabled"],
+            "max_length": tts["max_length"],
+            "openai_voice": tts["openai"]["voice"],
+            "openai_model": tts["openai"]["model"],
+            "last_attempt": get_last_tts_attempt(),
+        }
+
+    @app.get("/tts/providers")
+    async def tts_providers():
+        """List available TTS providers and their configuration."""
+        from ..voice import resolve_voice_config, _get_tts_api_key, OPENAI_TTS_VOICES, OPENAI_TTS_MODELS
+        voice_cfg = resolve_voice_config(agent.config)
+        tts = voice_cfg["tts"]
+        return {
+            "providers": [
+                {
+                    "id": "openai",
+                    "name": "OpenAI TTS",
+                    "available": bool(_get_tts_api_key("openai", agent.config)),
+                    "voices": list(OPENAI_TTS_VOICES),
+                    "models": list(OPENAI_TTS_MODELS),
+                    "config": tts["openai"],
+                },
+                {
+                    "id": "elevenlabs",
+                    "name": "ElevenLabs",
+                    "available": bool(_get_tts_api_key("elevenlabs", agent.config)),
+                    "config": tts["elevenlabs"],
+                },
+                {
+                    "id": "edge",
+                    "name": "Edge TTS (Free)",
+                    "available": tts["edge"]["enabled"],
+                    "config": tts["edge"],
+                },
+            ],
+        }
 
     # Mount dashboard routes (overview, memories, tools, usage, config, history)
     from .dashboard import mount_dashboard

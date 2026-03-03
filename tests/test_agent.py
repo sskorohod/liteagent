@@ -81,6 +81,57 @@ class TestCostCalculation:
         assert cost > 0
 
 
+class TestCascadeTier:
+    """Cascade tier mapping and history."""
+
+    def test_tier_for_score_simple(self):
+        assert LiteAgent._tier_for_score(0) == "simple"
+        assert LiteAgent._tier_for_score(-1) == "simple"
+
+    def test_tier_for_score_medium(self):
+        assert LiteAgent._tier_for_score(1) == "medium"
+        assert LiteAgent._tier_for_score(2) == "medium"
+
+    def test_tier_for_score_complex(self):
+        assert LiteAgent._tier_for_score(3) == "complex"
+        assert LiteAgent._tier_for_score(5) == "complex"
+
+    def test_record_cascade_decision(self):
+        # Clear history
+        LiteAgent._cascade_history = []
+        LiteAgent._record_cascade_decision("claude-haiku-4-5-20251001", "simple", 0)
+        LiteAgent._record_cascade_decision("claude-sonnet-4-20250514", "medium", 2)
+        assert len(LiteAgent._cascade_history) == 2
+        assert LiteAgent._cascade_history[0]["tier"] == "simple"
+        assert LiteAgent._cascade_history[1]["model"] == "claude-sonnet-4-20250514"
+
+    def test_cascade_history_max_cap(self):
+        LiteAgent._cascade_history = []
+        for i in range(60):
+            LiteAgent._record_cascade_decision(f"model-{i}", "simple", 0)
+        assert len(LiteAgent._cascade_history) == LiteAgent._CASCADE_HISTORY_MAX
+
+    def test_get_cascade_summary(self):
+        LiteAgent._cascade_history = []
+        LiteAgent._record_cascade_decision("haiku", "simple", 0)
+        LiteAgent._record_cascade_decision("haiku", "simple", -1)
+        LiteAgent._record_cascade_decision("sonnet", "medium", 2)
+        LiteAgent._record_cascade_decision("opus", "complex", 4)
+        summary = LiteAgent.get_cascade_summary()
+        assert summary["tier_counts"]["simple"] == 2
+        assert summary["tier_counts"]["medium"] == 1
+        assert summary["tier_counts"]["complex"] == 1
+        assert summary["total_decisions"] == 4
+        assert summary["last_decision"]["model"] == "opus"
+
+    def test_get_cascade_history(self):
+        LiteAgent._cascade_history = []
+        LiteAgent._record_cascade_decision("haiku", "simple", 0)
+        history = LiteAgent.get_cascade_history()
+        assert len(history) == 1
+        assert "timestamp" in history[0]
+
+
 class TestTextExtraction:
     """Response text extraction."""
 

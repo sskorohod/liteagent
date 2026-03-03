@@ -1,5 +1,6 @@
 """S3/MinIO file storage backend for LiteAgent."""
 
+import asyncio
 import logging
 import mimetypes
 from datetime import datetime
@@ -115,12 +116,75 @@ class StorageBackend:
             ExpiresIn=expires,
         )
 
+    def delete_many(self, keys: list[str]) -> dict:
+        """Delete multiple files. Returns {"deleted": [...], "errors": [...]}."""
+        result = {"deleted": [], "errors": []}
+        for key in keys:
+            if self.delete(key):
+                result["deleted"].append(key)
+            else:
+                result["errors"].append(key)
+        return result
+
+    def list_all_files(self, prefix: str = "") -> list[dict]:
+        """List ALL files (paginated). Returns full metadata."""
+        files = []
+        kwargs = {"Bucket": self.bucket}
+        if prefix:
+            kwargs["Prefix"] = prefix
+        while True:
+            resp = self._client.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents", []):
+                files.append({
+                    "key": obj["Key"],
+                    "size": obj["Size"],
+                    "last_modified": obj["LastModified"].isoformat()
+                    if isinstance(obj["LastModified"], datetime)
+                    else str(obj["LastModified"]),
+                })
+            if not resp.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+        return files
+
     def get_stats(self) -> dict:
         """Get storage stats: file count and total size."""
         resp = self._client.list_objects_v2(Bucket=self.bucket)
         contents = resp.get("Contents", [])
         total_size = sum(obj["Size"] for obj in contents)
         return {"file_count": len(contents), "total_size_bytes": total_size}
+
+    # ── Async wrappers (non-blocking for event loop) ──
+
+    async def async_upload(self, key: str, data: bytes,
+                           content_type: str = "") -> str:
+        return await asyncio.to_thread(self.upload, key, data, content_type)
+
+    async def async_upload_file(self, local_path: str,
+                                key: str = None) -> str:
+        return await asyncio.to_thread(self.upload_file, local_path, key)
+
+    async def async_download(self, key: str) -> bytes:
+        return await asyncio.to_thread(self.download, key)
+
+    async def async_list_files(self, prefix: str = "",
+                               limit: int = 100) -> list[dict]:
+        return await asyncio.to_thread(self.list_files, prefix, limit)
+
+    async def async_list_all_files(self, prefix: str = "") -> list[dict]:
+        return await asyncio.to_thread(self.list_all_files, prefix)
+
+    async def async_delete(self, key: str) -> bool:
+        return await asyncio.to_thread(self.delete, key)
+
+    async def async_delete_many(self, keys: list[str]) -> dict:
+        return await asyncio.to_thread(self.delete_many, keys)
+
+    async def async_get_url(self, key: str, expires: int = 3600) -> str:
+        return await asyncio.to_thread(self.get_url, key, expires)
+
+    async def async_get_stats(self) -> dict:
+        return await asyncio.to_thread(self.get_stats)
 
 
 def create_storage(config: dict) -> StorageBackend | None:

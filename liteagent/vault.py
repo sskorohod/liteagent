@@ -54,15 +54,27 @@ def _fernet():
 
 
 def load_keys() -> dict[str, str]:
-    """Decrypt and return keys from the vault file."""
+    """Decrypt and return keys from the vault file.
+
+    Returns empty dict on any failure — caller should fallback to keys.json.
+    """
     if not VAULT_PATH.exists():
         return {}
     try:
         encrypted = VAULT_PATH.read_bytes()
+        if not encrypted:
+            logger.warning("Vault file exists but is empty — ignoring")
+            return {}
         decrypted = _fernet().decrypt(encrypted)
         return json.loads(decrypted)
     except Exception as exc:
-        logger.error("Failed to decrypt vault: %s", exc)
+        exc_type = type(exc).__name__
+        logger.error(
+            "Failed to decrypt vault (%s: %s). "
+            "keys.json will be used as fallback. "
+            "To fix: unset LITEAGENT_VAULT_KEY or delete %s",
+            exc_type, exc or "(no details)", VAULT_PATH,
+        )
         return {}
 
 
@@ -78,8 +90,22 @@ def save_keys(keys: dict[str, str]) -> None:
 
 
 def vault_set(provider: str, api_key: str) -> None:
-    """Add or update a single key in the vault."""
+    """Add or update a single key in the vault.
+
+    Safety: if vault is empty but keys.json has keys, merge them
+    to prevent data loss on first vault write.
+    """
     keys = load_keys()
+    # If vault returned nothing, check if keys.json has data we should preserve
+    if not keys and KEYS_PATH.exists():
+        try:
+            import json as _json
+            json_keys = _json.loads(KEYS_PATH.read_text())
+            if json_keys:
+                logger.info("Vault empty — merging %d key(s) from keys.json into vault", len(json_keys))
+                keys = json_keys
+        except Exception:
+            pass
     keys[provider] = api_key
     save_keys(keys)
 

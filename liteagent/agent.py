@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime, timezone, timedelta
@@ -17,7 +18,9 @@ from .hooks import HookRegistry, HookContext
 from .memory import MemorySystem
 from .plugins import load_plugins
 from .providers import create_provider, get_pricing, MODEL_PRICING, TextBlock, ToolUseBlock
+from .skills import SkillRegistry
 from .tools import ToolRegistry, register_builtin_tools
+
 
 
 def _serialize_content(content: list) -> list[dict]:
@@ -75,6 +78,10 @@ class LiteAgent:
     # ── WebSocket hub reference (set by api.py at startup) ──
     _ws_hub = None
 
+    # ── Cascade decision history (class-level, for dashboard) ──
+    _cascade_history: list = []
+    _CASCADE_HISTORY_MAX = 50
+
     @classmethod
     def _ensure_locks(cls):
         """Lazily create asyncio.Lock instances (needs running event loop)."""
@@ -105,7 +112,8 @@ class LiteAgent:
         """Remove a queued request (lock acquired or timed out)."""
         LiteAgent._queued_requests.pop(q_id, None)
 
-    async def _track_request_start(self, user_id: str, input_preview: str, model: str) -> int:
+    async def _track_request_start(self, user_id: str, input_preview: str, model: str,
+                                    complexity_score: int = -1, cascade_tier: str = "") -> int:
         """Register an in-flight request. Returns request ID."""
         async with LiteAgent._requests_lock:
             req_id = next(LiteAgent._request_counter)
@@ -116,6 +124,8 @@ class LiteAgent:
                 "model": model,
                 "input_preview": input_preview[:120],
                 "status": "running",
+                "complexity_score": complexity_score,
+                "cascade_tier": cascade_tier,
             }
         self._ws_broadcast("request_started", LiteAgent._active_requests.get(req_id, {}))
         return req_id
@@ -125,7 +135,20 @@ class LiteAgent:
         async with LiteAgent._requests_lock:
             info = LiteAgent._active_requests.pop(req_id, None)
         if info:
-            self._ws_broadcast("request_done", {"id": req_id, "user_id": info.get("user_id")})
+            elapsed = 0.0
+            try:
+                started = datetime.fromisoformat(info["started_at"])
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            except Exception:
+                pass
+            self._ws_broadcast("request_done", {
+                "id": req_id,
+                "user_id": info.get("user_id"),
+                "model": info.get("model"),
+                "complexity_score": info.get("complexity_score"),
+                "cascade_tier": info.get("cascade_tier"),
+                "elapsed_sec": round(elapsed, 2),
+            })
 
     @classmethod
     def get_active_requests(cls) -> list:
@@ -172,7 +195,8 @@ class LiteAgent:
         # Tools (with security sandbox)
         self.tools = ToolRegistry()
         tools_cfg = config.get("tools", {})
-        builtin = tools_cfg.get("builtin", ["read_file", "write_file", "exec_command"])
+        builtin = tools_cfg.get("builtin", ["read_file", "write_file", "exec_command",
+                                            "download_file", "send_file_to_user"])
         sandbox_root = tools_cfg.get("sandbox_root")  # None = sensitive-path blocking only
         cmd_allowlist = set(tools_cfg["command_allowlist"]) if "command_allowlist" in tools_cfg else None
         allow_shell = tools_cfg.get("allow_shell", False)
@@ -196,6 +220,7 @@ class LiteAgent:
         # Voice message store (channel → agent tool pipeline)
         self._voice_store: dict[str, dict] = {}
         self._wire_voice_tool()
+        self._wire_voice_config_tools()
 
         # Background task tracking (prevents "Task destroyed" warnings)
         self._background_tasks: set[asyncio.Task] = set()
@@ -221,13 +246,22 @@ class LiteAgent:
             create_synthesize_meta_tool(
                 self.tools, self.memory.db, synth_cfg)
 
-        # Storage backend (MinIO/S3)
+        # Storage backend (MinIO/S3) + File Manager
         self._storage = None
+        self._file_manager = None
         if config.get("storage", {}).get("enabled", False):
             from .storage import create_storage
             self._storage = create_storage(config)
             if self._storage:
+                from .file_manager import create_file_manager
+                self._file_manager = create_file_manager(self)
                 self._wire_storage_tools()
+
+        # Knowledge base (separate from RAG, for books/reference materials)
+        self._knowledge_base = None
+        kb_cfg = config.get("knowledge_base", {})
+        if kb_cfg.get("enabled", False):
+            self._init_knowledge_base(kb_cfg)
 
         # RAG pipeline (optional, with Qdrant support + sandbox)
         self._rag = None
@@ -239,7 +273,14 @@ class LiteAgent:
                 embedder=self.memory._embedder,
                 config=rag_cfg,
                 sandbox_root=sandbox_root)
+            self._rag.init_backend(config)
             self._wire_rag_tool()
+            # Connect RAG to FileManager for full-content indexing
+            if self._file_manager:
+                self._file_manager._rag = self._rag
+
+        # Task manager (set by main.py after scheduler setup)
+        self._task_manager = None
 
         # Auto-ingestion config
         self._auto_ingestion = config.get("features", {}).get("auto_ingestion", {})
@@ -264,6 +305,16 @@ class LiteAgent:
         self._register_builtin_hooks()
         # Load user plugins from ~/.liteagent/plugins/
         self._loaded_plugins = load_plugins(self.hooks, config)
+
+        # Web tools (fetch, search, crawl, extract) — enabled by default
+        self._web_cache = None
+        web_cfg = config.get("web", {})
+        if web_cfg.get("enabled", True):
+            self._wire_web_tools()
+
+        # Skill system (modular prompt injection with progressive disclosure)
+        self.skill_registry = SkillRegistry()
+        self.skill_registry.load_all(config)
 
     def _register_builtin_hooks(self):
         """Register built-in metacognition features as hook handlers."""
@@ -441,6 +492,339 @@ class LiteAgent:
         }
         self.tools._handlers["rag_search"] = rag_search_handler
 
+    # ═══════════════════════════════════════════════════════════
+    # KNOWLEDGE BASE
+    # ═══════════════════════════════════════════════════════════
+
+    def _init_knowledge_base(self, kb_cfg: dict):
+        """Initialize knowledge base (separate from RAG)."""
+        try:
+            from .knowledge_base import KnowledgeBase
+            self._knowledge_base = KnowledgeBase(
+                config=kb_cfg,
+                embedder=self.memory._embedder,
+                provider=self.provider,
+            )
+            self._wire_knowledge_base_tools()
+            logger.info("Knowledge base initialized")
+        except Exception as e:
+            logger.warning("Knowledge base init failed: %s", e)
+            self._knowledge_base = None
+
+    def _wire_knowledge_base_tools(self):
+        """Register 6 KB tools: kb_search, kb_ingest, kb_list, kb_delete, kb_stats, kb_entities."""
+        kb = self._knowledge_base
+
+        async def kb_search_handler(query: str, top_k: int = 6,
+                                     mode: str = "hybrid") -> str:
+            results = await kb.search(query, top_k=top_k, mode=mode)
+            if not results:
+                return "В базе знаний релевантной информации не найдено."
+            context = kb.build_context(results)
+            return f"<kb_context>\n{context}\n</kb_context>"
+
+        async def kb_ingest_handler(path: str) -> str:
+            result = await kb.ingest(path)
+            return json.dumps(result, ensure_ascii=False)
+
+        async def kb_list_handler() -> str:
+            docs = await kb.list_documents()
+            if not docs:
+                return "База знаний пуста. Загрузите документы с помощью kb_ingest."
+            lines = []
+            for d in docs:
+                lines.append(
+                    f"- {d['name']} (id: {d['id'][:8]}..., "
+                    f"{d['chunk_count']} чанков, {d['page_count']} стр.)")
+            return "\n".join(lines)
+
+        async def kb_delete_handler(doc_id: str) -> str:
+            ok = await kb.delete_document(doc_id)
+            if ok:
+                return f"Документ удалён: {doc_id}"
+            return f"Документ не найден: {doc_id}"
+
+        async def kb_stats_handler() -> str:
+            stats = await kb.get_stats()
+            return json.dumps(stats, ensure_ascii=False, indent=2)
+
+        async def kb_entities_handler(doc_id: str = "") -> str:
+            entities = await kb.list_entities(doc_id=doc_id if doc_id else None)
+            if not entities:
+                return "Сущности не найдены. Запустите ночной обработчик для извлечения сущностей."
+            lines = []
+            for e in entities:
+                lines.append(f"- {e['name']} ({e['entity_type']}) — {e.get('doc_name', '?')}, x{e['count']}")
+            return "\n".join(lines)
+
+        # Register tools
+        tools_defs = [
+            {
+                "name": "kb_search",
+                "description": (
+                    "Search the knowledge base (books, reference materials). "
+                    "Returns relevant excerpts with citations (source, page, section). "
+                    "Use for accounting, law, regulations, and domain questions."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "Search query"},
+                        "top_k": {"type": "integer",
+                                  "description": "Number of results (default 6)"},
+                        "mode": {"type": "string",
+                                 "description": "Search mode: hybrid, bm25, vector (default hybrid)"},
+                    },
+                    "required": ["query"],
+                },
+                "_handler": kb_search_handler,
+            },
+            {
+                "name": "kb_ingest",
+                "description": (
+                    "Load a document (PDF, TXT, MD, HTML) into the knowledge base. "
+                    "Parses structure, creates semantic chunks, indexes for search."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string",
+                                 "description": "Path to the file to ingest"},
+                    },
+                    "required": ["path"],
+                },
+                "_handler": kb_ingest_handler,
+            },
+            {
+                "name": "kb_list",
+                "description": "List all documents in the knowledge base.",
+                "input_schema": {"type": "object", "properties": {}},
+                "_handler": kb_list_handler,
+            },
+            {
+                "name": "kb_delete",
+                "description": "Delete a document from the knowledge base by ID or name.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string",
+                                   "description": "Document ID or name to delete"},
+                    },
+                    "required": ["doc_id"],
+                },
+                "_handler": kb_delete_handler,
+            },
+            {
+                "name": "kb_stats",
+                "description": "Get knowledge base statistics (documents, chunks, search mode, storage size).",
+                "input_schema": {"type": "object", "properties": {}},
+                "_handler": kb_stats_handler,
+            },
+            {
+                "name": "kb_entities",
+                "description": "List extracted entities (people, laws, dates, terms) from the knowledge base.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {
+                            "type": "string",
+                            "description": "Optional document ID to filter entities"
+                        }
+                    }
+                },
+                "_handler": kb_entities_handler,
+            },
+        ]
+
+        for td in tools_defs:
+            handler = td.pop("_handler")
+            self.tools._tools[td["name"]] = td
+            self.tools._handlers[td["name"]] = handler
+
+    def _wire_web_tools(self):
+        """Register web tools: web_fetch, web_search, web_crawl, web_extract."""
+        agent = self
+        web_cfg = self.config.get("web", {})
+        cache_cfg = web_cfg.get("cache", {})
+
+        if cache_cfg.get("enabled", True):
+            from .web import WebCache
+            self._web_cache = WebCache(
+                default_ttl=cache_cfg.get("ttl", 300),
+                max_entries=cache_cfg.get("max_entries", 200))
+
+        async def web_fetch_handler(url: str, max_length: int = 10000) -> str:
+            from .web import web_fetch
+            result = await web_fetch(url, config=agent.config.get("web", {}),
+                                     cache=agent._web_cache)
+            if result.error:
+                return f"Error fetching {url}: {result.error}"
+            content = result.content[:max_length]
+            truncated = " (truncated)" if len(result.content) > max_length else ""
+            footer = (f"\n---\nSource: {result.url} | "
+                      f"Extractor: {result.extractor} | "
+                      f"{result.extracted_length} chars{truncated}"
+                      + (" | cached" if result.cached else ""))
+            title = f"# {result.title}\n\n" if result.title else ""
+            return f"{title}{content}{footer}"
+
+        async def web_search_handler(query: str, count: int = 5,
+                                     language: str = "", freshness: str = "") -> str:
+            from .web import web_search
+            resp = await web_search(query, config=agent.config.get("web", {}),
+                                    cache=agent._web_cache,
+                                    count=min(count, 20),
+                                    language=language, freshness=freshness)
+            if resp.error:
+                return f"Web search error: {resp.error}"
+            if not resp.results:
+                return "No results found."
+            lines = [f'Search results for "{query}" (via {resp.provider}, '
+                     f'{len(resp.results)} results):\n']
+            for i, r in enumerate(resp.results, 1):
+                lines.append(f"{i}. **{r.title}**\n   {r.snippet}\n   URL: {r.url}")
+            footer = (f"\n---\nProvider: {resp.provider}"
+                      + (" | Cached" if resp.cached else ""))
+            return "\n\n".join(lines) + footer
+
+        async def web_crawl_handler(url: str, max_depth: int = 1,
+                                    max_pages: int = 5) -> str:
+            from .web import web_crawl
+            from urllib.parse import urlparse as _urlparse
+            results = await web_crawl(url, config=agent.config.get("web", {}),
+                                      cache=agent._web_cache,
+                                      max_depth=min(max_depth, 3),
+                                      max_pages=min(max_pages, 20))
+            if not results:
+                return f"Crawl returned no pages for {url}"
+            lines = [f"Crawled {len(results)} pages from "
+                     f"{_urlparse(url).netloc}:\n"]
+            total_chars = 0
+            for r in results:
+                if r.error:
+                    lines.append(f"## Error: {r.url}\n{r.error}")
+                    continue
+                excerpt = r.content[:2000]
+                trunc = "..." if len(r.content) > 2000 else ""
+                lines.append(f"## {r.title or r.url} (depth: {r.depth})\n"
+                             f"{excerpt}{trunc}")
+                total_chars += len(r.content)
+            lines.append(f"\n---\nPages: {len(results)} | "
+                         f"Total content: {total_chars} chars")
+            return "\n\n".join(lines)
+
+        async def web_extract_handler(url: str, selector: str = "",
+                                      extract: str = "") -> str:
+            from .web import web_extract
+            result = await web_extract(url, config=agent.config.get("web", {}),
+                                       selectors={"css": selector} if selector else None)
+            if result.error:
+                return f"Error extracting from {url}: {result.error}"
+            return json.dumps({
+                "url": result.url,
+                "title": result.title,
+                "description": result.description,
+                "og_tags": result.og_tags,
+                "headings": result.headings[:50],
+                "links": result.links[:50],
+                "images": result.images[:30],
+                "tables": result.tables[:10],
+            }, ensure_ascii=False, indent=2)
+
+        tools_defs = [
+            {
+                "name": "web_fetch",
+                "description": (
+                    "Fetch a web page and extract its readable content as clean text. "
+                    "Use this to read articles, documentation, blog posts, or any web page. "
+                    "Returns cleaned, readable content with the page title."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string",
+                                "description": "URL to fetch (http/https)"},
+                        "max_length": {"type": "integer",
+                                       "description": "Max characters to return (default 10000)"},
+                    },
+                    "required": ["url"],
+                },
+                "_handler": web_fetch_handler,
+            },
+            {
+                "name": "web_search",
+                "description": (
+                    "Search the web for current information, facts, and research. "
+                    "Returns top results with titles, descriptions, and URLs. "
+                    "Supports multiple search providers with automatic fallback."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "Search query"},
+                        "count": {"type": "integer",
+                                  "description": "Number of results (1-20, default 5)"},
+                        "language": {"type": "string",
+                                     "description": "Language code (e.g. 'en', 'ru', 'de')"},
+                        "freshness": {"type": "string",
+                                      "description": "Time filter: 'day', 'week', 'month', 'year'"},
+                    },
+                    "required": ["query"],
+                },
+                "_handler": web_search_handler,
+            },
+            {
+                "name": "web_crawl",
+                "description": (
+                    "Crawl multiple pages from a website. Follows internal links "
+                    "up to a specified depth. Respects robots.txt and rate limits. "
+                    "Use for gathering content from documentation sites or multi-page articles."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string",
+                                "description": "Starting URL to crawl"},
+                        "max_depth": {"type": "integer",
+                                      "description": "Max link depth (default 1, max 3)"},
+                        "max_pages": {"type": "integer",
+                                      "description": "Max pages to crawl (default 5, max 20)"},
+                    },
+                    "required": ["url"],
+                },
+                "_handler": web_crawl_handler,
+            },
+            {
+                "name": "web_extract",
+                "description": (
+                    "Extract structured data from a web page: title, description, "
+                    "metadata (OG tags), headings, links, images, and tables. "
+                    "Optionally use CSS selectors to target specific elements."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string",
+                                "description": "URL to extract from"},
+                        "selector": {"type": "string",
+                                     "description": "CSS selector to narrow extraction (optional)"},
+                        "extract": {"type": "string",
+                                    "description": "What to extract: links,images,headings,tables,metadata (default: all)"},
+                    },
+                    "required": ["url"],
+                },
+                "_handler": web_extract_handler,
+            },
+        ]
+
+        for td in tools_defs:
+            handler = td.pop("_handler")
+            self.tools._tools[td["name"]] = td
+            self.tools._handlers[td["name"]] = handler
+        logger.info("Web tools registered: web_fetch, web_search, web_crawl, web_extract")
+
     def store_voice(self, voice_id: str, audio_bytes: bytes, config: dict | None = None):
         """Store voice audio bytes for transcription via agent tool.
 
@@ -453,48 +837,56 @@ class LiteAgent:
         }
 
     def _wire_voice_tool(self):
-        """Register transcribe_voice tool — lets the agent transcribe voice messages."""
+        """Register transcribe_voice tool — delegates to voice.py multi-provider STT."""
         agent = self
 
         async def transcribe_voice_handler(voice_id: str) -> str:
-            """Transcribe a voice message by its ID using OpenAI Whisper API."""
+            """Transcribe a voice message by its ID using configured STT provider."""
             voice_data = agent._voice_store.pop(voice_id, None)
             if not voice_data:
                 return f"Voice message '{voice_id}' not found or already transcribed."
 
             audio_bytes = voice_data["audio_bytes"]
-            config = voice_data["config"]
+            logger.info("STT: transcribing %s (%d bytes)", voice_id, len(audio_bytes))
 
-            try:
-                import openai
-            except ImportError:
-                return ("OpenAI SDK is required for voice transcription: "
-                        "pip install liteagent[openai]")
+            from .voice import transcribe
+            result = await transcribe(audio_bytes, agent.config)
 
-            from .config import get_api_key
-            api_key = get_api_key("openai")
-            if not api_key:
-                return ("OpenAI API key required for voice transcription. "
-                        "Set it via dashboard Settings → Providers → OpenAI, "
-                        "or set OPENAI_API_KEY environment variable.")
+            if result.success:
+                logger.info("STT: transcribed via %s (%s): %d chars",
+                            result.provider, result.model, len(result.text))
+                return result.text
 
-            import io
-            client = openai.AsyncOpenAI(api_key=api_key)
-            model = config.get("voice_model", "whisper-1")
-            language = config.get("voice_language")  # None = auto-detect
+            logger.warning("STT: builtin failed for %s: %s", voice_id, result.error)
 
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = "voice.ogg"
+            # Fallback to MCP transcription tools (e.g. mywhisper)
+            mcp_transcribe = [
+                n for n in agent.tools._handlers
+                if "transcribe" in n and "__" in n
+            ]
+            if mcp_transcribe:
+                import tempfile, os
+                tmp_path = os.path.join(tempfile.gettempdir(), f"{voice_id}.ogg")
+                if not os.path.exists(tmp_path):
+                    with open(tmp_path, "wb") as f:
+                        f.write(audio_bytes)
 
-            kwargs = {"model": model, "file": audio_file}
-            if language:
-                kwargs["language"] = language
+                for mcp_name in mcp_transcribe:
+                    try:
+                        logger.info("STT: trying MCP fallback %s for %s", mcp_name, voice_id)
+                        mcp_handler = agent.tools._handlers[mcp_name]
+                        if asyncio.iscoroutinefunction(mcp_handler):
+                            mcp_result = await mcp_handler(path=tmp_path)
+                        else:
+                            mcp_result = mcp_handler(path=tmp_path)
+                        if mcp_result and not mcp_result.startswith("Error"):
+                            logger.info("STT: transcribed via MCP %s: %d chars",
+                                        mcp_name, len(mcp_result))
+                            return mcp_result
+                    except Exception as e:
+                        logger.warning("STT: MCP %s failed: %s", mcp_name, e)
 
-            try:
-                response = await client.audio.transcriptions.create(**kwargs)
-                return response.text
-            except Exception as e:
-                return f"Voice transcription error: {e}"
+            return f"Voice transcription error: {result.error}"
 
         self.tools._tools["transcribe_voice"] = {
             "name": "transcribe_voice",
@@ -503,7 +895,9 @@ class LiteAgent:
                 "message (e.g. via Telegram), the audio is stored with a voice_id. "
                 "Call this tool with that voice_id to get the text transcription. "
                 "You MUST call this tool to understand what the user said in their "
-                "voice message before you can respond."
+                "voice message before you can respond. "
+                "IMPORTANT: Do NOT show or repeat the transcription to the user — "
+                "just respond to their message as if they typed it."
             ),
             "input_schema": {
                 "type": "object",
@@ -518,73 +912,961 @@ class LiteAgent:
         }
         self.tools._handlers["transcribe_voice"] = transcribe_voice_handler
 
+    def _wire_voice_config_tools(self):
+        """Register voice configuration tools — let the agent self-configure TTS/STT."""
+        agent = self
+
+        def get_voice_settings_handler() -> str:
+            """Get current voice (TTS/STT) settings, provider status, and available presets."""
+            from .voice import (resolve_voice_config, TTS_PROVIDERS, STT_PROVIDERS,
+                                TTS_COST_INFO, STT_COST_INFO, BUILTIN_PRESETS)
+            from .config import get_api_key
+
+            cfg = resolve_voice_config(agent.config)
+
+            # Provider availability
+            providers = {}
+            for p in TTS_PROVIDERS:
+                configured = True
+                if p == "openai":
+                    configured = bool(get_api_key("openai"))
+                elif p == "elevenlabs":
+                    configured = bool(get_api_key("elevenlabs") or os.environ.get("ELEVENLABS_API_KEY"))
+                providers[p] = {
+                    "configured": configured,
+                    "cost": TTS_COST_INFO.get(p, "unknown"),
+                }
+
+            # Presets
+            custom_presets = list(agent.config.get("voice", {}).get("presets", {}).keys())
+            all_presets = list(BUILTIN_PRESETS.keys()) + custom_presets
+
+            result = {
+                "tts": {
+                    "auto": cfg["tts"]["auto"],
+                    "provider": cfg["tts"]["provider"],
+                    "voice": cfg["tts"].get(cfg["tts"]["provider"], {}).get("voice",
+                             cfg["tts"].get("openai", {}).get("voice", "alloy")),
+                    "model": cfg["tts"].get("openai", {}).get("model", "tts-1"),
+                    "max_length": cfg["tts"]["max_length"],
+                },
+                "stt": {
+                    "provider": cfg["stt"]["provider"],
+                    "model": cfg["stt"].get(cfg["stt"]["provider"], {}).get("model", "whisper-1"),
+                    "language": cfg["stt"].get(cfg["stt"]["provider"], {}).get("language"),
+                },
+                "providers": providers,
+                "presets": all_presets,
+            }
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        def set_voice_settings_handler(
+            tts_auto: str = "",
+            tts_provider: str = "",
+            tts_voice: str = "",
+            tts_model: str = "",
+            tts_speed: float = 0,
+            tts_max_length: int = 0,
+            elevenlabs_voice_id: str = "",
+            elevenlabs_stability: float = -1,
+            elevenlabs_similarity_boost: float = -1,
+            stt_provider: str = "",
+            stt_model: str = "",
+            stt_language: str = "",
+        ) -> str:
+            """Update voice settings. All parameters are optional — only provided ones are changed.
+
+            tts_auto: Auto-TTS mode (off, always, inbound, tagged)
+            tts_provider: TTS provider (openai, elevenlabs, edge)
+            tts_voice: Voice name (openai: alloy/nova/etc, edge: ru-RU-SvetlanaNeural/etc)
+            tts_model: TTS model (tts-1, tts-1-hd, gpt-4o-mini-tts)
+            tts_speed: Speech speed (0.25-4.0)
+            tts_max_length: Max text length for TTS
+            elevenlabs_voice_id: ElevenLabs voice ID
+            elevenlabs_stability: ElevenLabs stability (0-1)
+            elevenlabs_similarity_boost: ElevenLabs similarity boost (0-1)
+            stt_provider: STT provider (openai, deepgram, groq)
+            stt_model: STT model name
+            stt_language: STT language code
+            """
+            from .voice import TTS_PROVIDERS, STT_PROVIDERS, OPENAI_TTS_MODELS, OPENAI_TTS_VOICES
+            from .config import save_config, get_api_key
+
+            voice = agent.config.setdefault("voice", {})
+            tts = voice.setdefault("tts", {})
+            stt = voice.setdefault("stt", {})
+            changes = []
+            warnings = []
+
+            # TTS auto mode
+            if tts_auto:
+                valid_modes = ("off", "always", "inbound", "tagged")
+                if tts_auto not in valid_modes:
+                    return json.dumps({"error": f"Invalid tts_auto: '{tts_auto}'. Valid: {valid_modes}"})
+                tts["auto"] = tts_auto
+                changes.append(f"auto={tts_auto}")
+
+            # TTS provider
+            if tts_provider:
+                if tts_provider not in TTS_PROVIDERS:
+                    return json.dumps({"error": f"Invalid tts_provider: '{tts_provider}'. Valid: {list(TTS_PROVIDERS)}"})
+                if tts_provider == "openai" and not get_api_key("openai"):
+                    warnings.append("OpenAI API key not configured — TTS may fail")
+                if tts_provider == "elevenlabs" and not (get_api_key("elevenlabs") or os.environ.get("ELEVENLABS_API_KEY")):
+                    warnings.append("ElevenLabs API key not configured — TTS may fail")
+                tts["provider"] = tts_provider
+                changes.append(f"provider={tts_provider}")
+
+            # TTS voice
+            if tts_voice:
+                provider = tts_provider or tts.get("provider", "openai")
+                if provider == "openai":
+                    tts.setdefault("openai", {})["voice"] = tts_voice
+                elif provider == "edge":
+                    tts.setdefault("edge", {})["voice"] = tts_voice
+                changes.append(f"voice={tts_voice}")
+
+            # TTS model
+            if tts_model:
+                if tts_model not in OPENAI_TTS_MODELS:
+                    warnings.append(f"Unknown model '{tts_model}', setting anyway")
+                tts.setdefault("openai", {})["model"] = tts_model
+                changes.append(f"model={tts_model}")
+
+            # TTS speed
+            if tts_speed > 0:
+                tts.setdefault("openai", {})["speed"] = max(0.25, min(4.0, tts_speed))
+                changes.append(f"speed={tts_speed}")
+
+            # TTS max length
+            if tts_max_length > 0:
+                tts["max_length"] = tts_max_length
+                changes.append(f"max_length={tts_max_length}")
+
+            # ElevenLabs settings
+            if elevenlabs_voice_id:
+                tts.setdefault("elevenlabs", {})["voice_id"] = elevenlabs_voice_id
+                changes.append(f"elevenlabs_voice_id={elevenlabs_voice_id}")
+            if elevenlabs_stability >= 0:
+                tts.setdefault("elevenlabs", {})["stability"] = max(0, min(1, elevenlabs_stability))
+                changes.append(f"elevenlabs_stability={elevenlabs_stability}")
+            if elevenlabs_similarity_boost >= 0:
+                tts.setdefault("elevenlabs", {})["similarity_boost"] = max(0, min(1, elevenlabs_similarity_boost))
+                changes.append(f"elevenlabs_similarity_boost={elevenlabs_similarity_boost}")
+
+            # STT provider
+            if stt_provider:
+                if stt_provider not in STT_PROVIDERS:
+                    return json.dumps({"error": f"Invalid stt_provider: '{stt_provider}'. Valid: {list(STT_PROVIDERS)}"})
+                stt["provider"] = stt_provider
+                changes.append(f"stt_provider={stt_provider}")
+
+            # STT model
+            if stt_model:
+                provider = stt_provider or stt.get("provider", "openai")
+                stt.setdefault(provider, {})["model"] = stt_model
+                changes.append(f"stt_model={stt_model}")
+
+            # STT language
+            if stt_language:
+                provider = stt_provider or stt.get("provider", "openai")
+                stt.setdefault(provider, {})["language"] = stt_language
+                changes.append(f"stt_language={stt_language}")
+
+            if not changes:
+                return json.dumps({"status": "no_changes", "message": "No parameters provided"})
+
+            save_config(agent.config)
+            result = {"status": "updated", "changes": changes}
+            if warnings:
+                result["warnings"] = warnings
+            return json.dumps(result, ensure_ascii=False)
+
+        def list_voice_providers_handler() -> str:
+            """List available TTS and STT providers with their capabilities and pricing."""
+            from .voice import (TTS_PROVIDERS, STT_PROVIDERS, OPENAI_TTS_VOICES,
+                                OPENAI_TTS_MODELS, TTS_COST_INFO, STT_COST_INFO,
+                                resolve_voice_config)
+            from .config import get_api_key
+
+            cfg = resolve_voice_config(agent.config)
+
+            tts_list = []
+            for p in TTS_PROVIDERS:
+                entry = {"id": p, "cost": TTS_COST_INFO.get(p, "unknown")}
+                if p == "openai":
+                    entry["configured"] = bool(get_api_key("openai"))
+                    entry["models"] = list(OPENAI_TTS_MODELS)
+                    entry["voices"] = list(OPENAI_TTS_VOICES)
+                elif p == "elevenlabs":
+                    entry["configured"] = bool(get_api_key("elevenlabs") or os.environ.get("ELEVENLABS_API_KEY"))
+                    entry["models"] = ["eleven_multilingual_v2", "eleven_turbo_v2_5", "eleven_monolingual_v1"]
+                    entry["voices"] = ["Use voice_id from ElevenLabs dashboard"]
+                elif p == "edge":
+                    entry["configured"] = True
+                    entry["models"] = []
+                    entry["voices"] = [
+                        "ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural",
+                        "en-US-MichelleNeural", "en-US-GuyNeural",
+                        "en-GB-SoniaNeural", "de-DE-KatjaNeural",
+                        "fr-FR-DeniseNeural", "es-ES-ElviraNeural",
+                        "ja-JP-NanamiNeural", "zh-CN-XiaoxiaoNeural",
+                    ]
+                tts_list.append(entry)
+
+            stt_list = []
+            for p in STT_PROVIDERS:
+                entry = {"id": p, "cost": STT_COST_INFO.get(p, "unknown")}
+                if p == "openai":
+                    entry["configured"] = bool(get_api_key("openai"))
+                    entry["models"] = ["whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"]
+                elif p == "deepgram":
+                    entry["configured"] = bool(get_api_key("deepgram") or os.environ.get("DEEPGRAM_API_KEY"))
+                    entry["models"] = ["nova-3", "nova-2"]
+                elif p == "groq":
+                    entry["configured"] = bool(get_api_key("groq") or os.environ.get("GROQ_API_KEY"))
+                    entry["models"] = ["whisper-large-v3"]
+                stt_list.append(entry)
+
+            return json.dumps({
+                "tts_providers": tts_list,
+                "stt_providers": stt_list,
+                "active_tts": cfg["tts"]["provider"],
+                "active_stt": cfg["stt"]["provider"],
+            }, indent=2, ensure_ascii=False)
+
+        async def test_tts_handler(text: str, voice: str = "", provider: str = "") -> str:
+            """Generate audio from text using current or overridden TTS settings.
+
+            text: Text to convert to speech
+            voice: Optional voice override (without changing settings)
+            provider: Optional provider override (without changing settings)
+            """
+            from .voice import text_to_speech, resolve_voice_config
+            from .file_queue import enqueue_file
+
+            cfg = resolve_voice_config(agent.config)
+            tts_cfg = cfg["tts"]
+
+            # Apply overrides without modifying persistent config
+            if provider:
+                tts_cfg = {**tts_cfg, "provider": provider}
+            if voice:
+                p = provider or tts_cfg["provider"]
+                if p == "openai":
+                    tts_cfg = {**tts_cfg, "openai": {**tts_cfg.get("openai", {}), "voice": voice}}
+                elif p == "edge":
+                    tts_cfg = {**tts_cfg, "edge": {**tts_cfg.get("edge", {}), "voice": voice}}
+
+            result = await text_to_speech(text, tts_cfg, agent.config)
+            if result.success and result.audio_path:
+                enqueue_file(
+                    result.audio_path,
+                    caption="",
+                    mime_type="audio/opus" if result.voice_compatible else "audio/mpeg",
+                    voice_compatible=result.voice_compatible,
+                )
+                resp = {
+                    "status": "ok",
+                    "provider": result.provider,
+                    "format": result.output_format,
+                    "latency_ms": result.latency_ms,
+                }
+                return json.dumps(resp)
+            else:
+                return json.dumps({"status": "error", "error": result.error or "TTS failed"})
+
+        def save_voice_preset_handler(name: str, description: str = "") -> str:
+            """Save current TTS settings as a named preset for quick loading later.
+
+            name: Preset name (e.g. 'my_voice', 'work', 'podcast')
+            description: Optional description of the preset
+            """
+            from .voice import resolve_voice_config
+            from .config import save_config
+
+            cfg = resolve_voice_config(agent.config)
+            preset_data = {
+                "provider": cfg["tts"]["provider"],
+                "openai": cfg["tts"]["openai"],
+                "elevenlabs": cfg["tts"]["elevenlabs"],
+                "edge": cfg["tts"]["edge"],
+            }
+            if description:
+                preset_data["description"] = description
+
+            voice = agent.config.setdefault("voice", {})
+            presets = voice.setdefault("presets", {})
+            presets[name] = preset_data
+            save_config(agent.config)
+            return json.dumps({"status": "saved", "name": name, "settings": preset_data}, ensure_ascii=False)
+
+        def load_voice_preset_handler(name: str) -> str:
+            """Load a saved or built-in voice preset and apply its settings.
+
+            name: Preset name (built-in: professional, casual, storyteller, fast_free, russian)
+            """
+            from .voice import BUILTIN_PRESETS, resolve_voice_config
+            from .config import save_config
+            import copy
+
+            # Check custom presets first, then builtins
+            custom = agent.config.get("voice", {}).get("presets", {})
+            if name in custom:
+                preset = custom[name]
+            elif name in BUILTIN_PRESETS:
+                preset = BUILTIN_PRESETS[name]
+            else:
+                available = list(BUILTIN_PRESETS.keys()) + list(custom.keys())
+                return json.dumps({
+                    "error": f"Preset '{name}' not found",
+                    "available": available,
+                }, ensure_ascii=False)
+
+            # Apply preset to config
+            voice = agent.config.setdefault("voice", {})
+            tts = voice.setdefault("tts", {})
+            if "provider" in preset:
+                tts["provider"] = preset["provider"]
+            if "openai" in preset:
+                tts["openai"] = {**tts.get("openai", {}), **preset["openai"]}
+            if "elevenlabs" in preset:
+                tts["elevenlabs"] = {**tts.get("elevenlabs", {}), **preset["elevenlabs"]}
+            if "edge" in preset:
+                tts["edge"] = {**tts.get("edge", {}), **preset["edge"]}
+
+            save_config(agent.config)
+            cfg = resolve_voice_config(agent.config)
+            return json.dumps({
+                "status": "loaded",
+                "preset": name,
+                "applied": {
+                    "provider": cfg["tts"]["provider"],
+                    "voice": cfg["tts"].get(cfg["tts"]["provider"], {}).get("voice", ""),
+                },
+            }, ensure_ascii=False)
+
+        # ── Register all 6 voice config tools ──
+
+        self.tools._tools["get_voice_settings"] = {
+            "name": "get_voice_settings",
+            "description": (
+                "Get current voice configuration: TTS auto-mode, provider, voice, model, "
+                "STT settings, provider availability and pricing, saved presets."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        self.tools._handlers["get_voice_settings"] = get_voice_settings_handler
+
+        self.tools._tools["set_voice_settings"] = {
+            "name": "set_voice_settings",
+            "description": (
+                "Update voice settings. Change TTS provider/voice/model/auto-mode, "
+                "STT provider/model/language, ElevenLabs parameters. "
+                "Only provided parameters are changed; others stay as-is. "
+                "Settings are persisted to config.json."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tts_auto": {
+                        "type": "string",
+                        "description": "Auto-TTS mode: off, always, inbound (echo voice), tagged (only [[tts]] directives)",
+                    },
+                    "tts_provider": {
+                        "type": "string",
+                        "description": "TTS provider: openai, elevenlabs, edge",
+                    },
+                    "tts_voice": {
+                        "type": "string",
+                        "description": "Voice name (openai: alloy/ash/coral/echo/fable/nova/onyx/sage/shimmer/verse; edge: ru-RU-SvetlanaNeural etc)",
+                    },
+                    "tts_model": {
+                        "type": "string",
+                        "description": "TTS model: tts-1, tts-1-hd, gpt-4o-mini-tts",
+                    },
+                    "tts_speed": {
+                        "type": "number",
+                        "description": "Speech speed (0.25-4.0, default 1.0)",
+                    },
+                    "tts_max_length": {
+                        "type": "integer",
+                        "description": "Max text length for TTS (default 1500)",
+                    },
+                    "elevenlabs_voice_id": {
+                        "type": "string",
+                        "description": "ElevenLabs voice ID",
+                    },
+                    "elevenlabs_stability": {
+                        "type": "number",
+                        "description": "ElevenLabs voice stability (0-1)",
+                    },
+                    "elevenlabs_similarity_boost": {
+                        "type": "number",
+                        "description": "ElevenLabs similarity boost (0-1)",
+                    },
+                    "stt_provider": {
+                        "type": "string",
+                        "description": "STT provider: openai, deepgram, groq",
+                    },
+                    "stt_model": {
+                        "type": "string",
+                        "description": "STT model name",
+                    },
+                    "stt_language": {
+                        "type": "string",
+                        "description": "STT language code (e.g. ru, en)",
+                    },
+                },
+            },
+        }
+        self.tools._handlers["set_voice_settings"] = set_voice_settings_handler
+
+        self.tools._tools["list_voice_providers"] = {
+            "name": "list_voice_providers",
+            "description": (
+                "List all available TTS and STT providers with their models, "
+                "voices, pricing, and whether they are configured (have API keys)."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        self.tools._handlers["list_voice_providers"] = list_voice_providers_handler
+
+        self.tools._tools["test_tts"] = {
+            "name": "test_tts",
+            "description": (
+                "Convert text to speech audio. Optionally override voice/provider "
+                "for testing without changing persistent settings. "
+                "The audio file is sent to the user."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to convert to speech",
+                    },
+                    "voice": {
+                        "type": "string",
+                        "description": "Optional voice override for this request only",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Optional provider override for this request only",
+                    },
+                },
+                "required": ["text"],
+            },
+        }
+        self.tools._handlers["test_tts"] = test_tts_handler
+
+        self.tools._tools["save_voice_preset"] = {
+            "name": "save_voice_preset",
+            "description": (
+                "Save current TTS settings as a named preset. "
+                "Presets can be loaded later to quickly switch voice profiles."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Preset name (e.g. 'my_voice', 'work', 'podcast')",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional description of the preset",
+                    },
+                },
+                "required": ["name"],
+            },
+        }
+        self.tools._handlers["save_voice_preset"] = save_voice_preset_handler
+
+        self.tools._tools["load_voice_preset"] = {
+            "name": "load_voice_preset",
+            "description": (
+                "Load a voice preset and apply its TTS settings. "
+                "Built-in presets: professional, casual, storyteller, fast_free, russian. "
+                "Custom presets saved via save_voice_preset are also available."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Preset name to load",
+                    },
+                },
+                "required": ["name"],
+            },
+        }
+        self.tools._handlers["load_voice_preset"] = load_voice_preset_handler
+
     def _wire_storage_tools(self):
-        """Register file storage tools when storage backend is available."""
+        """Register file storage + file manager tools when storage is available."""
         storage = self._storage
-        storage_sandbox = self.config.get("storage", {}).get("sandbox_prefix", "")
+        fm = self._file_manager
+        agent = self
 
-        def _validate_storage_key(key: str) -> str | None:
-            """Validate storage key: block path traversal and enforce sandbox prefix."""
-            # Block path traversal
-            if ".." in key or key.startswith("/"):
-                return "Access denied: path traversal detected in storage key"
-            # Enforce sandbox prefix if configured
-            if storage_sandbox and not key.startswith(storage_sandbox):
-                return f"Access denied: storage key must start with '{storage_sandbox}'"
-            return None
-
-        async def save_file_handler(path: str, content: str) -> str:
-            """Save a file to cloud storage (MinIO/S3)."""
-            err = _validate_storage_key(path)
-            if err:
-                return err
+        # ── save_file: save text content to storage ──
+        async def save_file_handler(filename: str, content: str) -> str:
+            """Save text content to cloud storage."""
             data = content.encode("utf-8")
-            key = storage.upload(path, data)
+            if fm:
+                info = await fm.ingest(
+                    data, filename,
+                    source="agent", user_id=agent._current_user_id)
+                return (f"File saved: {info['original_name']} → {info['storage_key']} "
+                        f"({info['size_bytes']} bytes)")
+            key = await storage.async_upload(filename, data)
             return f"File saved to storage: {key} ({len(data)} bytes)"
 
-        async def get_file_handler(path: str) -> str:
-            """Retrieve a file from cloud storage."""
-            err = _validate_storage_key(path)
-            if err:
-                return err
+        # ── get_file: retrieve text content ──
+        async def get_file_handler(storage_key: str) -> str:
+            """Retrieve file content from storage by its key."""
+            if ".." in storage_key or storage_key.startswith("/"):
+                return "Access denied: invalid key"
             try:
-                data = storage.download(path)
+                data = await storage.async_download(storage_key)
                 return data.decode("utf-8", errors="replace")
             except Exception as e:
                 return f"Error retrieving file: {e}"
 
-        async def list_storage_handler(prefix: str = "") -> str:
-            """List files in cloud storage."""
-            if storage_sandbox and prefix and not prefix.startswith(storage_sandbox):
-                return f"Access denied: listing must use prefix '{storage_sandbox}'"
-            files = storage.list_files(prefix=prefix or storage_sandbox)
+        # ── search_files: semantic + keyword search across all user files ──
+        async def search_files_handler(query: str, limit: int = 10) -> str:
+            """Search files by description, name, or content. Uses semantic search."""
+            if not fm:
+                return "File manager not available."
+            results = fm.search(query, top_k=min(limit, 50))
+            if not results:
+                return "No files found matching your query."
+            lines = []
+            for f in results:
+                size_kb = f['size_bytes'] / 1024
+                lines.append(
+                    f"• {f['original_name']} ({size_kb:.1f} KB, {f['source']}) "
+                    f"— {f['description'][:100]}\n"
+                    f"  key: {f['storage_key']}")
+            return f"Found {len(results)} files:\n" + "\n".join(lines)
+
+        # ── list_all_files: list all files in storage ──
+        async def list_all_files_handler(source: str = "", limit: int = 50) -> str:
+            """List all indexed files. Optionally filter by source (telegram, api, voice, download, agent)."""
+            if not fm:
+                files = await storage.async_list_files(limit=limit)
+                if not files:
+                    return "No files in storage."
+                lines = [f"{f['key']} ({f['size']} bytes)" for f in files]
+                return "\n".join(lines)
+            files = fm.list_files(
+                source=source or None, limit=limit)
             if not files:
-                return "No files found in storage."
-            lines = [f"{f['key']} ({f['size']} bytes)" for f in files]
+                return "No files found."
+            total = fm.count_files()
+            lines = []
+            for f in files:
+                size_kb = f['size_bytes'] / 1024
+                lines.append(
+                    f"• {f['original_name']} ({size_kb:.1f} KB, {f['source']}, "
+                    f"{f['created_at'][:10]})\n"
+                    f"  key: {f['storage_key']}")
+            header = f"Files in storage ({len(files)} shown, {total} total):\n"
+            return header + "\n".join(lines)
+
+        # ── get_file_url: generate download link ──
+        async def get_file_url_handler(storage_key: str, expires_hours: int = 1) -> str:
+            """Generate a temporary download URL for a file."""
+            if ".." in storage_key or storage_key.startswith("/"):
+                return "Access denied: invalid key"
+            try:
+                if fm:
+                    url = await fm.get_download_url(
+                        storage_key, expires=expires_hours * 3600)
+                else:
+                    url = await storage.async_get_url(
+                        storage_key, expires=expires_hours * 3600)
+                return f"Download URL (valid {expires_hours}h): {url}"
+            except Exception as e:
+                return f"Error generating URL: {e}"
+
+        # ── send_stored_file: download from S3 and send to user via file_queue ──
+        async def send_stored_file_handler(storage_key: str, caption: str = "") -> str:
+            """Send a file from storage directly to the user (Telegram/API)."""
+            if ".." in storage_key or storage_key.startswith("/"):
+                return "Access denied: invalid key"
+            try:
+                import tempfile
+                data = await storage.async_download(storage_key)
+                name = storage_key.rsplit("/", 1)[-1]
+                tmp = os.path.join(tempfile.gettempdir(), f"s3_{name}")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                from .file_queue import enqueue_file
+                enqueue_file(tmp, caption=caption or name)
+                return f"File queued for delivery: {name} ({len(data)} bytes)"
+            except Exception as e:
+                return f"Error sending file: {e}"
+
+        # ── propose_cleanup: suggest files for deletion ──
+        async def propose_cleanup_handler(days_unused: int = 30) -> str:
+            """Propose old unused files for deletion. User MUST confirm before deleting."""
+            if not fm:
+                return "File manager not available."
+            candidates = fm.propose_cleanup(days_unused=max(days_unused, 7))
+            if not candidates:
+                return "No cleanup candidates found. All files are recent."
+            lines = []
+            total_bytes = 0
+            for f in candidates:
+                size_kb = f['size_bytes'] / 1024
+                total_bytes += f['size_bytes']
+                lines.append(
+                    f"• {f['original_name']} ({size_kb:.1f} KB, "
+                    f"last access: {f['accessed_at'][:10]})\n"
+                    f"  key: {f['storage_key']}")
+            total_mb = total_bytes / (1024 * 1024)
+            header = (
+                f"Cleanup candidates ({len(candidates)} files, {total_mb:.1f} MB total):\n"
+                f"⚠️ Show this list to the user and ask which files to delete.\n"
+                f"DO NOT delete without explicit user confirmation!\n\n")
+            return header + "\n".join(lines)
+
+        # ── confirm_cleanup: actually delete after user says yes ──
+        async def confirm_cleanup_handler(storage_keys: str) -> str:
+            """Delete specific files from storage. Only call AFTER user confirmed.
+            storage_keys: comma-separated list of storage keys."""
+            if not fm:
+                return "File manager not available."
+            keys = [k.strip() for k in storage_keys.split(",") if k.strip()]
+            if not keys:
+                return "No keys provided."
+            result = await fm.confirm_cleanup(keys)
+            deleted = len(result.get("deleted", []))
+            errors = len(result.get("errors", []))
+            return f"Deleted {deleted} files. Errors: {errors}."
+
+        # Register all tools
+        tools_defs = [
+            ("save_file", save_file_handler,
+             "Save text content to cloud storage. Automatically indexed and searchable.",
+             {"type": "object", "properties": {
+                 "filename": {"type": "string", "description": "Filename (e.g. 'notes.txt', 'report.md')"},
+                 "content": {"type": "string", "description": "File content (text)"},
+             }, "required": ["filename", "content"]}),
+            ("get_file", get_file_handler,
+             "Retrieve text file content from storage by storage key.",
+             {"type": "object", "properties": {
+                 "storage_key": {"type": "string", "description": "Storage key (from search or list)"},
+             }, "required": ["storage_key"]}),
+            ("search_files", search_files_handler,
+             "Search through all stored files by name, description, or content. "
+             "Use this to find specific documents, images, or data the user uploaded.",
+             {"type": "object", "properties": {
+                 "query": {"type": "string", "description": "Search query (name, topic, content keywords)"},
+                 "limit": {"type": "integer", "description": "Max results (default 10)"},
+             }, "required": ["query"]}),
+            ("list_all_files", list_all_files_handler,
+             "List all files in cloud storage. Filter by source: telegram, api, voice, download, agent.",
+             {"type": "object", "properties": {
+                 "source": {"type": "string", "description": "Filter by source (optional)"},
+                 "limit": {"type": "integer", "description": "Max files to show (default 50)"},
+             }, "required": []}),
+            ("get_file_url", get_file_url_handler,
+             "Generate a temporary download URL for a file in storage. "
+             "Give this link to the user so they can download the file.",
+             {"type": "object", "properties": {
+                 "storage_key": {"type": "string", "description": "Storage key of the file"},
+                 "expires_hours": {"type": "integer", "description": "URL validity in hours (default 1)"},
+             }, "required": ["storage_key"]}),
+            ("send_stored_file", send_stored_file_handler,
+             "Download a file from storage and send it to the user as an attachment "
+             "(works in Telegram and API chat). Use when user wants to receive a specific file.",
+             {"type": "object", "properties": {
+                 "storage_key": {"type": "string", "description": "Storage key of the file"},
+                 "caption": {"type": "string", "description": "Caption for the file (optional)"},
+             }, "required": ["storage_key"]}),
+            ("propose_cleanup", propose_cleanup_handler,
+             "Analyze storage for unused files and propose candidates for deletion. "
+             "IMPORTANT: Never delete files without showing the list to the user first and getting confirmation.",
+             {"type": "object", "properties": {
+                 "days_unused": {"type": "integer", "description": "Days since last access (default 30, min 7)"},
+             }, "required": []}),
+            ("confirm_cleanup", confirm_cleanup_handler,
+             "Delete files from storage. ONLY call this after the user explicitly confirmed "
+             "which files to delete from the propose_cleanup list.",
+             {"type": "object", "properties": {
+                 "storage_keys": {"type": "string", "description": "Comma-separated storage keys to delete"},
+             }, "required": ["storage_keys"]}),
+        ]
+        for name, handler, desc, schema in tools_defs:
+            self.tools._tools[name] = {
+                "name": name, "description": desc, "input_schema": schema,
+            }
+            self.tools._handlers[name] = handler
+
+    async def _auto_ingest_tool_file(self, block, user_id: str):
+        """Auto-upload files produced by download_file or write_file to S3."""
+        fm = self._file_manager
+        if not fm:
+            return
+        if not hasattr(block, 'name') or not isinstance(getattr(block, 'input', None), dict):
+            return
+        try:
+            if block.name == "download_file":
+                # download_file returns "Downloaded to: /path (N bytes)"
+                # The file is at the path in block.input
+                url = block.input.get("url", "")
+                filename = block.input.get("filename", "")
+                # Find the result — check tool_results which are already in messages
+                # Simpler: just find the file in downloads dir
+                import glob as _glob
+                downloads_dir = os.path.join(os.path.expanduser("~"), ".liteagent", "downloads")
+                if not filename:
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(url)
+                    filename = os.path.basename(parsed.path) or "download"
+                # Find most recent matching file
+                pattern = os.path.join(downloads_dir, f"*_{filename}")
+                matches = sorted(_glob.glob(pattern), key=os.path.getmtime, reverse=True)
+                if matches:
+                    await fm.ingest_local(
+                        matches[0], source="download", user_id=user_id,
+                        description=f"Downloaded from {url}")
+            elif block.name == "write_file":
+                path = block.input.get("path", "")
+                if path and os.path.exists(path):
+                    await fm.ingest_local(
+                        path, source="agent", user_id=user_id)
+        except Exception as e:
+            logger.debug("Auto-ingest failed for %s: %s", block.name, e)
+
+    async def ingest_file(self, data: bytes, filename: str, *,
+                          source: str = "unknown", user_id: str = "system",
+                          mime_type: str = "", description: str = "") -> dict | None:
+        """Public method for channels to auto-ingest files into S3."""
+        fm = self._file_manager
+        if not fm:
+            return None
+        try:
+            return await fm.ingest(
+                data, filename, source=source, user_id=user_id,
+                mime_type=mime_type, description=description)
+        except Exception as e:
+            logger.warning("File ingestion failed: %s", e)
+            return None
+
+    def enable_tasks(self, task_manager):
+        """Enable task scheduling tools. Called by main.py after TaskManager is created."""
+        self._task_manager = task_manager
+        self._wire_task_tools()
+
+    def _wire_task_tools(self):
+        """Register schedule_task, list_tasks, cancel_task tools for LLM use."""
+        import json as _json
+        import re as _re
+        from datetime import datetime as _dt, timedelta as _td
+        agent = self
+        tm = self._task_manager
+
+        def _parse_schedule(schedule: str) -> tuple[str | None, str | None]:
+            """Parse human-readable schedule into (run_at, cron_expr).
+
+            Returns exactly one of them set, the other None.
+            Supports Russian and English, relative and absolute times.
+            """
+            raw = schedule.strip()
+            s = raw.lower()
+
+            # ── Already valid 5-field cron ──
+            if _re.match(r'^[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+$', s):
+                return None, s
+
+            # ── Already ISO datetime ──
+            if _re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}', s):
+                return raw, None
+
+            now = _dt.now()
+
+            # ── Relative: "через N минут/часов" / "in N minutes/hours" ──
+            m = _re.search(r'(?:через|in|after)\s+(\d+)\s*(?:мин|min)', s)
+            if m:
+                dt = now + _td(minutes=int(m.group(1)))
+                return dt.isoformat(timespec='seconds'), None
+            m = _re.search(r'(?:через|in|after)\s+(\d+)\s*(?:час|hour|hr)', s)
+            if m:
+                dt = now + _td(hours=int(m.group(1)))
+                return dt.isoformat(timespec='seconds'), None
+            m = _re.search(r'(?:через|in|after)\s+(\d+)\s*(?:сек|sec)', s)
+            if m:
+                dt = now + _td(seconds=max(60, int(m.group(1))))
+                return dt.isoformat(timespec='seconds'), None
+
+            # ── Recurring: "каждый день/ежедневно/daily" ──
+            daily_rx = r'(?:каждый\s*день|ежедневно|daily|dayly|every\s*day)'
+            m = _re.search(daily_rx + r'(?:\s+(?:в|at))?\s+(\d{1,2})[:\.](\d{2})', s)
+            if m:
+                return None, f"{int(m.group(2))} {int(m.group(1))} * * *"
+            m = _re.search(daily_rx + r'(?:\s+(?:в|at))?\s+(\d{1,2})(?:\s|$)', s)
+            if m:
+                return None, f"0 {int(m.group(1))} * * *"
+            if _re.search(daily_rx, s):
+                # "каждый день" без времени → 9:00
+                return None, "0 9 * * *"
+
+            # ── Recurring: "каждые N минут/часов" / "every N min/hours" ──
+            m = _re.search(r'(?:каждые?|every)\s+(\d+)\s*(?:мин|min)', s)
+            if m:
+                return None, f"*/{m.group(1)} * * * *"
+            m = _re.search(r'(?:каждые?|every)\s+(\d+)\s*(?:час|hour|hr)', s)
+            if m:
+                return None, f"0 */{m.group(1)} * * *"
+            if _re.search(r'(?:каждую\s*минуту|every\s*min)', s):
+                return None, "* * * * *"
+            if _re.search(r'(?:каждый\s*час|every\s*hour)', s):
+                return None, "0 * * * *"
+
+            # ── Recurring: "по будням / weekdays" ──
+            m = _re.search(r'(?:по\s*будням|будни|weekdays?)(?:\s+(?:в|at))?\s+(\d{1,2})[:\.](\d{2})', s)
+            if m:
+                return None, f"{int(m.group(2))} {int(m.group(1))} * * 1-5"
+
+            # ── Recurring: "по понедельникам/вторникам..." ──
+            day_map = {
+                r'понедельник|monday|mon': '1', r'вторник|tuesday|tue': '2',
+                r'сред[аы]|wednesday|wed': '3', r'четверг|thursday|thu': '4',
+                r'пятниц[аы]|friday|fri': '5', r'суббот[аы]|saturday|sat': '6',
+                r'воскресень[еям]|sunday|sun': '0',
+            }
+            for pattern, dow in day_map.items():
+                m_day = _re.search(r'(?:по\s*|every\s*)?' + f'(?:{pattern})', s)
+                if m_day:
+                    m_time = _re.search(r'(?:в|at)?\s*(\d{1,2})[:\.](\d{2})', s)
+                    if m_time:
+                        return None, f"{int(m_time.group(2))} {int(m_time.group(1))} * * {dow}"
+                    return None, f"0 9 * * {dow}"
+
+            # ── One-shot: "завтра в HH:MM" / "tomorrow at HH:MM" ──
+            m = _re.search(r'(?:завтра|tomorrow)(?:\s+(?:в|at))?\s+(\d{1,2})[:\.](\d{2})', s)
+            if m:
+                dt = (now + _td(days=1)).replace(
+                    hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+                return dt.isoformat(timespec='seconds'), None
+            if _re.search(r'завтра|tomorrow', s):
+                dt = (now + _td(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                return dt.isoformat(timespec='seconds'), None
+
+            # ── One-shot: "сегодня в HH:MM" / "today at HH:MM" ──
+            m = _re.search(r'(?:сегодня|today)(?:\s+(?:в|at))?\s+(\d{1,2})[:\.](\d{2})', s)
+            if m:
+                dt = now.replace(
+                    hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+                if dt <= now:
+                    dt += _td(days=1)
+                return dt.isoformat(timespec='seconds'), None
+
+            # ── Bare "HH:MM" → one-shot today (or tomorrow if past) ──
+            m = _re.match(r'^(\d{1,2})[:\.](\d{2})$', s)
+            if m:
+                dt = now.replace(
+                    hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+                if dt <= now:
+                    dt += _td(days=1)
+                return dt.isoformat(timespec='seconds'), None
+
+            # ── Can't parse → return as-is in cron (will fail with clear error) ──
+            return None, s
+
+        async def schedule_task_handler(name: str, query: str,
+                                        schedule: str = "") -> str:
+            """Schedule a task. The schedule is parsed automatically.
+            name: Short task name (e.g. "Проверка погоды", "Напоминание")
+            query: What the agent should do when the task fires
+            schedule: When to run. Examples:
+              - "через 30 минут" / "in 30 minutes"
+              - "завтра в 9:00" / "tomorrow at 9:00"
+              - "каждый день в 8:00" / "daily at 8:00"
+              - "каждые 2 часа" / "every 2 hours"
+              - "по будням в 10:00" / "weekdays 10:00"
+              - "0 9 * * *" (raw cron)
+            """
+            if not schedule:
+                return "Error: schedule is required (e.g. 'через 30 минут', 'каждый день в 9:00')"
+
+            run_at, cron = _parse_schedule(schedule)
+            if not run_at and not cron:
+                return f"Error: could not parse schedule '{schedule}'"
+
+            task_type = "recurring" if cron else "one_shot"
+            uid = agent._current_user_id
+            chat_id = None
+            if uid.startswith("tg-"):
+                chat_id = getattr(agent, "_current_chat_id", None)
+            try:
+                task = tm.add_task(
+                    name=name, query=query, user_id=uid,
+                    task_type=task_type,
+                    run_at=run_at,
+                    cron_expr=cron,
+                    chat_id=str(chat_id) if chat_id else None,
+                )
+                return _json.dumps(task, ensure_ascii=False, default=str)
+            except Exception as e:
+                return f"Error creating task: {e}"
+
+        async def list_tasks_handler() -> str:
+            """List all your scheduled tasks."""
+            tasks = tm.list_tasks(user_id=agent._current_user_id)
+            if not tasks:
+                return "No tasks scheduled."
+            lines = []
+            for t in tasks:
+                schedule = t.get("cron_expr") or t.get("run_at") or "?"
+                lines.append(
+                    f"#{t['id']} [{t['status']}] {t['name']} "
+                    f"({t['task_type']}, {schedule})"
+                )
             return "\n".join(lines)
 
+        async def cancel_task_handler(task_id: int) -> str:
+            """Cancel a scheduled task by its ID.
+            task_id: The numeric ID of the task to cancel
+            """
+            ok = tm.cancel_task(int(task_id))
+            return "Task cancelled." if ok else "Task not found or already completed/cancelled."
+
         for name, handler, desc, schema in [
-            ("save_file", save_file_handler,
-             "Save a file to cloud storage (MinIO/S3). Use for persisting data, documents, exports.",
+            ("schedule_task", schedule_task_handler,
+             "Schedule a task for the user. Call this when the user wants to be reminded about something, "
+             "or wants something done at a specific time or on a recurring schedule. "
+             "The 'schedule' parameter accepts natural language in Russian or English: "
+             "'через 30 минут', 'завтра в 9:00', 'каждый день в 8:00', 'каждые 2 часа', "
+             "'по будням в 10:00', 'по понедельникам в 14:00', 'every 30 minutes', 'daily 9:00'. "
+             "Also accepts cron: '0 9 * * *'. "
+             "The 'query' is the instruction the agent will execute when the task fires.",
              {"type": "object", "properties": {
-                 "path": {"type": "string", "description": "File path/key in storage"},
-                 "content": {"type": "string", "description": "File content (text)"},
-             }, "required": ["path", "content"]}),
-            ("get_file", get_file_handler,
-             "Retrieve a file from cloud storage by its path/key.",
+                 "name": {"type": "string", "description": "Short task name (e.g. 'Проверка погоды')"},
+                 "query": {"type": "string", "description": "Instruction for the agent to execute when task fires"},
+                 "schedule": {"type": "string",
+                              "description": "When to run: 'через 30 минут', 'каждый день в 8:00', 'завтра в 9:00', 'daily 9:00', '0 9 * * *'"},
+             }, "required": ["name", "query", "schedule"]}),
+
+            ("list_tasks", list_tasks_handler,
+             "List all your scheduled and completed tasks with their IDs, statuses, and schedules.",
+             {"type": "object", "properties": {}}),
+
+            ("cancel_task", cancel_task_handler,
+             "Cancel a scheduled task by its numeric ID. Use list_tasks first to see IDs.",
              {"type": "object", "properties": {
-                 "path": {"type": "string", "description": "File path/key in storage"},
-             }, "required": ["path"]}),
-            ("list_storage", list_storage_handler,
-             "List files in cloud storage. Optionally filter by prefix.",
-             {"type": "object", "properties": {
-                 "prefix": {"type": "string", "description": "Filter by prefix (optional)"},
-             }, "required": []}),
+                 "task_id": {"type": "integer", "description": "Task ID to cancel"},
+             }, "required": ["task_id"]}),
         ]:
             self.tools._tools[name] = {
                 "name": name, "description": desc, "input_schema": schema,
             }
             self.tools._handlers[name] = handler
+
+        logger.info("Task scheduling tools registered (schedule_task, list_tasks, cancel_task)")
 
     def _init_file_access_tracking(self):
         """Initialize SQLite table for file access tracking (auto-ingestion)."""
@@ -737,6 +2019,8 @@ class LiteAgent:
             # Re-register builtin if missing
             if "transcribe_voice" not in self.tools._tools:
                 self._wire_voice_tool()
+            if "get_voice_settings" not in self.tools._tools:
+                self._wire_voice_config_tools()
             logger.info("Voice transcription: builtin (OpenAI Whisper)")
 
         elif mode == "mcp":
@@ -768,9 +2052,11 @@ class LiteAgent:
             del self.tools._tools[t]
             if t in self.tools._handlers:
                 del self.tools._handlers[t]
-        # Re-register builtin voice tool (may have been removed by previous mode)
+        # Re-register builtin voice tools (may have been removed by previous mode)
         if "transcribe_voice" not in self.tools._tools:
             self._wire_voice_tool()
+        if "get_voice_settings" not in self.tools._tools:
+            self._wire_voice_config_tools()
         self._mcp_loaded = False
         await self._ensure_mcp_loaded()
         logger.info("MCP servers reloaded: %d servers",
@@ -796,6 +2082,8 @@ class LiteAgent:
     async def _run_impl(self, user_input: str | list, user_id: str = "default") -> str:
         """Run agent on user input. Accepts str or list of content blocks (multimodal)."""
         self._current_user_id = user_id
+        from .file_queue import init_file_queue
+        init_file_queue()
         await self._ensure_mcp_loaded()
         self._ensure_onboarding_tool()
         # Load persisted history on first interaction
@@ -803,10 +2091,28 @@ class LiteAgent:
             self.memory.load_history(user_id)
 
         # Normalize multimodal input
+        _file_metas = []  # collected file/image metadata for memory
         if isinstance(user_input, list):
             text_for_memory = " ".join(
                 b.get("text", "") for b in user_input if b.get("type") == "text")
             content_for_api = user_input
+            # Collect file metadata from multimodal blocks
+            for block in user_input:
+                btype = block.get("type", "")
+                if btype == "image":
+                    src = block.get("source", {})
+                    _file_metas.append({"type": "image", "mime": src.get("media_type", "image/unknown")})
+                elif btype == "document":
+                    src = block.get("source", {})
+                    _file_metas.append({"type": "document", "mime": src.get("media_type", "application/octet-stream")})
+                elif btype == "text":
+                    txt = block.get("text", "")
+                    # Detect file markers from text wrappers
+                    import re as _re
+                    fm = _re.search(r'--- File:\s*(.+?)\s*(?:\(([^)]+)\))?\s*---', txt)
+                    if fm:
+                        _file_metas.append({"type": "file", "filename": fm.group(1),
+                                            "info": fm.group(2) or ""})
         else:
             text_for_memory = user_input
             content_for_api = user_input
@@ -836,13 +2142,21 @@ class LiteAgent:
         # Select model (cascade routing — may switch provider for cross-provider cascade)
         complexity_score = self._complexity_score(text_for_memory)
         model = self._model_for_score(complexity_score) if self.cascade_routing else self.default_model
+        _cascade_tier = self._tier_for_score(complexity_score) if self.cascade_routing else "fixed"
         _provider_switched = hasattr(self, '_original_provider')
-        logger.info("Model: %s | User: %s | Input: %d chars | Complexity: %d%s",
-                     model, user_id, len(text_for_memory), complexity_score,
+        logger.info("Model: %s | User: %s | Input: %d chars | Complexity: %d | Tier: %s%s",
+                     model, user_id, len(text_for_memory), complexity_score, _cascade_tier,
                      " [cross-provider]" if _provider_switched else "")
+        LiteAgent._record_cascade_decision(model, _cascade_tier, complexity_score)
 
         # Tool selection: skip tools for trivial messages (greetings, short chat)
-        if complexity_score <= 0 and len(text_for_memory) < 60:
+        # But always include tools from triggered skills (voice mode switching, etc.)
+        _triggered_skills = self.skill_registry.get_triggered_skills(text_for_memory)
+        _skill_tool_names = set()
+        for _sk in _triggered_skills:
+            _skill_tool_names.update(_sk.metadata.tools or [])
+
+        if complexity_score <= 0 and len(text_for_memory) < 60 and not _skill_tool_names:
             tool_defs = []
             logger.debug("Skipping tools for simple message")
         elif self.memory._embedder and len(self.tools._tools) > 8:
@@ -850,6 +2164,14 @@ class LiteAgent:
                 text_for_memory, top_k=8, embedder=self.memory._embedder)
         else:
             tool_defs = self.tools.get_definitions()
+
+        # Ensure triggered skill tools are always included in tool_defs
+        if _skill_tool_names:
+            existing_names = {td["name"] for td in tool_defs}
+            for _stn in _skill_tool_names:
+                if _stn not in existing_names and _stn in self.tools._tools:
+                    tool_defs.append(self.tools._tools[_stn])
+                    logger.debug("Added skill tool: %s", _stn)
 
         # Track tool calls for skill crystallization
         _tool_calls_log = []
@@ -863,7 +2185,9 @@ class LiteAgent:
         _req_id = await self._track_request_start(
             user_id,
             text_for_memory[:120] if isinstance(text_for_memory, str) else "multimodal",
-            model)
+            model,
+            complexity_score=complexity_score,
+            cascade_tier=_cascade_tier)
 
         # Agent loop
         try:
@@ -905,6 +2229,8 @@ class LiteAgent:
                                 file_path = block.input.get("path", "")
                                 if file_path:
                                     self.track_file_access(file_path, user_id)
+                            # Auto-upload downloaded files to S3
+                            await self._auto_ingest_tool_file(block, user_id)
                     # Collect tool result summaries for reflection
                     for tr in tool_results:
                         content = tr.get("content", "") if isinstance(tr, dict) else str(tr)
@@ -970,7 +2296,7 @@ class LiteAgent:
 
                     # Background: extract knowledge (non-blocking)
                     task = asyncio.create_task(
-                        self._safe_extract(text_for_memory, text, user_id)
+                        self._safe_extract(text_for_memory, text, user_id, file_meta=_file_metas)
                     )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
@@ -1019,6 +2345,8 @@ class LiteAgent:
             yield f"⚠️ Daily budget (${self.budget_daily:.2f}) reached."
             return
 
+        _file_metas = []  # no multimodal in stream path
+
         # Persist user message immediately (before streaming starts)
         self.memory.add_message(user_id, "user", user_input)
 
@@ -1027,19 +2355,33 @@ class LiteAgent:
         messages.append({"role": "user", "content": user_input})
         complexity_score = self._complexity_score(user_input)
         model = self._model_for_score(complexity_score) if self.cascade_routing else self.default_model
+        _cascade_tier = self._tier_for_score(complexity_score) if self.cascade_routing else "fixed"
         _provider_switched = hasattr(self, '_original_provider')
-        logger.info("Stream | Model: %s | User: %s | Complexity: %d%s",
-                     model, user_id, complexity_score,
+        logger.info("Stream | Model: %s | User: %s | Complexity: %d | Tier: %s%s",
+                     model, user_id, complexity_score, _cascade_tier,
                      " [cross-provider]" if _provider_switched else "")
+        LiteAgent._record_cascade_decision(model, _cascade_tier, complexity_score)
 
-        # Skip tools for trivial messages
-        if complexity_score <= 0 and len(user_input) < 60:
+        # Skip tools for trivial messages, but always include triggered skill tools
+        _triggered_skills = self.skill_registry.get_triggered_skills(user_input)
+        _skill_tool_names = set()
+        for _sk in _triggered_skills:
+            _skill_tool_names.update(_sk.metadata.tools or [])
+
+        if complexity_score <= 0 and len(user_input) < 60 and not _skill_tool_names:
             tool_defs = []
         elif self.memory._embedder and len(self.tools._tools) > 8:
             tool_defs = self.tools.get_relevant_definitions(
-                text_for_memory, top_k=8, embedder=self.memory._embedder)
+                user_input, top_k=8, embedder=self.memory._embedder)
         else:
             tool_defs = self.tools.get_definitions()
+
+        # Ensure triggered skill tools are always included
+        if _skill_tool_names:
+            existing_names = {td["name"] for td in tool_defs}
+            for _stn in _skill_tool_names:
+                if _stn not in existing_names and _stn in self.tools._tools:
+                    tool_defs.append(self.tools._tools[_stn])
 
         # Internal monologue: pre-planning (stream)
         _tool_calls_log = []
@@ -1048,7 +2390,10 @@ class LiteAgent:
             user_input, user_id, system_prompt, tool_defs, model)
 
         # Track in-flight request for dashboard
-        _req_id = await self._track_request_start(user_id, user_input[:120], model)
+        _req_id = await self._track_request_start(
+            user_id, user_input[:120], model,
+            complexity_score=complexity_score,
+            cascade_tier=_cascade_tier)
 
         full_text = ""
 
@@ -1163,7 +2508,7 @@ class LiteAgent:
                     if _provider_switched:
                         self._cascade_restore_provider()
 
-                    task = asyncio.create_task(self._safe_extract(user_input, full_text, user_id))
+                    task = asyncio.create_task(self._safe_extract(user_input, full_text, user_id, file_meta=_file_metas))
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
                     return
@@ -1357,13 +2702,22 @@ class LiteAgent:
         # Feature injections (dynamic, not cached)
         feature_section = self._build_feature_section(user_input, user_id)
 
+        # Skills catalog (static, cacheable — only name + description per skill)
+        skills_cfg = self.config.get("skills", {})
+        catalog = self.skill_registry.get_catalog_prompt(
+            max_chars=skills_cfg.get("max_catalog_chars", 5000))
+
         dynamic_text = memory_section + time_section + feature_section
 
         if self.prompt_caching:
+            # Soul + skills catalog → cached together (both static between requests)
+            cached_text = self._soul_prompt
+            if catalog:
+                cached_text += catalog
             blocks = [
                 {
                     "type": "text",
-                    "text": self._soul_prompt,
+                    "text": cached_text,
                     "cache_control": {"type": "ephemeral"},  # Static part cached
                 },
             ]
@@ -1374,7 +2728,7 @@ class LiteAgent:
                 })
             return blocks
         else:
-            return self._soul_prompt + dynamic_text
+            return self._soul_prompt + (catalog or "") + dynamic_text
 
     def _build_feature_section(self, user_input: str, user_id: str) -> str:
         """Build feature injections for system prompt."""
@@ -1412,6 +2766,14 @@ class LiteAgent:
             skill_text = format_skill_suggestion(skills)
             if skill_text:
                 parts.append(skill_text)
+
+        # Skill system — inject triggered skill bodies (progressive disclosure)
+        skills_cfg = self.config.get("skills", {})
+        triggered = self.skill_registry.get_triggered_prompt(
+            user_input,
+            max_chars=skills_cfg.get("max_triggered_chars", 10000))
+        if triggered:
+            parts.append("\n\n" + triggered)
 
         return "".join(parts)
 
@@ -1624,7 +2986,7 @@ class LiteAgent:
                 return fallback
 
         # Cross-provider cascade: 'provider:model' format
-        if ":" in candidate and candidate.split(":")[0] in ("anthropic", "openai", "gemini", "ollama"):
+        if ":" in candidate and candidate.split(":")[0] in ("anthropic", "openai", "gemini", "ollama", "qwen", "grok"):
             parts = candidate.split(":", 1)
             target_provider = parts[0]
             target_model = parts[1]
@@ -1676,6 +3038,48 @@ class LiteAgent:
     def _select_model(self, user_input: str) -> str:
         """Route to Haiku/Sonnet/Opus based on query complexity."""
         return self._model_for_score(self._complexity_score(user_input))
+
+    @staticmethod
+    def _tier_for_score(score: int) -> str:
+        """Map complexity score to cascade tier name."""
+        if score >= 3:
+            return "complex"
+        elif score >= 1:
+            return "medium"
+        return "simple"
+
+    @classmethod
+    def _record_cascade_decision(cls, model: str, tier: str, score: int):
+        """Record a cascade routing decision for dashboard visualization."""
+        cls._cascade_history.append({
+            "model": model,
+            "tier": tier,
+            "score": score,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        if len(cls._cascade_history) > cls._CASCADE_HISTORY_MAX:
+            cls._cascade_history = cls._cascade_history[-cls._CASCADE_HISTORY_MAX:]
+
+    @classmethod
+    def get_cascade_history(cls) -> list:
+        """Return recent cascade decisions for dashboard."""
+        return list(cls._cascade_history)
+
+    @classmethod
+    def get_cascade_summary(cls) -> dict:
+        """Aggregate cascade stats for today."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_decisions = [d for d in cls._cascade_history if d["timestamp"].startswith(today)]
+        tier_counts = {"simple": 0, "medium": 0, "complex": 0}
+        for d in today_decisions:
+            t = d.get("tier", "medium")
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        last = cls._cascade_history[-1] if cls._cascade_history else None
+        return {
+            "tier_counts": tier_counts,
+            "total_decisions": len(today_decisions),
+            "last_decision": last,
+        }
 
     # ══════════════════════════════════════════
     # HELPERS
@@ -1782,10 +3186,12 @@ class LiteAgent:
                                 response.usage, cost)
         return self._extract_text(response)
 
-    async def _safe_extract(self, user_input: str, response: str, user_id: str):
+    async def _safe_extract(self, user_input: str, response: str, user_id: str,
+                            file_meta: list | None = None):
         """Safe wrapper for knowledge extraction — never crashes."""
         try:
-            await self.memory.extract_and_learn(user_input, response, user_id)
+            await self.memory.extract_and_learn(user_input, response, user_id,
+                                                file_meta=file_meta)
         except Exception as e:
             logger.warning("Knowledge extraction failed: %s", e)
 

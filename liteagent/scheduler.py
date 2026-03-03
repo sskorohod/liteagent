@@ -365,4 +365,40 @@ def setup_scheduler(agent, config: dict) -> Scheduler | None:
             reaper_job,
             max_runtime_sec=60)
 
+    # Night Worker — overnight KB enrichment
+    nw_cfg = config.get("night_worker", {})
+    if nw_cfg.get("enabled", False):
+        cron_expr = nw_cfg.get("cron", "0 22 * * *")
+
+        async def _night_worker_handler():
+            try:
+                from .night_worker import NightWorker
+                from .providers import OllamaProvider
+
+                kb = getattr(agent, '_knowledge_base', None)
+                if not kb:
+                    logger.info("Night worker: no knowledge base configured")
+                    return
+
+                # Create Ollama provider for free processing
+                model = nw_cfg.get("model", "qwen2.5:latest")
+                ollama_cfg = config.get("providers", {}).get("ollama", {})
+                base_url = ollama_cfg.get("base_url", "http://localhost:11434")
+                provider = OllamaProvider({"base_url": base_url}, default_model=model)
+
+                embedder = getattr(kb, '_embedder', None)
+                worker = NightWorker(nw_cfg, kb.db, provider=provider, embedder=embedder)
+                result = await worker.run()
+                logger.info("Night worker completed: %s", result)
+            except Exception as e:
+                logger.error("Night worker failed: %s", e)
+
+        scheduler.add_job(
+            name="night_worker",
+            cron_expr=cron_expr,
+            handler=_night_worker_handler,
+            max_runtime_sec=nw_cfg.get("max_runtime_sec", 600),
+        )
+        logger.info("Night worker scheduled: %s", cron_expr)
+
     return scheduler

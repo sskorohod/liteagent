@@ -70,6 +70,19 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "gemini-2.0-flash":           {"input": 0.10, "output": 0.40, "cache_read": 0.0},
     "gemini-2.5-pro":             {"input": 1.25, "output": 10.00, "cache_read": 0.0},
     "gemini-2.5-flash":           {"input": 0.15, "output": 0.60, "cache_read": 0.0},
+    # Qwen / DashScope (Alibaba Cloud)
+    "qwen-turbo":                 {"input": 0.30, "output": 0.60, "cache_read": 0.0},
+    "qwen-plus":                  {"input": 0.80, "output": 2.00, "cache_read": 0.0},
+    "qwen-max":                   {"input": 2.00, "output": 6.00, "cache_read": 0.0},
+    "qwen-vl-plus":               {"input": 0.80, "output": 2.00, "cache_read": 0.0},
+    "qwen-vl-max":                {"input": 2.00, "output": 6.00, "cache_read": 0.0},
+    "qwen-long":                  {"input": 0.50, "output": 2.00, "cache_read": 0.0},
+    # Grok / xAI
+    "grok-3":                     {"input": 3.00, "output": 15.00, "cache_read": 0.0},
+    "grok-3-mini":                {"input": 0.30, "output": 0.50, "cache_read": 0.0},
+    "grok-4-0709":                {"input": 3.00, "output": 15.00, "cache_read": 0.0},
+    "grok-3-fast":                {"input": 5.00, "output": 25.00, "cache_read": 0.0},
+    "grok-3-mini-fast":           {"input": 0.60, "output": 4.00, "cache_read": 0.0},
     # Ollama (local, free)
     "ollama/*":                   {"input": 0.0, "output": 0.0, "cache_read": 0.0},
 }
@@ -171,7 +184,9 @@ class OpenAIProvider:
         self._last_stream_response: LLMResponse | None = None
 
     def supports_model(self, model: str) -> bool:
-        return model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3")
+        return (model.startswith("gpt-") or model.startswith("o1")
+                or model.startswith("o3") or model.startswith("qwen")
+                or model.startswith("grok"))
 
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
@@ -650,6 +665,14 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "gemini": [
         "gemini-2.0-flash", "gemini-2.5-pro", "gemini-2.5-flash",
     ],
+    "qwen": [
+        "qwen-turbo", "qwen-plus", "qwen-max",
+        "qwen-vl-plus", "qwen-vl-max", "qwen-long",
+    ],
+    "grok": [
+        "grok-3", "grok-3-mini", "grok-4-0709",
+        "grok-3-fast", "grok-3-mini-fast",
+    ],
     "ollama": [],  # Populated dynamically by discover_ollama_models()
 }
 
@@ -708,6 +731,14 @@ def create_test_provider(provider_name: str, api_key: str, base_url: str | None 
             return AnthropicProvider()
         elif provider_name == "openai":
             return OpenAIProvider(base_url=base_url)
+        elif provider_name == "qwen":
+            return OpenAIProvider(
+                base_url=base_url or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                api_key_env="DASHSCOPE_API_KEY")
+        elif provider_name == "grok":
+            return OpenAIProvider(
+                base_url=base_url or "https://api.x.ai/v1",
+                api_key_env="XAI_API_KEY")
         elif provider_name == "ollama":
             return OllamaProvider(base_url=base_url or "http://localhost:11434/v1")
         elif provider_name == "gemini":
@@ -784,6 +815,18 @@ def create_provider(config: dict):
         refresh_ollama_models(api_base)
         return OllamaProvider(base_url=base)
 
+    elif provider_name == "qwen":
+        pcfg = providers_cfg.get("qwen", {})
+        return OpenAIProvider(
+            base_url=pcfg.get("base_url", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+            api_key_env=pcfg.get("api_key_env", "DASHSCOPE_API_KEY"))
+
+    elif provider_name == "grok":
+        pcfg = providers_cfg.get("grok", {})
+        return OpenAIProvider(
+            base_url=pcfg.get("base_url", "https://api.x.ai/v1"),
+            api_key_env=pcfg.get("api_key_env", "XAI_API_KEY"))
+
     elif provider_name == "gemini":
         pcfg = providers_cfg.get("gemini", {})
         return GeminiProvider(
@@ -791,7 +834,7 @@ def create_provider(config: dict):
 
     else:
         raise ValueError(f"Unknown provider: {provider_name}. "
-                         f"Supported: anthropic, openai, ollama, gemini")
+                         f"Supported: anthropic, openai, grok, qwen, ollama, gemini")
 
 
 def _find_fallback_provider(current: str, config: dict):
@@ -802,6 +845,8 @@ def _find_fallback_provider(current: str, config: dict):
     fallback_order = [
         ("anthropic", "claude-sonnet-4-20250514"),
         ("openai", "gpt-4o-mini"),
+        ("grok", "grok-3-mini"),
+        ("qwen", "qwen-plus"),
         ("gemini", "gemini-2.0-flash"),
     ]
     for name, default_model in fallback_order:

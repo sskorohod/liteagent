@@ -117,6 +117,19 @@ def main():
     if scheduler:
         agent._scheduler = scheduler  # Expose for dashboard API
 
+    # Setup user tasks (persistent scheduled tasks)
+    from .tasks import TaskManager, setup_task_checker
+    task_manager = TaskManager(agent.memory.db)
+    agent.enable_tasks(task_manager)
+    if scheduler:
+        setup_task_checker(scheduler, agent, task_manager)
+    else:
+        # Tasks need a scheduler — create a minimal one
+        from .scheduler import Scheduler
+        scheduler = Scheduler()
+        setup_task_checker(scheduler, agent, task_manager)
+        agent._scheduler = scheduler
+
     # Health monitor (exposed for dashboard + scheduler integration)
     from .health import HealthMonitor
     health_monitor = HealthMonitor(config)
@@ -183,11 +196,13 @@ def main():
                     tg_cfg["token"] = get_api_key("telegram") or ""
 
                 async def _run_api_with_telegram():
-                    """Run API server and Telegram bot concurrently."""
+                    """Run API server first, then start Telegram bot via HTTP proxy."""
                     import uvicorn
                     from .channels.api import create_app
-                    from .channels.telegram import (_make_message_handler,
-                                                    _make_voice_handler, _parse_chat_ids)
+                    from .channels.telegram import (
+                        TelegramAPIClient, _parse_chat_ids,
+                        _register_all_handlers, _set_bot_commands,
+                    )
 
                     # Start scheduler
                     if scheduler:
@@ -201,33 +216,35 @@ def main():
                         watcher = ConfigWatcher(config_path, agent, scheduler)
                         watcher.start()
 
-                    # Start Telegram bot
-                    tg_app = None
-                    try:
-                        from telegram.ext import Application, MessageHandler, filters
-                        token = tg_cfg.get("token")
-                        print(f"[Jess] Telegram token present: {bool(token)}", flush=True)
-                        if token:
-                            allowed_chat_ids = _parse_chat_ids(tg_cfg)
-                            tg_app = Application.builder().token(token).build()
-                            handler = _make_message_handler(agent, allowed_chat_ids)
-                            tg_app.add_handler(
-                                MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
-                            if tg_cfg.get("voice_enabled", True):
-                                voice_handler = _make_voice_handler(
-                                    agent, allowed_chat_ids, tg_cfg)
-                                tg_app.add_handler(
-                                    MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
-                                print("[Jess] Voice handler registered (Whisper)")
-                            await tg_app.initialize()
-                            await tg_app.updater.start_polling(drop_pending_updates=True)
-                            await tg_app.start()
-                            print("[Jess] Telegram bot running alongside API server!")
-                    except Exception as e:
-                        import traceback, sys
-                        print(f"[ERROR] Telegram bot failed: {e}", flush=True)
-                        traceback.print_exc(file=sys.stdout)
-                        sys.stdout.flush()
+                    # Create and start API server FIRST
+                    app = create_app(agent)
+                    host = api_cfg.get("host", "127.0.0.1")
+                    port = api_cfg.get("port", 8080)
+
+                    uvi_config = uvicorn.Config(app, host=host, port=port)
+                    server = uvicorn.Server(uvi_config)
+                    server_task = asyncio.create_task(server.serve())
+
+                    # Wait for API to be ready
+                    api_host = "127.0.0.1" if host == "0.0.0.0" else host
+                    internal_token = getattr(app.state, 'internal_token', '')
+                    api_client = TelegramAPIClient(
+                        f"http://{api_host}:{port}", internal_token)
+
+                    for _ in range(30):
+                        if await api_client.health_check():
+                            break
+                        await asyncio.sleep(0.5)
+                    else:
+                        print("[ERROR] API server failed to start within 15s", flush=True)
+
+                    # Auto-open dashboard in browser
+                    import webbrowser
+                    import threading
+                    open_host = "localhost" if host == "0.0.0.0" else host
+                    dashboard_url = f"http://{open_host}:{port}"
+                    print(f"\n   Dashboard: {dashboard_url}\n")
+                    threading.Timer(1.5, webbrowser.open, args=[dashboard_url]).start()
 
                     # Boot checks (proactive startup tasks)
                     from .boot import run_boot_checks
@@ -240,24 +257,38 @@ def main():
                         logging.getLogger("liteagent.boot").warning(
                             "Boot checks failed: %s", e)
 
-                    # Start API server
-                    app = create_app(agent)
-                    host = api_cfg.get("host", "127.0.0.1")
-                    port = api_cfg.get("port", 8080)
-
-                    # Auto-open dashboard in browser
-                    import webbrowser
-                    import threading
-                    open_host = "localhost" if host == "0.0.0.0" else host
-                    dashboard_url = f"http://{open_host}:{port}"
-                    print(f"\n   Dashboard: {dashboard_url}\n")
-                    threading.Timer(1.5, webbrowser.open, args=[dashboard_url]).start()
-
-                    uvi_config = uvicorn.Config(app, host=host, port=port)
-                    server = uvicorn.Server(uvi_config)
+                    # Start Telegram bot via HTTP proxy to API
+                    tg_app = None
                     try:
-                        await server.serve()
+                        from telegram.ext import Application
+                        token = tg_cfg.get("token")
+                        print(f"[Jess] Telegram token present: {bool(token)}", flush=True)
+                        if token:
+                            allowed_chat_ids = _parse_chat_ids(tg_cfg)
+                            tg_app = Application.builder().token(token).build()
+                            _register_all_handlers(
+                                tg_app, api_client, allowed_chat_ids, tg_cfg)
+
+                            await tg_app.initialize()
+                            await tg_app.updater.start_polling(drop_pending_updates=True)
+                            await tg_app.start()
+                            agent._telegram_app = tg_app
+
+                            has_rag = hasattr(agent, '_rag') and agent._rag is not None
+                            await _set_bot_commands(tg_app.bot, has_rag=has_rag)
+
+                            print("[Jess] Telegram bot running via API proxy!")
+                    except Exception as e:
+                        import traceback, sys
+                        print(f"[ERROR] Telegram bot failed: {e}", flush=True)
+                        traceback.print_exc(file=sys.stdout)
+                        sys.stdout.flush()
+
+                    # Wait for server to complete (blocks until shutdown)
+                    try:
+                        await server_task
                     finally:
+                        await api_client.close()
                         if watcher:
                             watcher.stop()
                         if tg_app:

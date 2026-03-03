@@ -313,6 +313,10 @@ class ToolRegistry:
         self._mcp_id_counter = 0
 
         for name, server_cfg in mcp_config.items():
+            if not server_cfg.get("enabled", True):
+                logger.info("MCP server '%s' is disabled, skipping", name)
+                continue
+
             url = server_cfg.get("url")
             command = server_cfg.get("command")
 
@@ -703,3 +707,53 @@ def register_builtin_tools(registry: ToolRegistry, enabled: list[str] | None = N
             """query: What to search for in memory"""
             # Will be connected to MemorySystem in agent.py
             return f"[Memory search stub for: {query}]"
+
+    if "download_file" in enabled:
+        @registry.tool(name="download_file",
+                       description="Download a file from a URL and save it locally. Returns the local file path. Use this when you need to fetch files from the internet.")
+        def download_file(url: str, filename: str = "") -> str:
+            """url: URL to download from
+            filename: Optional filename (auto-detected from URL if empty)"""
+            import urllib.request
+            import urllib.parse
+
+            downloads_dir = os.path.join(os.path.expanduser("~"), ".liteagent", "downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+
+            if not filename:
+                parsed = urllib.parse.urlparse(url)
+                filename = os.path.basename(parsed.path) or "download"
+
+            import uuid as _uuid
+            dest = os.path.join(downloads_dir, f"{_uuid.uuid4().hex[:8]}_{filename}")
+
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "LiteAgent/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = resp.read(50 * 1024 * 1024 + 1)  # 50MB limit
+                    if len(data) > 50 * 1024 * 1024:
+                        return "Error: file too large (>50MB)"
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                return f"Downloaded to: {dest} ({len(data)} bytes)"
+            except Exception as e:
+                return f"Download error: {e}"
+
+    if "send_file_to_user" in enabled:
+        @registry.tool(name="send_file_to_user",
+                       description="Queue a file to be sent to the user alongside your text response. "
+                                   "The file will be delivered as an attachment (e.g. in Telegram as a document/photo). "
+                                   "The file must exist on the local filesystem.")
+        def send_file_to_user(file_path: str, caption: str = "") -> str:
+            """file_path: Path to the local file to send
+            caption: Optional caption for the file"""
+            from .file_queue import enqueue_file
+
+            resolved = os.path.realpath(os.path.expanduser(file_path))
+            if not os.path.exists(resolved):
+                return f"Error: file not found: {file_path}"
+            if not os.path.isfile(resolved):
+                return f"Error: not a file: {file_path}"
+
+            enqueue_file(resolved, caption=caption)
+            return f"File queued for delivery: {os.path.basename(resolved)}"

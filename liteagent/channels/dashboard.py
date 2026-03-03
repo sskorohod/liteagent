@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -11,12 +12,113 @@ logger = logging.getLogger(__name__)
 DASHBOARD_USER = "dashboard-user"
 CUSTOM_TOOLS_DIR = Path.home() / ".liteagent" / "custom_tools"
 
+_FILE_BROWSER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Files — LiteAgent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{font-family:Inter,system-ui,sans-serif}
+.file-row:hover{background:#f8fafc}</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+<div class="max-w-5xl mx-auto px-4 py-8">
+  <div class="flex items-center justify-between mb-6">
+    <h1 class="text-2xl font-bold text-gray-800">File Storage</h1>
+    <div class="flex gap-3 items-center">
+      <input id="searchInput" type="text" placeholder="Search files..."
+        class="px-3 py-2 border rounded-lg text-sm w-64 focus:ring-2 focus:ring-blue-400 outline-none">
+      <select id="sourceFilter" class="px-3 py-2 border rounded-lg text-sm bg-white">
+        <option value="">All sources</option>
+        <option value="telegram">Telegram</option>
+        <option value="api">API / Chat</option>
+        <option value="voice">Voice</option>
+        <option value="download">Downloads</option>
+        <option value="agent">Agent</option>
+      </select>
+      <span id="fileCount" class="text-sm text-gray-500"></span>
+    </div>
+  </div>
+  <div id="fileList" class="bg-white rounded-xl shadow-sm border divide-y"></div>
+  <div id="emptyState" class="hidden text-center py-16 text-gray-400">
+    <p class="text-lg">No files yet</p>
+    <p class="text-sm mt-1">Files uploaded via Telegram, chat, or API will appear here</p>
+  </div>
+</div>
+<script>
+const API = window.location.origin;
+let allFiles = [];
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+function sourceIcon(s) {
+  const m = {telegram:'💬',api:'🌐',voice:'🎙',download:'⬇️',agent:'🤖'};
+  return m[s] || '📁';
+}
+
+function renderFiles(files) {
+  const el = document.getElementById('fileList');
+  const empty = document.getElementById('emptyState');
+  if (!files.length) { el.innerHTML=''; empty.classList.remove('hidden'); return; }
+  empty.classList.add('hidden');
+  el.innerHTML = files.map(f => `
+    <div class="file-row flex items-center px-4 py-3 gap-3 cursor-pointer"
+         onclick="downloadFile('${f.storage_key}')">
+      <span class="text-xl">${sourceIcon(f.source)}</span>
+      <div class="flex-1 min-w-0">
+        <div class="font-medium text-gray-800 truncate">${f.original_name}</div>
+        <div class="text-xs text-gray-400 truncate">${f.description||''}</div>
+      </div>
+      <div class="text-right shrink-0">
+        <div class="text-sm text-gray-600">${formatSize(f.size_bytes)}</div>
+        <div class="text-xs text-gray-400">${(f.created_at||'').slice(0,10)}</div>
+      </div>
+      <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">${f.source}</span>
+    </div>`).join('');
+}
+
+async function downloadFile(key) {
+  const resp = await fetch(API+'/api/files/url/'+key);
+  const data = await resp.json();
+  if (data.url) window.open(data.url, '_blank');
+}
+
+async function loadFiles() {
+  const source = document.getElementById('sourceFilter').value;
+  const params = new URLSearchParams({limit:'500'});
+  if (source) params.set('source', source);
+  const resp = await fetch(API+'/api/files?'+params);
+  allFiles = await resp.json();
+  document.getElementById('fileCount').textContent = allFiles.length+' files';
+  filterAndRender();
+}
+
+function filterAndRender() {
+  const q = document.getElementById('searchInput').value.toLowerCase();
+  const filtered = q
+    ? allFiles.filter(f => (f.original_name+' '+f.description).toLowerCase().includes(q))
+    : allFiles;
+  renderFiles(filtered);
+}
+
+document.getElementById('searchInput').addEventListener('input', filterAndRender);
+document.getElementById('sourceFilter').addEventListener('change', loadFiles);
+loadFiles();
+</script>
+</body>
+</html>
+"""
+
 
 def mount_dashboard(app, agent):
     """Mount dashboard API routes onto FastAPI app."""
     try:
         from fastapi import HTTPException
-        from fastapi.responses import HTMLResponse, FileResponse, Response
+        from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
     except ImportError:
         raise ImportError("FastAPI is required: pip install liteagent[api]")
 
@@ -51,10 +153,65 @@ def mount_dashboard(app, agent):
             "tools_count": len(agent.tools.get_definitions()),
         }
 
+    @app.get("/api/overview/enhanced")
+    async def api_overview_enhanced():
+        """Consolidated overview data for redesigned dashboard."""
+        mem = agent.memory
+        usage = mem.get_total_usage_stats()
+        today = mem.get_today_stats()
+        yesterday = mem.get_yesterday_stats()
+
+        kpi = {
+            "total_calls": usage["total_calls"],
+            "total_cost_usd": usage["total_cost_usd"],
+            "total_tokens": usage["total_input_tokens"] + usage["total_output_tokens"],
+            "memory_count": mem.get_memory_count(),
+            "today_cost_usd": round(mem.get_today_cost(), 4),
+            "today_calls": today["calls"],
+            "tools_count": len(agent.tools.get_definitions()),
+            "success_rate": mem.get_success_rate(24),
+            "avg_confidence": mem.get_avg_confidence(24),
+            "cache_efficiency": mem.get_cache_efficiency(),
+            "yesterday_cost_usd": round(yesterday["cost"], 4),
+            "yesterday_calls": yesterday["calls"],
+        }
+
+        # Composite health status
+        budget_pct = round(today["cost"] / agent.budget_daily * 100, 1) if agent.budget_daily > 0 else 0
+        error_rate = 100 - kpi["success_rate"]
+        health_status = "healthy"
+        if error_rate > 20 or budget_pct > 90:
+            health_status = "down"
+        elif error_rate > 10 or budget_pct > 70:
+            health_status = "degraded"
+
+        return {
+            "kpi": kpi,
+            "health": {
+                "status": health_status,
+                "error_rate_24h": round(error_rate, 1),
+                "budget_pct": budget_pct,
+            },
+            "model_distribution": mem.get_model_distribution_today(),
+        }
+
     @app.get("/api/usage")
     async def api_usage(days: int = 7):
-        """Usage breakdown by model."""
-        return agent.memory.get_usage_summary(days)
+        """Usage breakdown by model with KPI stats."""
+        mem = agent.memory
+        total = mem.get_total_usage_stats()
+        today = mem.get_today_stats()
+        hour = mem.get_hour_cost()
+        return {
+            "models": mem.get_usage_summary(days),
+            "today_cost": round(today["cost"], 4),
+            "today_calls": today["calls"],
+            "hour_cost": round(hour["cost"], 4),
+            "hour_calls": hour["calls"],
+            "total_cost": round(total["total_cost_usd"], 4),
+            "total_calls": total["total_calls"],
+            "total_tokens": total["total_input_tokens"] + total["total_output_tokens"],
+        }
 
     @app.get("/api/usage/daily")
     async def api_usage_daily(days: int = 14):
@@ -194,6 +351,7 @@ def mount_dashboard(app, agent):
         _SECRET_DISPLAY_PATHS = [
             ("providers", "anthropic", "api_key"),
             ("providers", "openai", "api_key"),
+            ("providers", "grok", "api_key"),
             ("providers", "gemini", "api_key"),
             ("channels", "telegram", "token"),
             ("tools", "brave_api_key"),
@@ -208,6 +366,70 @@ def mount_dashboard(app, agent):
             if isinstance(obj, dict) and key_path[-1] in obj:
                 obj[key_path[-1]] = "***"
         return cfg
+
+    @app.post("/api/config")
+    async def api_config_save(body: dict):
+        """Save full config JSON from the dashboard editor.
+
+        Secrets shown as '***' in the editor are preserved from the
+        current running config so they are never accidentally wiped.
+        """
+        import copy
+        from ..config import save_config as _save_config
+
+        _SECRET_MERGE_PATHS = [
+            ("providers", "anthropic", "api_key"),
+            ("providers", "openai", "api_key"),
+            ("providers", "grok", "api_key"),
+            ("providers", "gemini", "api_key"),
+            ("channels", "telegram", "token"),
+            ("tools", "brave_api_key"),
+            ("storage", "access_key"),
+            ("storage", "secret_key"),
+            ("rag", "qdrant", "api_key"),
+        ]
+
+        # Deep-copy incoming to avoid mutation
+        new_cfg = copy.deepcopy(body)
+
+        # Preserve secrets: if value is "***", restore from current config
+        for key_path in _SECRET_MERGE_PATHS:
+            # Navigate new config
+            new_obj = new_cfg
+            for k in key_path[:-1]:
+                new_obj = new_obj.get(k, {}) if isinstance(new_obj, dict) else {}
+            # Navigate current config
+            cur_obj = agent.config
+            for k in key_path[:-1]:
+                cur_obj = cur_obj.get(k, {}) if isinstance(cur_obj, dict) else {}
+            final_key = key_path[-1]
+            if isinstance(new_obj, dict) and new_obj.get(final_key) == "***":
+                if isinstance(cur_obj, dict) and final_key in cur_obj:
+                    new_obj[final_key] = cur_obj[final_key]
+
+        # Preserve internal keys from current config
+        for k, v in agent.config.items():
+            if k.startswith("_") and k not in new_cfg:
+                new_cfg[k] = v
+
+        # Apply to running agent config
+        agent.config.update(new_cfg)
+
+        # Save to disk
+        try:
+            _save_config(agent.config)
+        except Exception as exc:
+            raise HTTPException(500, f"Failed to save config: {exc}")
+
+        # Trigger runtime config update if watcher exists
+        watcher = getattr(app.state, "config_watcher", None)
+        if watcher:
+            try:
+                await watcher.force_reload()
+            except Exception:
+                pass  # Non-critical
+
+        return {"ok": True}
 
     @app.get("/api/history")
     async def api_history():
@@ -230,7 +452,8 @@ def mount_dashboard(app, agent):
         if format == "csv":
             output = io.StringIO()
             writer = csv.DictWriter(output,
-                fieldnames=["id", "user_id", "content", "type", "importance", "created_at"])
+                fieldnames=["id", "user_id", "content", "type", "importance", "created_at"],
+                extrasaction="ignore")
             writer.writeheader()
             writer.writerows(memories)
             return Response(content=output.getvalue(), media_type="text/csv",
@@ -420,16 +643,54 @@ def mount_dashboard(app, agent):
             "active_request_count": len(LiteAgent._active_requests),
         }
 
+    # ── Cascade routing monitor ────────────────
+
+    @app.get("/api/ops/cascade")
+    async def api_ops_cascade():
+        """Cascade routing status, tier costs, and recent history."""
+        from ..agent import LiteAgent
+        from ..providers import get_pricing
+
+        summary = LiteAgent.get_cascade_summary()
+        history = LiteAgent.get_cascade_history()[-20:]
+
+        # Cost per tier
+        tier_costs = {}
+        for tier_name in ("simple", "medium", "complex"):
+            model_name = agent.models.get(tier_name, agent.default_model)
+            lookup = model_name
+            if ":" in model_name and model_name.split(":")[0] in (
+                "anthropic", "openai", "gemini", "ollama"
+            ):
+                lookup = model_name.split(":", 1)[1]
+            pricing = get_pricing(lookup)
+            tier_costs[tier_name] = {
+                "model": model_name,
+                "input_per_mtok": pricing.get("input", 0),
+                "output_per_mtok": pricing.get("output", 0),
+            }
+
+        return {
+            "enabled": agent.cascade_routing,
+            "models": agent.models,
+            "default_model": agent.default_model,
+            "tier_costs": tier_costs,
+            "summary": summary,
+            "history": history,
+            "is_local_only_now": agent._is_local_only_hours(),
+        }
+
     # ── Feature monitoring ────────────────────
 
     @app.get("/api/features/status")
     async def api_features_status():
-        """Status of all 8 metacognition/evolution/synthesis features."""
+        """Status of all 9 metacognition/evolution/synthesis features."""
         features = agent.config.get("features", {})
         feature_names = [
             "dream_cycle", "self_evolving_prompt", "proactive_agent",
             "auto_tool_synthesis", "confidence_gate", "style_adaptation",
             "skill_crystallization", "counterfactual_replay",
+            "internal_monologue",
         ]
         status = {}
         for name in feature_names:
@@ -455,6 +716,61 @@ def mount_dashboard(app, agent):
         except Exception:
             pass  # Tables may not exist in older DBs
         return status
+
+    @app.post("/api/features/toggle")
+    async def api_features_toggle(body: dict):
+        """Toggle a single feature on/off. Body: {name: str, enabled: bool}."""
+        from ..config import save_config
+
+        ALL_FEATURES = [
+            "dream_cycle", "self_evolving_prompt", "proactive_agent",
+            "auto_tool_synthesis", "confidence_gate", "style_adaptation",
+            "skill_crystallization", "counterfactual_replay",
+            "internal_monologue",
+        ]
+        name = body.get("name", "")
+        if name not in ALL_FEATURES:
+            return {"ok": False, "error": f"Unknown feature: {name}"}
+
+        enabled = bool(body.get("enabled", False))
+        features = agent.config.setdefault("features", {})
+        feat_cfg = features.setdefault(name, {})
+        feat_cfg["enabled"] = enabled
+
+        save_config(agent.config)
+        logger.info("Feature toggled: %s = %s", name, enabled)
+        return {"ok": True, "name": name, "enabled": enabled}
+
+    @app.post("/api/features/preset")
+    async def api_features_preset(body: dict):
+        """Apply a feature preset. Body: {preset: "basic"|"all"|"none"}."""
+        from ..config import save_config
+
+        PRESETS = {
+            "basic": ["style_adaptation", "confidence_gate", "skill_crystallization"],
+            "all": [
+                "dream_cycle", "self_evolving_prompt", "proactive_agent",
+                "auto_tool_synthesis", "confidence_gate", "style_adaptation",
+                "skill_crystallization", "counterfactual_replay",
+                "internal_monologue",
+            ],
+            "none": [],
+        }
+        ALL_FEATURES = PRESETS["all"]
+
+        preset = body.get("preset", "")
+        if preset not in PRESETS:
+            return {"ok": False, "error": f"Unknown preset: {preset}"}
+
+        enabled_list = PRESETS[preset]
+        features = agent.config.setdefault("features", {})
+        for name in ALL_FEATURES:
+            feat_cfg = features.setdefault(name, {})
+            feat_cfg["enabled"] = name in enabled_list
+
+        save_config(agent.config)
+        logger.info("Features preset applied: %s", preset)
+        return {"ok": True, "preset": preset, "enabled": enabled_list}
 
     @app.get("/api/features/patches")
     async def api_prompt_patches():
@@ -564,6 +880,8 @@ def mount_dashboard(app, agent):
         _KEY_PREFIXES = {
             "anthropic": ("sk-ant-", "Anthropic keys start with 'sk-ant-'. Get yours at console.anthropic.com/settings/keys"),
             "openai": ("sk-", "OpenAI keys start with 'sk-'. Get yours at platform.openai.com/api-keys"),
+            "grok": ("xai-", "xAI keys start with 'xai-'. Get yours at console.x.ai"),
+            "qwen": ("sk-", "DashScope keys start with 'sk-'. Get yours at dashscope.console.aliyun.com"),
         }
         prefix_info = _KEY_PREFIXES.get(provider_name)
         if prefix_info:
@@ -610,8 +928,19 @@ def mount_dashboard(app, agent):
         if provider_name not in PROVIDER_MODELS:
             raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_name}")
 
-        # Save API key if provided
+        # Save API key if provided (with format validation)
         if api_key and provider_name != "ollama":
+            _KEY_PREFIXES_APPLY = {
+                "anthropic": "sk-ant-",
+                "openai": "sk-",
+                "grok": "xai-",
+                "qwen": "sk-",
+            }
+            prefix = _KEY_PREFIXES_APPLY.get(provider_name)
+            if prefix and not api_key.startswith(prefix):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid key format for {provider_name}. Key should start with '{prefix}'.")
             save_provider_key(provider_name, api_key)
 
         # Ensure API key is available in env
@@ -629,6 +958,7 @@ def mount_dashboard(app, agent):
         _SDK_PACKAGES = {
             "anthropic": "anthropic",
             "openai": "openai",
+            "grok": "openai",
             "gemini": "google.generativeai",
             "ollama": "openai",
         }
@@ -637,7 +967,7 @@ def mount_dashboard(app, agent):
             try:
                 __import__(pkg)
             except ImportError:
-                pip_extra = {"openai": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
+                pip_extra = {"openai": "openai", "grok": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
                 raise HTTPException(
                     status_code=400,
                     detail=f"SDK not installed. Run: pip install liteagent[{pip_extra}]")
@@ -693,7 +1023,7 @@ def mount_dashboard(app, agent):
             try:
                 __import__(pkg)
             except ImportError:
-                pip_extra = {"openai": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
+                pip_extra = {"openai": "openai", "grok": "openai", "gemini": "gemini", "ollama": "ollama"}.get(provider_name, provider_name)
                 return {"ok": False, "error": f"SDK not installed. Run: pip install liteagent[{pip_extra}]"}
 
         # For Ollama, no key needed
@@ -717,7 +1047,9 @@ def mount_dashboard(app, agent):
             _default_test_models = {
                 "anthropic": "claude-haiku-4-5-20251001",
                 "openai": "gpt-4o-mini",
+                "grok": "grok-3-mini",
                 "gemini": "gemini-2.0-flash",
+                "qwen": "qwen-turbo",
             }
             if provider_name == "ollama":
                 ollama_models = PROVIDER_MODELS.get("ollama", [])
@@ -922,56 +1254,153 @@ def mount_dashboard(app, agent):
             raise HTTPException(status_code=404, detail="No token saved")
         return {"ok": True}
 
-    # ── Voice Transcription Settings ─────────
+    # ── Voice Settings (TTS + STT) ─────────
 
     @app.get("/api/settings/voice")
     async def api_settings_voice():
-        """Get voice transcription mode and available backends."""
-        tg_cfg = agent.config.get("channels", {}).get("telegram", {})
-        mode = tg_cfg.get("voice_transcription", "auto")
+        """Get full voice settings: TTS + STT configuration."""
+        from ..voice import resolve_voice_config, _get_tts_api_key, get_last_tts_attempt
+        from ..voice import OPENAI_TTS_VOICES, OPENAI_TTS_MODELS, STT_PROVIDERS
 
-        # Check what's actually available
+        voice_cfg = resolve_voice_config(agent.config)
+        tts = voice_cfg["tts"]
+        stt = voice_cfg["stt"]
+
+        # STT backend detection (legacy compat)
+        tg_cfg = agent.config.get("channels", {}).get("telegram", {})
+        stt_mode = tg_cfg.get("voice_transcription", "auto")
         has_builtin = "transcribe_voice" in agent.tools._tools
         mcp_tools = [n for n in agent.tools._tools
                      if "transcribe" in n and "__" in n]
         has_mcp = bool(mcp_tools)
-
-        # Determine active backend
-        if mode == "builtin" or (mode == "auto" and not has_mcp):
-            active = "builtin"
-        elif mode == "mcp" or (mode == "auto" and has_mcp):
-            active = "mcp"
+        if stt_mode == "builtin" or (stt_mode == "auto" and not has_mcp):
+            stt_active = "builtin"
+        elif stt_mode == "mcp" or (stt_mode == "auto" and has_mcp):
+            stt_active = "mcp"
         else:
-            active = "builtin"
+            stt_active = "builtin"
 
         return {
-            "mode": mode,
-            "active": active,
-            "has_builtin": has_builtin or mode == "builtin",
-            "has_mcp": has_mcp or (agent._mcp_config and
-                                   any("whisper" in k.lower() or "transcri" in k.lower()
-                                       for k in agent._mcp_config)),
-            "mcp_tools": mcp_tools,
+            # TTS settings
+            "tts": {
+                "auto": tts["auto"],
+                "provider": tts["provider"],
+                "max_length": tts["max_length"],
+                "has_openai": bool(_get_tts_api_key("openai", agent.config)),
+                "has_elevenlabs": bool(_get_tts_api_key("elevenlabs", agent.config)),
+                "has_edge": tts["edge"]["enabled"],
+                "openai": tts["openai"],
+                "elevenlabs": tts["elevenlabs"],
+                "edge": tts["edge"],
+                "voices": list(OPENAI_TTS_VOICES),
+                "models": list(OPENAI_TTS_MODELS),
+                "last_attempt": get_last_tts_attempt(),
+            },
+            # STT settings
+            "stt": {
+                "mode": stt_mode,
+                "active": stt_active,
+                "provider": stt["provider"],
+                "providers": list(STT_PROVIDERS),
+                "has_builtin": has_builtin or stt_mode == "builtin",
+                "has_mcp": has_mcp or (agent._mcp_config and
+                                       any("whisper" in k.lower() or "transcri" in k.lower()
+                                           for k in agent._mcp_config)),
+                "mcp_tools": mcp_tools,
+                "openai": stt["openai"],
+                "deepgram": stt["deepgram"],
+                "groq": stt["groq"],
+            },
         }
 
     @app.post("/api/settings/voice")
     async def api_settings_voice_save(body: dict):
-        """Switch voice transcription mode: auto, builtin, mcp."""
+        """Save voice settings: TTS + STT configuration."""
         from ..config import save_config
-        mode = body.get("mode", "auto")
-        if mode not in ("auto", "builtin", "mcp"):
-            raise HTTPException(400, "Mode must be: auto, builtin, or mcp")
 
-        tg = agent.config.setdefault("channels", {}).setdefault("telegram", {})
-        tg["voice_transcription"] = mode
+        voice = agent.config.setdefault("voice", {})
+
+        # TTS settings
+        if "tts" in body:
+            tts_data = body["tts"]
+            tts = voice.setdefault("tts", {})
+            if "auto" in tts_data:
+                if tts_data["auto"] not in ("off", "always", "inbound", "tagged"):
+                    raise HTTPException(400, "auto must be: off, always, inbound, or tagged")
+                tts["auto"] = tts_data["auto"]
+            if "provider" in tts_data:
+                if tts_data["provider"] not in ("openai", "elevenlabs", "edge"):
+                    raise HTTPException(400, "provider must be: openai, elevenlabs, or edge")
+                tts["provider"] = tts_data["provider"]
+            if "max_length" in tts_data:
+                tts["max_length"] = int(tts_data["max_length"])
+            if "openai" in tts_data:
+                tts["openai"] = {**tts.get("openai", {}), **tts_data["openai"]}
+            if "elevenlabs" in tts_data:
+                tts["elevenlabs"] = {**tts.get("elevenlabs", {}), **tts_data["elevenlabs"]}
+            if "edge" in tts_data:
+                tts["edge"] = {**tts.get("edge", {}), **tts_data["edge"]}
+
+        # STT settings
+        if "stt" in body:
+            stt_data = body["stt"]
+            stt = voice.setdefault("stt", {})
+            if "provider" in stt_data:
+                if stt_data["provider"] not in ("openai", "deepgram", "groq"):
+                    raise HTTPException(400, "stt provider must be: openai, deepgram, or groq")
+                stt["provider"] = stt_data["provider"]
+            if "openai" in stt_data:
+                stt["openai"] = {**stt.get("openai", {}), **stt_data["openai"]}
+            if "deepgram" in stt_data:
+                stt["deepgram"] = {**stt.get("deepgram", {}), **stt_data["deepgram"]}
+            if "groq" in stt_data:
+                stt["groq"] = {**stt.get("groq", {}), **stt_data["groq"]}
+
+        # Legacy STT mode (voice_transcription in telegram config)
+        if "mode" in body:
+            mode = body["mode"]
+            if mode not in ("auto", "builtin", "mcp"):
+                raise HTTPException(400, "Mode must be: auto, builtin, or mcp")
+            tg = agent.config.setdefault("channels", {}).setdefault("telegram", {})
+            tg["voice_transcription"] = mode
+            if "transcribe_voice" not in agent.tools._tools:
+                agent._wire_voice_tool()
+            agent._apply_voice_transcription_mode()
+
         save_config(agent.config)
+        return {"ok": True}
 
-        # Apply immediately — re-register tools based on new mode
-        if "transcribe_voice" not in agent.tools._tools:
-            agent._wire_voice_tool()
-        agent._apply_voice_transcription_mode()
+    @app.post("/api/tts/test")
+    async def api_tts_test(body: dict):
+        """Test TTS: convert text to audio and return base64."""
+        import base64
+        text = body.get("text", "").strip()
+        if not text:
+            raise HTTPException(400, "text is required")
 
-        return {"ok": True, "mode": mode}
+        from ..voice import text_to_speech, resolve_voice_config
+        voice_cfg = resolve_voice_config(agent.config)
+        result = await text_to_speech(text, voice_cfg, agent.config, channel="api")
+
+        if not result.success:
+            return {"ok": False, "error": result.error}
+
+        with open(result.audio_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode()
+
+        # Cleanup
+        try:
+            os.unlink(result.audio_path)
+        except OSError:
+            pass
+
+        return {
+            "ok": True,
+            "audio": audio_b64,
+            "format": result.output_format or "mp3",
+            "provider": result.provider,
+            "latency_ms": result.latency_ms,
+        }
 
     # ── RAG Document Management ─────────────
 
@@ -1060,6 +1489,73 @@ def mount_dashboard(app, agent):
             raise HTTPException(status_code=500, detail="Delete failed")
         return {"ok": True}
 
+    # ── File Manager (index + search + browse) ────
+
+    @app.get("/api/files")
+    async def api_files_list(source: str = "", user_id: str = "",
+                             limit: int = 100, offset: int = 0):
+        """List indexed files with optional filters."""
+        fm = getattr(agent, '_file_manager', None)
+        if not fm:
+            raise HTTPException(400, "File manager not enabled (enable storage)")
+        return fm.list_files(
+            user_id=user_id or None, source=source or None,
+            limit=limit, offset=offset)
+
+    @app.get("/api/files/search")
+    async def api_files_search(q: str, limit: int = 20):
+        """Semantic search through indexed files."""
+        fm = getattr(agent, '_file_manager', None)
+        if not fm:
+            raise HTTPException(400, "File manager not enabled")
+        return fm.search(q, top_k=limit)
+
+    @app.get("/api/files/count")
+    async def api_files_count():
+        """Get total file count."""
+        fm = getattr(agent, '_file_manager', None)
+        if not fm:
+            return {"count": 0}
+        return {"count": fm.count_files()}
+
+    @app.get("/api/files/download/{key:path}")
+    async def api_files_download(key: str, expires: int = 3600):
+        """Get presigned download URL for a file."""
+        fm = getattr(agent, '_file_manager', None)
+        if not fm:
+            raise HTTPException(400, "File manager not enabled")
+        try:
+            url = await fm.get_download_url(key, expires=expires)
+            from starlette.responses import RedirectResponse
+            return RedirectResponse(url=url)
+        except Exception as e:
+            raise HTTPException(404, f"File not found: {e}")
+
+    @app.get("/api/files/url/{key:path}")
+    async def api_files_url(key: str, expires: int = 3600):
+        """Get presigned download URL (JSON, no redirect)."""
+        fm = getattr(agent, '_file_manager', None)
+        if not fm:
+            raise HTTPException(400, "File manager not enabled")
+        try:
+            url = await fm.get_download_url(key, expires=expires)
+            return {"url": url, "expires_sec": expires}
+        except Exception as e:
+            raise HTTPException(404, str(e))
+
+    @app.get("/files")
+    async def files_browse_page():
+        """File browser HTML page with download links."""
+        fm = getattr(agent, '_file_manager', None)
+        storage = getattr(agent, '_storage', None)
+        if not fm or not storage:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse("<h2>Storage not enabled</h2><p>Enable S3/MinIO in Settings → Storage</p>")
+        from starlette.responses import HTMLResponse
+        return HTMLResponse(_FILE_BROWSER_HTML)
+
+    # ── Storage Settings ──────────────────
+
     @app.get("/api/settings/storage")
     async def api_settings_storage():
         """Get storage configuration status."""
@@ -1102,9 +1598,15 @@ def mount_dashboard(app, agent):
             "bucket": bucket,
         })
 
+        # Persist config to disk
+        from ..config import save_config
+        save_config(agent.config)
+
         # Reconnect storage
         try:
             agent._storage = create_storage(agent.config)
+            if agent._storage:
+                agent._wire_storage_tools()
             return {"ok": True, "connected": agent._storage is not None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1134,64 +1636,130 @@ def mount_dashboard(app, agent):
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # ── Qdrant Settings ────────────────────
+    # ── Vector Search Settings ────────────────────
 
-    @app.get("/api/settings/qdrant")
-    async def api_settings_qdrant():
-        """Get Qdrant configuration status."""
+    @app.get("/api/settings/vector")
+    async def api_settings_vector():
+        """Get vector search configuration + status."""
         from ..config import get_api_key, key_preview
         rag_cfg = agent.config.get("rag", {})
-        qdrant_cfg = rag_cfg.get("qdrant", {})
-        api_key = qdrant_cfg.get("api_key") or get_api_key("qdrant") or ""
         rag = getattr(agent, '_rag', None)
-        connected = rag.is_qdrant_connected() if rag else False
         stats = rag.get_stats() if rag else {}
+
+        # Embedding config
+        emb_cfg = rag_cfg.get("embedding", {})
+
+        # Qdrant config
+        qdrant_cfg = rag_cfg.get("qdrant", {})
+        qdrant_key = qdrant_cfg.get("api_key") or get_api_key("qdrant") or ""
+
+        # Search config
+        search_cfg = rag_cfg.get("search", {})
+
+        # File indexing config
+        fi_cfg = rag_cfg.get("file_indexing", {})
+
         return {
             "enabled": rag_cfg.get("enabled", False),
-            "connected": connected,
-            "url": qdrant_cfg.get("url", ""),
-            "collection": qdrant_cfg.get("collection", "liteagent_rag"),
-            "api_key_preview": key_preview(api_key) if api_key else "",
+            "vector_backend": rag_cfg.get("vector_backend", "auto"),
+            "chunk_size": rag_cfg.get("chunk_size", 1000),
+            "chunk_overlap": rag_cfg.get("overlap", 200),
+            "embedding": {
+                "provider": emb_cfg.get("provider", "auto"),
+                "model": emb_cfg.get("model", "nomic-embed-text"),
+                "openai_model": emb_cfg.get("openai_model", "text-embedding-3-small"),
+                "dimension": emb_cfg.get("dimension"),
+            },
+            "search": {
+                "mode": search_cfg.get("mode", "hybrid"),
+                "rrf_k": search_cfg.get("rrf_k", 60),
+                "vector_top_k": search_cfg.get("vector_top_k", 50),
+                "keyword_top_k": search_cfg.get("keyword_top_k", 50),
+            },
+            "qdrant": {
+                "url": qdrant_cfg.get("url", ""),
+                "collection": qdrant_cfg.get("collection", "liteagent_rag"),
+                "api_key_preview": key_preview(qdrant_key) if qdrant_key else "",
+            },
+            "file_indexing": {
+                "enabled": fi_cfg.get("enabled", True),
+                "max_file_size_mb": fi_cfg.get("max_file_size_mb", 10),
+            },
             "stats": stats,
         }
 
-    @app.post("/api/settings/qdrant")
-    async def api_settings_qdrant_save(body: dict):
-        """Save Qdrant configuration and reconnect RAG."""
-        from ..config import save_provider_key
+    @app.post("/api/settings/vector")
+    async def api_settings_vector_save(body: dict):
+        """Save vector search configuration and reinitialize RAG."""
+        from ..config import save_config, save_provider_key
         from ..rag import RAGPipeline
 
-        url = body.get("url", "").strip()
-        api_key = body.get("api_key", "").strip()
-        collection = body.get("collection", "liteagent_rag").strip()
+        rag_cfg = agent.config.setdefault("rag", {})
+        rag_cfg["enabled"] = True
+        rag_cfg["vector_backend"] = body.get("vector_backend", "auto")
+        rag_cfg["chunk_size"] = max(200, min(4000, int(body.get("chunk_size", 1000))))
+        rag_cfg["overlap"] = max(0, min(1000, int(body.get("chunk_overlap", 200))))
 
-        if not url:
-            raise HTTPException(status_code=400, detail="Qdrant URL required")
+        # Embedding config
+        emb = body.get("embedding", {})
+        rag_cfg["embedding"] = {
+            "provider": emb.get("provider", "auto"),
+            "model": emb.get("model", "nomic-embed-text"),
+            "openai_model": emb.get("openai_model", "text-embedding-3-small"),
+        }
+        if emb.get("dimension"):
+            rag_cfg["embedding"]["dimension"] = int(emb["dimension"])
 
-        if api_key:
-            save_provider_key("qdrant", api_key)
-
-        # Update config
-        agent.config.setdefault("rag", {}).update({"enabled": True})
-        agent.config["rag"]["qdrant"] = {
-            "url": url, "api_key": api_key, "collection": collection,
+        # Search config
+        search = body.get("search", {})
+        rag_cfg["search"] = {
+            "mode": search.get("mode", "hybrid"),
+            "rrf_k": int(search.get("rrf_k", 60)),
+            "vector_top_k": int(search.get("vector_top_k", 50)),
+            "keyword_top_k": int(search.get("keyword_top_k", 50)),
         }
 
-        # Reconnect RAG
+        # Qdrant config
+        qdrant = body.get("qdrant", {})
+        qdrant_url = qdrant.get("url", "").strip()
+        qdrant_key = qdrant.get("api_key", "").strip()
+        qdrant_collection = qdrant.get("collection", "liteagent_rag").strip()
+        if qdrant_url:
+            rag_cfg["qdrant"] = {
+                "url": qdrant_url,
+                "collection": qdrant_collection,
+            }
+            if qdrant_key:
+                save_provider_key("qdrant", qdrant_key)
+
+        # File indexing config
+        fi = body.get("file_indexing", {})
+        rag_cfg["file_indexing"] = {
+            "enabled": fi.get("enabled", True),
+            "max_file_size_mb": int(fi.get("max_file_size_mb", 10)),
+        }
+
+        save_config(agent.config)
+
+        # Reinitialize RAG pipeline
         try:
             agent._rag = RAGPipeline(
                 agent.memory.db,
                 embedder=agent.memory._embedder,
-                config=agent.config["rag"])
+                config=rag_cfg)
+            agent._rag.init_backend(agent.config)
             agent._wire_rag_tool()
-            connected = agent._rag.is_qdrant_connected()
-            return {"ok": True, "connected": connected}
+            # Reconnect FileManager to new RAG
+            if agent._file_manager:
+                agent._file_manager._rag = agent._rag
+            stats = agent._rag.get_stats()
+            return {"ok": True, "stats": stats}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    @app.post("/api/settings/qdrant/test")
-    async def api_settings_qdrant_test(body: dict):
-        """Test Qdrant connection."""
+    @app.post("/api/settings/vector/test")
+    async def api_settings_vector_test(body: dict):
+        """Test Qdrant connection (when backend=qdrant)."""
         url = body.get("url", "").strip()
         api_key = body.get("api_key", "").strip()
 
@@ -1212,6 +1780,302 @@ def mount_dashboard(app, agent):
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    @app.post("/api/settings/vector/reindex")
+    async def api_settings_vector_reindex():
+        """Reindex all files from FileManager through RAG pipeline."""
+        rag = getattr(agent, '_rag', None)
+        fm = getattr(agent, '_file_manager', None)
+        if not rag:
+            return {"ok": False, "error": "RAG not enabled"}
+
+        files = fm.list_files(limit=500) if fm else []
+        indexed = 0
+        errors = []
+        for f in files:
+            try:
+                key = f["storage_key"]
+                data = await agent._storage.async_download(key)
+                if data:
+                    text = fm._extract_text(data, f["mime_type"])
+                    if text and len(text.strip()) > 20:
+                        ext = Path(f["original_name"]).suffix
+                        rag.index_content(text, source_key=key,
+                                         source_name=f["original_name"],
+                                         file_type=ext)
+                        indexed += 1
+            except Exception as e:
+                errors.append(f"{f['original_name']}: {e}")
+
+        return {"ok": True, "indexed": indexed, "errors": errors[:10],
+                "stats": rag.get_stats()}
+
+    # ── Knowledge Base Management ─────────
+
+    @app.get("/api/settings/knowledge_base")
+    async def api_settings_knowledge_base():
+        """Get knowledge base configuration + status."""
+        kb_cfg = agent.config.get("knowledge_base", {})
+        kb = getattr(agent, '_knowledge_base', None)
+        stats = {}
+        if kb:
+            try:
+                stats = await kb.get_stats()
+            except Exception:
+                pass
+        return {
+            "enabled": kb_cfg.get("enabled", False),
+            "chunk_size": kb_cfg.get("chunk_size", 800),
+            "chunk_overlap": kb_cfg.get("chunk_overlap", 150),
+            "search_mode": kb_cfg.get("search_mode", "hybrid"),
+            "rerank": kb_cfg.get("rerank", True),
+            "rerank_model": kb_cfg.get("rerank_model",
+                                        "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+            "query_rewrite": kb_cfg.get("query_rewrite", True),
+            "max_file_size_mb": kb_cfg.get("max_file_size_mb", 50),
+            "db_path": kb_cfg.get("db_path", "~/.liteagent/knowledge_base.db"),
+            "stats": stats,
+        }
+
+    @app.post("/api/settings/knowledge_base")
+    async def api_settings_knowledge_base_save(body: dict):
+        """Save knowledge base settings and reinitialize."""
+        from ..config import save_config
+
+        kb_cfg = agent.config.setdefault("knowledge_base", {})
+        kb_cfg["enabled"] = body.get("enabled", False)
+        kb_cfg["chunk_size"] = max(200, min(2000, int(body.get("chunk_size", 800))))
+        kb_cfg["chunk_overlap"] = max(0, min(500, int(body.get("chunk_overlap", 150))))
+        kb_cfg["search_mode"] = body.get("search_mode", "hybrid")
+        kb_cfg["rerank"] = body.get("rerank", True)
+        if body.get("rerank_model"):
+            kb_cfg["rerank_model"] = body["rerank_model"]
+        kb_cfg["query_rewrite"] = body.get("query_rewrite", True)
+        kb_cfg["max_file_size_mb"] = max(1, min(200, int(body.get("max_file_size_mb", 50))))
+
+        save_config(agent.config)
+
+        try:
+            if kb_cfg["enabled"]:
+                agent._init_knowledge_base(kb_cfg)
+                stats = {}
+                if agent._knowledge_base:
+                    stats = await agent._knowledge_base.get_stats()
+                return {"ok": True, "stats": stats}
+            else:
+                agent._knowledge_base = None
+                return {"ok": True, "stats": {}}
+        except Exception as e:
+            logger.warning("KB reinit failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    @app.get("/api/knowledge_base/documents")
+    async def api_kb_documents():
+        """List documents in the knowledge base."""
+        kb = getattr(agent, '_knowledge_base', None)
+        if not kb:
+            return {"documents": [], "stats": {}}
+        docs = await kb.list_documents()
+        stats = await kb.get_stats()
+        return {"documents": docs, "stats": stats}
+
+    @app.post("/api/knowledge_base/ingest")
+    async def api_kb_ingest(body: dict):
+        """Ingest a document into the knowledge base."""
+        kb = getattr(agent, '_knowledge_base', None)
+        if not kb:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Knowledge Base is not enabled"})
+        path = body.get("path", "").strip()
+        if not path:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Path is required"})
+        try:
+            result = await kb.ingest(path)
+            return result
+        except FileNotFoundError as e:
+            return JSONResponse(status_code=404, content={"detail": str(e)})
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"detail": str(e)})
+
+    @app.delete("/api/knowledge_base/documents/{doc_id}")
+    async def api_kb_delete(doc_id: str):
+        """Delete a document from the knowledge base."""
+        kb = getattr(agent, '_knowledge_base', None)
+        if not kb:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Knowledge Base is not enabled"})
+        ok = await kb.delete_document(doc_id)
+        if not ok:
+            return JSONResponse(status_code=404,
+                                content={"detail": "Document not found"})
+        return {"status": "deleted"}
+
+    @app.post("/api/knowledge_base/search")
+    async def api_kb_search(body: dict):
+        """Test search against the knowledge base."""
+        kb = getattr(agent, '_knowledge_base', None)
+        if not kb:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Knowledge Base is not enabled"})
+        query = body.get("query", "").strip()
+        if not query:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Query required"})
+        top_k = int(body.get("top_k", 6))
+        mode = body.get("mode")
+        results = await kb.search(query, top_k=top_k, mode=mode)
+        return {
+            "results": [
+                {
+                    "content": r.content[:500],
+                    "score": round(r.score, 4),
+                    "source": r.source,
+                    "page": r.page,
+                    "section": r.section,
+                }
+                for r in results
+            ],
+            "count": len(results),
+        }
+
+    @app.get("/api/knowledge_base/query_log")
+    async def api_kb_query_log(limit: int = 20):
+        """Get recent query log entries."""
+        kb = getattr(agent, '_knowledge_base', None)
+        if not kb:
+            return {"queries": []}
+        import json as _json
+        try:
+            rows = kb.db.execute(
+                "SELECT query, rewritten_queries, result_count, latency_ms, "
+                "created_at FROM kb_query_log ORDER BY id DESC LIMIT ?",
+                (min(limit, 100),)).fetchall()
+        except Exception:
+            return {"queries": []}
+        queries = []
+        for row in rows:
+            queries.append({
+                "query": row[0],
+                "sub_queries": _json.loads(row[1]) if row[1] else [],
+                "result_count": row[2],
+                "latency_ms": row[3],
+                "created_at": row[4],
+            })
+        return {"queries": queries}
+
+    # ── Night Worker ───────────────────────
+
+    @app.get("/api/settings/night_worker")
+    async def api_settings_night_worker():
+        """Get night worker config + queue stats."""
+        try:
+            nw_cfg = agent.config.get("night_worker", {})
+
+            # Get queue stats if KB is available
+            stats = {}
+            kb = getattr(agent, '_knowledge_base', None)
+            if kb:
+                try:
+                    from ..night_worker import NightWorker
+                    worker = NightWorker(nw_cfg, kb.db)
+                    stats = worker.get_queue_stats()
+                except Exception:
+                    pass
+
+            return JSONResponse({
+                "enabled": nw_cfg.get("enabled", False),
+                "model": nw_cfg.get("model", "qwen2.5:latest"),
+                "batch_size": nw_cfg.get("batch_size", 20),
+                "max_tasks_per_run": nw_cfg.get("max_tasks_per_run", 200),
+                "max_runtime_sec": nw_cfg.get("max_runtime_sec", 3600),
+                "cron": nw_cfg.get("cron", "0 22 * * *"),
+                "queue_stats": stats,
+            })
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/settings/night_worker")
+    async def api_settings_night_worker_save(body: dict):
+        """Save night worker settings."""
+        try:
+            from ..config import save_config
+
+            nw_cfg = agent.config.get("night_worker", {})
+            for key in ("enabled", "model", "batch_size", "max_tasks_per_run",
+                         "max_runtime_sec", "cron"):
+                if key in body:
+                    nw_cfg[key] = body[key]
+            agent.config["night_worker"] = nw_cfg
+            save_config(agent.config)
+            return JSONResponse({"status": "ok"})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/night_worker/run")
+    async def api_night_worker_run():
+        """Manually trigger night worker."""
+        try:
+            nw_cfg = agent.config.get("night_worker", {})
+            kb = getattr(agent, '_knowledge_base', None)
+            if not kb:
+                return JSONResponse({"error": "Knowledge base not configured"},
+                                    status_code=400)
+
+            from ..night_worker import NightWorker
+
+            # Try to create an Ollama provider
+            provider = None
+            try:
+                from ..providers import OllamaProvider
+                model = nw_cfg.get("model", "qwen2.5:latest")
+                ollama_cfg = agent.config.get("providers", {}).get("ollama", {})
+                base_url = ollama_cfg.get("base_url", "http://localhost:11434")
+                provider = OllamaProvider({"base_url": base_url},
+                                          default_model=model)
+            except Exception:
+                pass
+
+            embedder = getattr(kb, '_embedder', None)
+            worker = NightWorker(nw_cfg, kb.db, provider=provider,
+                                 embedder=embedder)
+            result = await worker.run()
+            return JSONResponse(result)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/night_worker/enqueue")
+    async def api_night_worker_enqueue():
+        """Enqueue unenriched chunks for night processing."""
+        try:
+            nw_cfg = agent.config.get("night_worker", {})
+            kb = getattr(agent, '_knowledge_base', None)
+            if not kb:
+                return JSONResponse({"error": "Knowledge base not configured"},
+                                    status_code=400)
+
+            from ..night_worker import NightWorker
+            worker = NightWorker(nw_cfg, kb.db)
+            counts = worker.enqueue_unenriched()
+            return JSONResponse({"status": "ok", "enqueued": counts})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ── KB Quality Metrics ─────────────────
+
+    @app.get("/api/knowledge_base/quality")
+    async def api_kb_quality():
+        """Get KB quality metrics."""
+        try:
+            kb = getattr(agent, '_knowledge_base', None)
+            if not kb:
+                return JSONResponse({"error": "Knowledge base not configured"},
+                                    status_code=400)
+
+            stats = await kb.get_quality_stats()
+            return JSONResponse(stats)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     # ── MCP Server Management ──────────────
 
     @app.get("/api/mcp/config")
@@ -1227,6 +2091,7 @@ def mount_dashboard(app, agent):
                 "command": cfg.get("command", ""),
                 "args": cfg.get("args", []),
                 "env": {k: "***" for k in cfg.get("env", {})},
+                "enabled": cfg.get("enabled", True),
                 "connected": name in connected_names,
             })
         return servers
@@ -1292,6 +2157,21 @@ def mount_dashboard(app, agent):
         try:
             await agent.reload_mcp()
             return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/api/mcp/servers/{name}/toggle")
+    async def api_mcp_toggle_server(name: str, body: dict):
+        """Enable or disable an MCP server without removing it."""
+        mcp_cfg = agent.config.get("tools", {}).get("mcp_servers", {})
+        if name not in mcp_cfg:
+            raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+        enabled = body.get("enabled", True)
+        mcp_cfg[name]["enabled"] = bool(enabled)
+        agent._mcp_config = mcp_cfg
+        try:
+            await agent.reload_mcp()
+            return {"ok": True, "enabled": bool(enabled)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1373,5 +2253,101 @@ def mount_dashboard(app, agent):
             raise HTTPException(400, "Config watcher not running")
         changes = await watcher.force_reload()
         return {"ok": True, "changes": changes}
+
+    # ── Tasks API ──────────────────────────────
+
+    @app.get("/api/tasks")
+    async def api_tasks_list(status: str = None):
+        """List all user tasks."""
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            return []
+        return tm.list_tasks(status=status)
+
+    @app.get("/api/tasks/{task_id}")
+    async def api_task_detail(task_id: int):
+        """Get a single task."""
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            raise HTTPException(404, "Tasks not available")
+        task = tm.get_task(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        return task
+
+    @app.post("/api/tasks")
+    async def api_task_create(body: dict):
+        """Create a task from the dashboard."""
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            raise HTTPException(400, "Tasks not available")
+        name = body.get("name", "").strip()
+        query = body.get("query", "").strip()
+        run_at = body.get("run_at") or None
+        cron = body.get("cron") or None
+        if not name or not query:
+            raise HTTPException(400, "name and query are required")
+        if not run_at and not cron:
+            raise HTTPException(400, "run_at or cron is required")
+        task_type = "recurring" if cron else "one_shot"
+        try:
+            task = tm.add_task(
+                name=name, query=query, user_id=DASHBOARD_USER,
+                task_type=task_type, run_at=run_at, cron_expr=cron)
+            return task
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    async def api_task_cancel(task_id: int):
+        """Cancel a task."""
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            raise HTTPException(400, "Tasks not available")
+        ok = tm.cancel_task(task_id)
+        if not ok:
+            raise HTTPException(404, "Task not found or already completed/cancelled")
+        return {"status": "cancelled"}
+
+    @app.post("/api/tasks/{task_id}/run")
+    async def api_task_run_now(task_id: int):
+        """Execute a task immediately."""
+        import asyncio as _aio
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            raise HTTPException(400, "Tasks not available")
+        task = tm.get_task(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+
+        async def _run():
+            tm.mark_running(task_id)
+            try:
+                result = await agent.run(task["query"], task["user_id"])
+                tm.mark_completed(task_id, result)
+                agent._ws_broadcast("task_completed", {
+                    "task_id": task_id, "name": task["name"],
+                    "result": result[:500], "user_id": task["user_id"],
+                })
+            except Exception as e:
+                tm.mark_failed(task_id, str(e))
+                agent._ws_broadcast("task_failed", {
+                    "task_id": task_id, "name": task["name"],
+                    "error": str(e)[:200],
+                })
+
+        _aio.create_task(_run())
+        return {"status": "triggered"}
+
+    @app.delete("/api/tasks/{task_id}")
+    async def api_task_delete(task_id: int):
+        """Delete a task permanently."""
+        tm = getattr(agent, '_task_manager', None)
+        if not tm:
+            raise HTTPException(400, "Tasks not available")
+        ok = tm.delete_task(task_id)
+        if not ok:
+            raise HTTPException(404, "Task not found")
+        return {"status": "deleted"}
 
     logger.info("Dashboard routes mounted")

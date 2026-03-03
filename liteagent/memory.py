@@ -21,28 +21,8 @@ _CONTRADICTION_WORDS = {
 }
 
 
-class OllamaEmbedder:
-    """Embedder that uses Ollama /api/embeddings endpoint. Compatible with SentenceTransformer API."""
-
-    def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434"):
-        import numpy as np
-        self._model = model
-        self._url = f"{base_url}/api/embeddings"
-        self._np = np
-        # Probe dimension
-        test = self.encode("test")
-        self.dim = len(test)
-
-    def encode(self, text: str):
-        """Encode text to numpy vector via Ollama API."""
-        import urllib.request
-        import json as _json
-        body = _json.dumps({"model": self._model, "prompt": text}).encode()
-        req = urllib.request.Request(self._url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = _json.loads(resp.read())
-        return self._np.array(data["embedding"], dtype="float32")
+# Backward-compat: import OllamaEmbedder from new module
+from .embedders import OllamaEmbedder, create_embedder as _create_embedder
 
 
 class MemorySystem:
@@ -186,6 +166,24 @@ class MemorySystem:
                 use_count INTEGER DEFAULT 0,
                 created_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS file_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                storage_key TEXT UNIQUE NOT NULL,
+                original_name TEXT NOT NULL,
+                mime_type TEXT DEFAULT 'application/octet-stream',
+                size_bytes INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'unknown',
+                user_id TEXT DEFAULT 'system',
+                description TEXT DEFAULT '',
+                embedding BLOB,
+                created_at TEXT DEFAULT (datetime('now')),
+                accessed_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_index_user
+                ON file_index(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_file_index_source
+                ON file_index(source);
         """)
         # Add embedding column if missing (migration for existing DBs)
         try:
@@ -197,44 +195,16 @@ class MemorySystem:
             self.db.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Add file_meta column (JSON: {filename, mime_type, size_bytes})
+        try:
+            self.db.execute("ALTER TABLE memories ADD COLUMN file_meta TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self.db.commit()
 
     def _init_embedder(self):
-        """Initialize embedder: Ollama → sentence-transformers → None."""
-        import importlib
-
-        # 1. Try Ollama embeddings (free, local)
-        parent_cfg = {k: v for k, v in self.config.items() if not k.startswith("_")}
-        # Access parent config via the _default_model key to detect Ollama
-        # Check if Ollama is running by looking at providers config
-        ollama_url = None
-        try:
-            # self.config is memory sub-config, need to detect Ollama from env
-            import urllib.request
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                if resp.status == 200:
-                    import json as _json
-                    data = _json.loads(resp.read())
-                    models = [m["name"] for m in data.get("models", [])]
-                    # Prefer dedicated embedding models
-                    embed_models = [m for m in models if "embed" in m or "minilm" in m]
-                    if embed_models:
-                        emb = OllamaEmbedder(model=embed_models[0])
-                        logger.info("Using Ollama embeddings: %s (dim=%d)", embed_models[0], emb.dim)
-                        return emb
-        except Exception:
-            pass
-
-        # 2. Try sentence-transformers
-        try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            logger.info("Loaded embedding model: all-MiniLM-L6-v2")
-            return model
-        except ImportError:
-            logger.debug("No embedder available (install sentence-transformers or pull an Ollama embed model)")
-            return None
+        """Initialize embedder via unified embedders module."""
+        return _create_embedder(self._config)
 
     def _embed(self, text: str) -> bytes | None:
         """Generate embedding as pickle bytes, or None if embedder unavailable."""
@@ -469,7 +439,8 @@ class MemorySystem:
         return top_results
 
     async def remember(self, content: str, user_id: str,
-                       memory_type: str = "fact", importance: float = 0.5):
+                       memory_type: str = "fact", importance: float = 0.5,
+                       file_meta: str | None = None):
         """Store a new memory with deduplication, conflict detection, and optional embedding."""
         content_hash = hashlib.md5(content.lower().strip().encode()).hexdigest()
 
@@ -501,10 +472,10 @@ class MemorySystem:
 
         embedding = self._embed(content)
         self.db.execute(
-            """INSERT INTO memories (user_id, content, type, importance, hash, created_at, accessed_at, embedding)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (user_id, content, type, importance, hash, created_at, accessed_at, embedding, file_meta)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, content, memory_type, importance, content_hash,
-             datetime.now().isoformat(), datetime.now().isoformat(), embedding))
+             datetime.now().isoformat(), datetime.now().isoformat(), embedding, file_meta))
         self.db.commit()
 
     def forget(self, user_id: str, content_fragment: str):
@@ -703,7 +674,8 @@ class MemorySystem:
     # L4: KNOWLEDGE EXTRACTOR
     # ══════════════════════════════════════════
 
-    async def extract_and_learn(self, user_input: str, agent_response: str, user_id: str):
+    async def extract_and_learn(self, user_input: str, agent_response: str, user_id: str,
+                                file_meta: list | None = None):
         """Extract knowledge from conversation turn using cheap model."""
         if not self.provider or not self.config.get("auto_learn", True):
             return
@@ -738,15 +710,18 @@ class MemorySystem:
 
             data = json.loads(text)
 
+            # Serialize file_meta once for all memories from this turn
+            _fm_json = json.dumps(file_meta, ensure_ascii=False) if file_meta else None
+
             for fact in data.get("facts", []):
                 if len(fact) > 10:  # Skip trivial
-                    await self.remember(fact, user_id, "fact", 0.6)
+                    await self.remember(fact, user_id, "fact", 0.6, file_meta=_fm_json)
             for pref in data.get("preferences", []):
                 if len(pref) > 10:
-                    await self.remember(pref, user_id, "preference", 0.8)
+                    await self.remember(pref, user_id, "preference", 0.8, file_meta=_fm_json)
             for correction in data.get("corrections", []):
                 if len(correction) > 10:
-                    await self.remember(correction, user_id, "correction", 0.9)
+                    await self.remember(correction, user_id, "correction", 0.9, file_meta=_fm_json)
 
             # Update session summary for context compression
             summary_update = data.get("session_summary", "")
@@ -815,6 +790,21 @@ class MemorySystem:
             (f"{today}%",)).fetchone()
         return row[0] if row else 0.0
 
+    def get_hour_cost(self) -> dict:
+        """Get cost and calls for the last hour."""
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM usage_stats "
+            "WHERE timestamp >= datetime('now', '-1 hour')").fetchone()
+        return {"cost": row[0] if row else 0.0, "calls": row[1] if row else 0}
+
+    def get_today_stats(self) -> dict:
+        """Get cost and calls for today."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM usage_stats "
+            "WHERE timestamp LIKE ?", (f"{today}%",)).fetchone()
+        return {"cost": row[0] if row else 0.0, "calls": row[1] if row else 0}
+
     def get_usage_summary(self, days: int = 7) -> dict:
         """Get usage summary for last N days."""
         rows = self.db.execute(
@@ -858,14 +848,14 @@ class MemorySystem:
         """Get all memories, optionally filtered by user_id."""
         if user_id:
             rows = self.db.execute(
-                "SELECT id, user_id, content, type, importance, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC",
+                "SELECT id, user_id, content, type, importance, created_at, file_meta FROM memories WHERE user_id = ? ORDER BY created_at DESC",
                 (user_id,)).fetchall()
         else:
             rows = self.db.execute(
-                "SELECT id, user_id, content, type, importance, created_at FROM memories ORDER BY created_at DESC"
+                "SELECT id, user_id, content, type, importance, created_at, file_meta FROM memories ORDER BY created_at DESC"
             ).fetchall()
         return [{"id": r[0], "user_id": r[1], "content": r[2], "type": r[3],
-                 "importance": r[4], "created_at": r[5]} for r in rows]
+                 "importance": r[4], "created_at": r[5], "file_meta": r[6]} for r in rows]
 
     def get_memory_count(self, user_id: str = None) -> int:
         """Count memories, optionally filtered by user_id."""
@@ -885,6 +875,55 @@ class MemorySystem:
                FROM usage_stats""").fetchone()
         return {"total_calls": row[0], "total_input_tokens": row[1],
                 "total_output_tokens": row[2], "total_cost_usd": round(row[3], 4)}
+
+    def get_success_rate(self, hours: int = 24) -> float:
+        """Success rate from interaction_log for last N hours."""
+        row = self.db.execute(
+            """SELECT COUNT(*) as total,
+                      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as ok
+               FROM interaction_log
+               WHERE created_at >= datetime('now', ?)""",
+            (f"-{hours} hours",)).fetchone()
+        if not row or row[0] == 0:
+            return 100.0
+        return round(row[1] / row[0] * 100, 1)
+
+    def get_avg_confidence(self, hours: int = 24) -> float:
+        """Average confidence from interaction_log for last N hours."""
+        row = self.db.execute(
+            """SELECT AVG(confidence) FROM interaction_log
+               WHERE confidence IS NOT NULL
+                 AND created_at >= datetime('now', ?)""",
+            (f"-{hours} hours",)).fetchone()
+        return round(row[0], 1) if row and row[0] is not None else 0.0
+
+    def get_cache_efficiency(self) -> float:
+        """Ratio of cache_read_tokens to total input_tokens (percentage)."""
+        row = self.db.execute(
+            """SELECT COALESCE(SUM(cache_read_tokens), 0),
+                      COALESCE(SUM(input_tokens), 0)
+               FROM usage_stats""").fetchone()
+        if not row or row[1] == 0:
+            return 0.0
+        return round(row[0] / row[1] * 100, 1)
+
+    def get_yesterday_stats(self) -> dict:
+        """Get cost and calls for yesterday (for delta calculations)."""
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM usage_stats "
+            "WHERE timestamp LIKE ?", (f"{yesterday}%",)).fetchone()
+        return {"cost": row[0] if row else 0.0, "calls": row[1] if row else 0}
+
+    def get_model_distribution_today(self) -> list[dict]:
+        """Model usage breakdown for today (for mini donut chart)."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        rows = self.db.execute(
+            """SELECT model, COUNT(*) as calls, COALESCE(SUM(cost_usd), 0) as cost
+               FROM usage_stats WHERE timestamp LIKE ?
+               GROUP BY model ORDER BY calls DESC""",
+            (f"{today}%",)).fetchall()
+        return [{"model": r[0], "calls": r[1], "cost_usd": round(r[2], 4)} for r in rows]
 
     def prune_old_memories(self, days: int = 90, min_importance: float = 0.3) -> int:
         """Delete memories older than `days` with importance below threshold.

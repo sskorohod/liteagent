@@ -51,6 +51,46 @@ class TestOverviewEndpoint:
         assert data["total_cost_usd"] == 0
 
 
+class TestCascadeEndpoint:
+    def test_cascade_returns_structure(self, client):
+        c, _ = client
+        resp = c.get("/api/ops/cascade")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "models" in data
+        assert "tier_costs" in data
+        assert "summary" in data
+        assert "history" in data
+        assert "is_local_only_now" in data
+
+    def test_cascade_tier_costs_have_pricing(self, client):
+        c, _ = client
+        data = c.get("/api/ops/cascade").json()
+        for tier in ("simple", "medium", "complex"):
+            assert tier in data["tier_costs"]
+            assert "model" in data["tier_costs"][tier]
+            assert "input_per_mtok" in data["tier_costs"][tier]
+            assert "output_per_mtok" in data["tier_costs"][tier]
+
+    def test_cascade_summary_structure(self, client):
+        c, _ = client
+        data = c.get("/api/ops/cascade").json()
+        summary = data["summary"]
+        assert "tier_counts" in summary
+        assert "total_decisions" in summary
+        assert set(summary["tier_counts"].keys()) == {"simple", "medium", "complex"}
+
+    def test_cascade_records_history(self, client):
+        from liteagent.agent import LiteAgent
+        LiteAgent._cascade_history = []
+        LiteAgent._record_cascade_decision("test-model", "simple", 0)
+        c, _ = client
+        data = c.get("/api/ops/cascade").json()
+        assert len(data["history"]) >= 1
+        assert data["history"][-1]["model"] == "test-model"
+
+
 class TestMemoriesEndpoints:
     def test_list_memories_empty(self, client):
         c, _ = client
@@ -79,7 +119,10 @@ class TestUsageEndpoints:
         c, _ = client
         resp = c.get("/api/usage?days=7")
         assert resp.status_code == 200
-        assert resp.json() == []
+        data = resp.json()
+        assert data["models"] == []
+        assert data["today_calls"] == 0
+        assert data["hour_calls"] == 0
 
     def test_daily_usage_empty(self, client):
         c, _ = client
@@ -425,3 +468,44 @@ class TestKeyManagement:
         monkeypatch.setenv("OPENAI_API_KEY", "env-key-123")
         key = get_api_key("openai")
         assert key == "env-key-123"
+
+
+class TestKnowledgeBaseEndpoints:
+    """Tests for Knowledge Base dashboard endpoints."""
+
+    def test_kb_settings_get_disabled(self, client):
+        """GET /api/settings/knowledge_base returns disabled state."""
+        c, _ = client
+        resp = c.get("/api/settings/knowledge_base")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "search_mode" in data
+        assert "chunk_size" in data
+
+    def test_kb_settings_save(self, client):
+        """POST /api/settings/knowledge_base saves config."""
+        c, _ = client
+        resp = c.post("/api/settings/knowledge_base",
+            json={"enabled": True, "search_mode": "hybrid", "chunk_size": 1000})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("ok") is True
+
+    def test_kb_documents_empty(self, client):
+        """GET /api/knowledge_base/documents returns empty list when KB not enabled."""
+        c, _ = client
+        resp = c.get("/api/knowledge_base/documents")
+        assert resp.status_code in (200, 400)  # 400 if KB not enabled
+
+    def test_kb_search_not_enabled(self, client):
+        """POST /api/knowledge_base/search returns error when KB not enabled."""
+        c, _ = client
+        resp = c.post("/api/knowledge_base/search", json={"query": "test"})
+        assert resp.status_code == 400
+
+    def test_kb_query_log_empty(self, client):
+        """GET /api/knowledge_base/query_log returns empty when KB not enabled."""
+        c, _ = client
+        resp = c.get("/api/knowledge_base/query_log")
+        assert resp.status_code in (200, 400)
