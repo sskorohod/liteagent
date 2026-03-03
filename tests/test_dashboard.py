@@ -8,7 +8,7 @@ from liteagent.channels.api import create_app
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     """Create FastAPI TestClient with real agent."""
     config = {
         "agent": {"max_iterations": 3},
@@ -19,6 +19,8 @@ def client(tmp_path):
     }
     agent = LiteAgent(config)
     app = create_app(agent)
+    # Prevent tests from overwriting real config.json
+    monkeypatch.setattr("liteagent.config.save_config", lambda *a, **kw: None)
     from starlette.testclient import TestClient
     c = TestClient(app)
     yield c, agent
