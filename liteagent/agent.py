@@ -2418,7 +2418,13 @@ class LiteAgent:
         for _sk in _triggered_skills:
             _skill_tool_names.update(_sk.metadata.tools or [])
 
-        if complexity_score <= 0 and len(text_for_memory) < 60 and not _skill_tool_names:
+        # Skip tools only for truly trivial messages (greetings, etc.)
+        # Never skip if tool-capability guard promoted the model (tools are needed)
+        _tool_guard_active = (self.cascade_routing and complexity_score < 1
+                              and hasattr(self, "tools") and self.tools._tools
+                              and self.models.get("simple") != self.models.get("medium"))
+        if (complexity_score <= 0 and len(text_for_memory) < 60
+                and not _skill_tool_names and not _tool_guard_active):
             tool_defs = []
             logger.debug("Skipping tools for simple message")
         elif self.memory._embedder and len(self.tools._tools) > 8:
