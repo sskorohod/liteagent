@@ -6,6 +6,8 @@ import os
 import pickle
 import sqlite3
 import tempfile
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -116,6 +118,34 @@ def sample_html(tmp_path):
     return str(p)
 
 
+@pytest.fixture
+def sample_docx(tmp_path):
+    """Sample OOXML document for generic extractable parsing."""
+    p = tmp_path / "sample.docx"
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/word/document.xml"
+               ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+            </Types>""",
+        )
+        archive.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p><w:r><w:t>First extracted paragraph.</w:t></w:r></w:p>
+                <w:p><w:r><w:t>Second extracted paragraph about taxes.</w:t></w:r></w:p>
+              </w:body>
+            </w:document>""",
+        )
+    p.write_bytes(buf.getvalue())
+    return str(p)
+
+
 # ═══════════════════════════════════════
 # SCHEMA
 # ═══════════════════════════════════════
@@ -166,6 +196,14 @@ class TestParsing:
         parsed = kb._parse_file(sample_html)
         tables = parsed["pages"][0]["tables"]
         assert len(tables) >= 1
+
+    def test_parse_extractable_docx(self, kb, sample_docx):
+        parsed = kb._parse_file(sample_docx)
+        sections = parsed["pages"][0]["sections"]
+        assert len(sections) >= 1
+        joined = "\n".join(section["content"] for section in sections)
+        assert "First extracted paragraph." in joined
+        assert "taxes" in joined
 
     def test_parse_file_not_found(self, kb):
         with pytest.raises(FileNotFoundError):
@@ -278,6 +316,11 @@ class TestIngestion:
         result = await kb.ingest(sample_txt)
         assert result["status"] == "ok"
         assert result["chunks"] >= 3
+
+    async def test_ingest_docx(self, kb, sample_docx):
+        result = await kb.ingest(sample_docx)
+        assert result["status"] == "ok"
+        assert result["chunks"] >= 1
 
     async def test_ingest_no_embedder(self, kb_config, sample_md):
         """KB without embedder should still work (BM25 only)."""

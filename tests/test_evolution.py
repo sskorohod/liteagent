@@ -7,7 +7,9 @@ from datetime import datetime, timedelta
 from liteagent.evolution import (
     detect_friction, store_friction, get_active_patches,
     analyze_style, update_style_profile, get_style_instruction,
-    detect_patterns, _inputs_similar,
+    detect_patterns, detect_human_support_opportunities,
+    get_human_support_snapshot,
+    _inputs_similar, synthesize_prompt_patches,
 )
 
 
@@ -95,6 +97,41 @@ class TestFrictionDetection:
         patches = get_active_patches(evo_db)
         assert patches == ["Be concise"]
 
+    @pytest.mark.asyncio
+    async def test_synthesize_prompt_patches_uses_local_agent_model(self, evo_db):
+        evo_db.execute(
+            "INSERT INTO friction_signals VALUES (NULL, 'u1', 'correction', 'wrong answer', 'bad response', NULL, ?)",
+            (datetime.now().isoformat(),),
+        )
+        evo_db.commit()
+
+        class OllamaProvider:
+            def __init__(self):
+                self.seen_model = None
+
+            async def complete(self, model, max_tokens, messages):
+                self.seen_model = model
+
+                class Block:
+                    text = '{"patches":["Always verify the root route in browser before claiming frontend is ready."]}'
+
+                class Result:
+                    content = [Block()]
+
+                return Result()
+
+        provider = OllamaProvider()
+        patches = await synthesize_prompt_patches(
+            provider,
+            evo_db,
+            {
+                "min_friction_signals": 1,
+                "_agent_config": {"default_model": "qwen3-coder:30b"},
+            },
+        )
+        assert provider.seen_model == "qwen3-coder:30b"
+        assert len(patches) == 1
+
 
 class TestStyleAdaptation:
     def test_analyze_casual_text(self):
@@ -177,3 +214,122 @@ class TestProactiveAgent:
 
     def test_inputs_similar_empty(self):
         assert _inputs_similar("", "") is False
+
+    def test_detects_recurring_workflow_for_similar_request(self, evo_db):
+        now = datetime.now().isoformat()
+        rows = [
+            ("build fastapi dashboard", '[{"name":"read_file"},{"name":"write_file"}]'),
+            ("build fastapi admin dashboard", '[{"name":"read_file"},{"name":"write_file"}]'),
+            ("build dashboard in fastapi", '[{"name":"read_file"},{"name":"write_file"}]'),
+        ]
+        for user_input, tools in rows:
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', ?, 1, 0.9, 'local', ?)",
+                (user_input, tools, now),
+            )
+        evo_db.commit()
+
+        result = detect_patterns(
+            evo_db,
+            "u1",
+            "build a fastapi dashboard for analytics",
+            {"pattern_window_days": 30, "min_pattern_occurrences": 3},
+        )
+        assert any("recurring workflow" in item.lower() for item in result)
+        assert any("write_file" in item for item in result)
+
+    def test_detects_likely_followup_step(self, evo_db):
+        base_time = datetime.now() - timedelta(days=1)
+        for i in range(3):
+            t1 = (base_time + timedelta(minutes=i * 10)).isoformat()
+            t2 = (base_time + timedelta(minutes=i * 10 + 1)).isoformat()
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', '[]', 1, 0.8, 'local', ?)",
+                ("sync drive files", t1),
+            )
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', '[]', 1, 0.8, 'local', ?)",
+                ("search files by content", t2),
+            )
+        evo_db.commit()
+
+        result = detect_patterns(
+            evo_db,
+            "u1",
+            "sync files from google drive",
+            {"pattern_window_days": 30, "min_pattern_occurrences": 3},
+        )
+        assert any("asks next to" in item.lower() for item in result)
+        assert any("search files by content" in item.lower() for item in result)
+
+    def test_ignores_failed_runs_for_proactive_suggestions(self, evo_db):
+        now = datetime.now().isoformat()
+        for _ in range(4):
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'failed', '[]', 0, 0.2, 'local', ?)",
+                ("deploy production build", now),
+            )
+        evo_db.commit()
+
+        result = detect_patterns(
+            evo_db,
+            "u1",
+            "deploy the app",
+            {"pattern_window_days": 30, "min_pattern_occurrences": 3, "min_confidence": 0.5},
+        )
+        assert result == []
+
+
+class TestHumanSupportAgent:
+    def test_detects_overload_and_focus_support(self, evo_db):
+        result = detect_human_support_opportunities(
+            evo_db,
+            "u1",
+            "Я перегружен и не могу сосредоточиться, слишком много задач",
+            {"enabled": True, "max_suggestions": 3},
+        )
+        text = "\n".join(result).lower()
+        assert "overloaded" in text
+        assert "focus reset" in text
+
+    def test_detects_late_night_energy_pattern(self, evo_db):
+        for day in range(3):
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', '[]', 1, 0.9, 'local', ?)",
+                ("finish work late at night", f"2026-03-0{day + 1}T23:45:00"),
+            )
+        evo_db.commit()
+        result = detect_human_support_opportunities(
+            evo_db,
+            "u1",
+            "надо доделать еще сегодня",
+            {"enabled": True, "min_pattern_occurrences": 3, "late_night_hour": 23, "early_hour": 6},
+        )
+        assert any("energy" in item.lower() for item in result)
+
+    def test_detects_admin_burden_and_suggests_automation(self, evo_db):
+        timestamps = ["2026-03-01T10:00:00", "2026-03-02T11:00:00", "2026-03-03T12:00:00"]
+        for ts in timestamps:
+            evo_db.execute(
+                "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', '[]', 1, 0.8, 'local', ?)",
+                ("renew passport reminder deadline", ts),
+            )
+        evo_db.commit()
+        result = detect_human_support_opportunities(
+            evo_db,
+            "u1",
+            "надо продлить документы",
+            {"enabled": True, "min_pattern_occurrences": 3},
+        )
+        assert any("reminders" in item.lower() or "calendar" in item.lower() for item in result)
+
+    def test_builds_human_support_snapshot(self, evo_db):
+        evo_db.execute(
+            "INSERT INTO interaction_log VALUES (NULL, 'u1', ?, 'done', '[]', 1, 0.9, 'local', ?)",
+            ("I am overwhelmed and need a reminder for renewal", "2026-03-09T23:50:00"),
+        )
+        evo_db.commit()
+        snapshot = get_human_support_snapshot(evo_db, "u1", "", {"enabled": True})
+        assert snapshot["enabled"] is True
+        assert snapshot["metrics"]["overload_signals"] >= 1
+        assert isinstance(snapshot["opportunities"], list)

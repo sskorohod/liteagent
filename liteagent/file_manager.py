@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from .file_types import detect_file_type, extract_text_from_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,8 +54,8 @@ class FileManager:
                      source: str = "unknown", user_id: str = "system",
                      mime_type: str = "", description: str = "") -> dict:
         """Store file in S3 and index it.  Returns file metadata dict."""
-        if not mime_type:
-            mime_type = mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+        file_info = detect_file_type(data, original_name, mime_type)
+        mime_type = file_info.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream"
 
         # Deterministic key: prefix/hash_originalname
         file_hash = hashlib.sha256(data).hexdigest()[:16]
@@ -66,7 +68,7 @@ class FileManager:
 
         # Auto-describe: for text-based files, extract first lines
         if not description:
-            description = self._auto_describe(data, mime_type, original_name)
+            description = self._auto_describe(data, file_info, original_name)
 
         # Embed description for search
         embedding_blob = None
@@ -92,9 +94,9 @@ class FileManager:
         self._db.commit()
 
         # Full-content indexing via RAG pipeline
-        if self._rag and self._should_index(mime_type, original_name, len(data)):
+        if self._rag and self._should_index(file_info, len(data)):
             try:
-                text = self._extract_text(data, mime_type)
+                text = self._extract_text(data, file_info)
                 if text and len(text.strip()) > 20:
                     ext = Path(original_name).suffix
                     self._rag.index_content(
@@ -297,6 +299,48 @@ class FileManager:
             f"SELECT COUNT(*) FROM file_index WHERE {where}", params).fetchone()
         return row[0] if row else 0
 
+    def update_description(self, storage_key: str, description: str, *, user_id: str | None = None) -> bool:
+        """Update indexed description for an existing file, preserving useful older context."""
+        key = str(storage_key or "").strip()
+        new_desc = " ".join(str(description or "").split())
+        if not key or not new_desc:
+            return False
+
+        row = self._db.execute(
+            "SELECT description, user_id FROM file_index WHERE storage_key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return False
+
+        existing_desc = str(row[0] or "").strip()
+        owner = str(row[1] or "").strip()
+        if user_id and owner and owner != str(user_id).strip():
+            return False
+
+        if existing_desc and existing_desc != new_desc:
+            merged = f"{existing_desc} | {new_desc}"
+        else:
+            merged = new_desc
+
+        # Deduplicate repeated fragments after repeated enrich passes.
+        parts = []
+        seen = set()
+        for part in [p.strip() for p in merged.split("|") if p.strip()]:
+            marker = part.lower()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            parts.append(part)
+        merged = " | ".join(parts)[:4000]
+
+        self._db.execute(
+            "UPDATE file_index SET description = ?, accessed_at = datetime('now') WHERE storage_key = ?",
+            (merged, key),
+        )
+        self._db.commit()
+        return True
+
     # ── Get presigned URL ────────────────────────────────────
 
     async def get_download_url(self, storage_key: str,
@@ -347,78 +391,53 @@ class FileManager:
 
     # ── Internal helpers ─────────────────────────────────────
 
-    def _should_index(self, mime_type: str, name: str, size: int) -> bool:
+    def _should_index(self, file_info, size: int) -> bool:
         """Check if file should be full-text indexed via RAG."""
         max_size = 10 * 1024 * 1024  # 10 MB default
         if size > max_size:
             return False
-        ext = Path(name).suffix.lower()
+        ext = str(getattr(file_info, "extension", "") or "").lower()
+        mime_type = str(getattr(file_info, "mime_type", "") or "")
         if ext in self._INDEXABLE_EXTENSIONS:
             return True
         if mime_type in self._INDEXABLE_TEXT_TYPES:
             return True
         if mime_type.startswith("text/"):
             return True
+        if getattr(file_info, "can_extract_text", False):
+            return True
         return False
 
     @staticmethod
-    def _extract_text(data: bytes, mime_type: str) -> str:
+    def _extract_text(data: bytes, file_info_or_mime) -> str:
         """Extract text content from file data for RAG indexing."""
-        if mime_type.startswith("text/") or mime_type in (
-            "application/json", "application/xml",
-            "application/javascript", "application/x-python",
-        ):
-            return data.decode("utf-8", errors="replace")
-
-        if mime_type == "application/pdf":
-            try:
-                import fitz
-                doc = fitz.open(stream=data, filetype="pdf")
-                text = "\n\n".join(page.get_text() for page in doc)
-                doc.close()
-                return text
-            except ImportError:
-                return ""
-            except Exception:
-                return ""
-
-        # Fallback: try decoding as text
-        try:
-            return data.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+        if isinstance(file_info_or_mime, str):
+            file_info = detect_file_type(data, "", file_info_or_mime)
+        else:
+            file_info = file_info_or_mime
+        return extract_text_from_file(data, file_info)
 
     @staticmethod
-    def _auto_describe(data: bytes, mime_type: str, name: str) -> str:
+    def _auto_describe(data: bytes, file_info_or_mime, name: str) -> str:
         """Generate a short description from file content."""
+        if isinstance(file_info_or_mime, str):
+            file_info = detect_file_type(data, name, file_info_or_mime)
+        else:
+            file_info = file_info_or_mime
+        mime_type = file_info.mime_type
         parts = [name]
 
-        # Text-based files: extract first lines
-        if mime_type.startswith("text/") or mime_type in (
-            "application/json", "application/xml",
-            "application/javascript", "application/x-python",
-        ):
+        # Text-based and office files: extract first lines
+        if file_info.can_extract_text:
             try:
-                text = data[:2000].decode("utf-8", errors="replace")
+                text = extract_text_from_file(data, file_info)[:2000]
                 first_lines = text.strip().split("\n")[:5]
                 parts.append(" ".join(first_lines)[:300])
             except Exception:
                 pass
 
-        # PDF: try extracting text from first page
-        elif mime_type == "application/pdf":
-            try:
-                import fitz
-                doc = fitz.open(stream=data, filetype="pdf")
-                if doc.page_count > 0:
-                    page_text = doc[0].get_text()[:500]
-                    parts.append(page_text.strip()[:300])
-                doc.close()
-            except Exception:
-                pass
-
         # Images: include dimensions if possible
-        elif mime_type.startswith("image/"):
+        elif file_info.is_image:
             try:
                 from io import BytesIO
                 # Try PIL for dimensions
@@ -427,6 +446,8 @@ class FileManager:
                 parts.append(f"image {img.width}x{img.height}")
             except Exception:
                 parts.append("image file")
+        else:
+            parts.append(f"{file_info.label} ({mime_type})")
 
         return " | ".join(parts)
 

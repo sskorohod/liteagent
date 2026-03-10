@@ -192,7 +192,13 @@ Full `config.json` reference:
   "channels": {
     "cli": { "enabled": true },
     "telegram": { "enabled": false, "token_env": "TELEGRAM_BOT_TOKEN" },
-    "api": { "enabled": false, "host": "0.0.0.0", "port": 8080 }
+    "api": {
+      "enabled": false,
+      "host": "0.0.0.0",
+      "port": 8080,
+      "password": "set-a-strong-password",
+      "allow_unauthenticated_public": false
+    }
   },
   "cost": {
     "cascade_routing": true,

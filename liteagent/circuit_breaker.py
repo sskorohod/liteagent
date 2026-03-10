@@ -29,6 +29,7 @@ class ProviderState:
     total_calls: int = 0
     consecutive_failures: int = 0
     error_history: list = field(default_factory=list)
+    backoff_multiplier: int = 1  # exponential backoff for recovery failures
 
 
 class CircuitBreaker:
@@ -68,9 +69,11 @@ class CircuitBreaker:
             logger.info("Circuit breaker: %s recovered (closed)", provider)
             st.state = "closed"
             st.cooldown_until = 0.0
+            st.backoff_multiplier = 1  # reset on recovery
 
     def record_failure(self, provider: str, error: Exception) -> None:
-        """Record a failed API call. May open the circuit."""
+        """Record a failed API call. May open the circuit with exponential backoff."""
+        import random
         st = self._get_state(provider)
         st.failure_count += 1
         st.total_calls += 1
@@ -85,13 +88,18 @@ class CircuitBreaker:
             st.error_history = st.error_history[-self.max_error_history:]
 
         if st.state == "half_open":
-            # Failed during recovery test — re-open
+            # Failed during recovery — escalate backoff (cap at 16x)
+            st.backoff_multiplier = min(st.backoff_multiplier * 2, 16)
+            jitter = random.uniform(0.8, 1.2)
+            cooldown = self.recovery_timeout * st.backoff_multiplier * jitter
             st.state = "open"
-            st.cooldown_until = time.time() + self.recovery_timeout
+            st.cooldown_until = time.time() + cooldown
             logger.warning("Circuit breaker: %s failed recovery, re-opened "
-                           "(cooldown %.0fs)", provider, self.recovery_timeout)
+                           "(cooldown %.0fs, backoff %dx)",
+                           provider, cooldown, st.backoff_multiplier)
         elif (st.state == "closed"
               and st.consecutive_failures >= self.failure_threshold):
+            st.backoff_multiplier = 1  # fresh open
             st.state = "open"
             st.cooldown_until = time.time() + self.recovery_timeout
             logger.warning("Circuit breaker: %s opened after %d consecutive "

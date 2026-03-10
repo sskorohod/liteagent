@@ -56,6 +56,37 @@ class TestValidateConfig:
         warnings = validate_config(config)
         assert any("max_iteratons" in w for w in warnings)
 
+    def test_memory_extraction_keys_are_known(self):
+        config = {
+            "memory": {
+                "extraction_provider": "ollama",
+                "extraction_model": "qwen2.5:latest",
+                "extraction_max_concurrency": 1,
+                "memory_exchange_enabled": True,
+                "memory_exchange_pack_budget_tokens": 420,
+                "memory_exchange_max_packs": 2,
+                "memory_exchange_context_budget_tokens": 700,
+                "memory_exchange_daemon_enabled": True,
+                "memory_exchange_daemon_interval_sec": 1.0,
+                "memory_exchange_daemon_batch_size": 3,
+                "memory_exchange_daemon_auto_pause": True,
+                "memory_exchange_daemon_pause_active_requests": 1,
+                "memory_exchange_daemon_pause_queued_requests": 2,
+                "memory_exchange_queue_max_pending": 5000,
+                "memory_exchange_max_attempts": 3,
+                "memory_local_worker_enabled": True,
+                "memory_local_worker_interval_sec": 12.0,
+                "memory_local_worker_batch_size": 24,
+                "user_aliases": {"dashboard-user": "tg-123"},
+                "shadow_twin_enabled": True,
+                "shadow_twin_predictions": 3,
+                "shadow_twin_use_llm": True,
+                "_default_model": "qwen-plus",
+            }
+        }
+        warnings = validate_config(config)
+        assert not any("Unknown memory key" in w for w in warnings)
+
 
 class TestSoulPrompt:
 

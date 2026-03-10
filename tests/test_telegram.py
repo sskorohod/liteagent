@@ -1,5 +1,6 @@
 """Tests for Telegram channel — handlers, file sending, API client adapter."""
 
+import asyncio
 import io
 import os
 import tempfile
@@ -63,7 +64,7 @@ class TestMessageHandler:
 
         await handler(update, MagicMock())
 
-        client.chat.assert_awaited_once_with("Hello", "tg-456")
+        client.chat.assert_awaited_once_with("Hello", "tg-456", chat_id=123)
         update.message.reply_text.assert_awaited_once_with("Hello from API!")
 
     @pytest.mark.asyncio
@@ -107,6 +108,33 @@ class TestMessageHandler:
         assert len(first_call) == 4096
 
 
+class TestDirectTelegramAdapter:
+    @pytest.mark.asyncio
+    async def test_direct_adapter_remembers_last_chat_id(self, tmp_path):
+        from liteagent.agent import LiteAgent
+        from liteagent.channels.telegram import _DirectAPIAdapter
+
+        config = {
+            "agent": {
+                "max_iterations": 2,
+                "provider": "ollama",
+                "default_model": "qwen3:30b",
+            },
+            "cost": {"budget_daily_usd": 100.0, "prompt_caching": False},
+            "memory": {"db_path": str(tmp_path / "test.db"), "auto_learn": False},
+            "tools": {"builtin": []},
+        }
+        agent = LiteAgent(config)
+        adapter = _DirectAPIAdapter(agent)
+        agent.run = AsyncMock(return_value="ok")
+        try:
+            await adapter.chat("hello", "tg-456", chat_id=123)
+            remembered = agent.memory.get_state("user:telegram_chat_id", user_id="tg-456")
+            assert remembered == "123"
+        finally:
+            agent.memory.close()
+
+
 class TestPhotoHandler:
     """Test _make_photo_handler."""
 
@@ -136,6 +164,7 @@ class TestPhotoHandler:
         client.chat_multimodal.assert_awaited_once()
         call_args = client.chat_multimodal.call_args
         assert call_args.kwargs["user_id"] == "tg-456"
+        assert call_args.kwargs["chat_id"] == 123
         assert len(call_args.kwargs["files"]) == 1
         assert call_args.kwargs["files"][0][0] == "photo.jpg"
 
@@ -159,7 +188,7 @@ class TestPhotoHandler:
         await handler(update, MagicMock())
 
         call_args = client.chat_multimodal.call_args
-        assert call_args.kwargs["message"] == "What breed is this dog?"
+        assert "What breed is this dog?" in call_args.kwargs["message"]
 
     @pytest.mark.asyncio
     async def test_photo_filtered_by_chat_id(self):
@@ -175,23 +204,29 @@ class TestPhotoHandler:
 
     @pytest.mark.asyncio
     async def test_photo_typing_indicator(self):
-        """Should show typing indicator while processing."""
+        """Should show typing indicator while processing (via _typing_loop)."""
         client = _make_api_client()
         handler = self._get_handler(client)
 
         update = _make_update()
         update.message.caption = None
 
+        async def _slow_download():
+            await asyncio.sleep(0.05)
+            return bytearray(b"\xff\xd8" + b"\x00" * 50)
+
         mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"\xff\xd8" + b"\x00" * 50))
+        mock_file.download_as_bytearray = _slow_download
         photo_size = MagicMock()
         photo_size.get_file = AsyncMock(return_value=mock_file)
         update.message.photo = [photo_size]
 
         await handler(update, MagicMock())
 
+        # _typing_loop sends typing action via chat.send_action
         update.message.chat.send_action.assert_awaited()
-        assert update.message.chat.send_action.call_args_list[0][0][0] == "typing"
+        calls = [c[0][0] for c in update.message.chat.send_action.call_args_list]
+        assert "typing" in calls
 
 
 class TestDocumentHandler:
@@ -241,7 +276,7 @@ class TestDocumentHandler:
         client.chat_multimodal.assert_not_awaited()
         update.message.reply_text.assert_awaited_once()
         error_text = update.message.reply_text.call_args[0][0]
-        assert "too large" in error_text.lower()
+        assert "слишком большой" in error_text.lower() or "too large" in error_text.lower()
 
     @pytest.mark.asyncio
     async def test_document_with_caption(self):
@@ -263,7 +298,7 @@ class TestDocumentHandler:
         await handler(update, MagicMock())
 
         call_args = client.chat_multimodal.call_args
-        assert call_args.kwargs["message"] == "Please analyze this CSV"
+        assert "Please analyze this CSV" in call_args.kwargs["message"]
 
     @pytest.mark.asyncio
     async def test_document_filtered_by_chat_id(self):
@@ -305,9 +340,9 @@ class TestVoiceHandler:
         await handler(update, MagicMock())
 
         client.chat_voice.assert_awaited_once()
-        call_args = client.chat_voice.call_args
-        assert call_args[0][1] == "tg-456"  # user_id
-        assert call_args[0][2] == "5"  # duration
+        call_kwargs = client.chat_voice.call_args.kwargs
+        assert call_kwargs["chat_id"] == 123
+        assert call_kwargs["duration"] == "5"
 
 
 class TestSendFiles:
@@ -455,32 +490,70 @@ class TestSendFiles:
                 os.unlink(path)
 
 
-class TestCommandHandler:
-    """Test _make_command_handler."""
+def _make_cmd_handler(memories=None, usage_summary=None, today_cost=0.0,
+                      archived=None, rag=None):
+    """Create a mock TelegramCommandHandler with controllable data."""
+    from liteagent.channels.telegram import TelegramCommandHandler
+    memory = MagicMock()
+    memory.get_all_memories.return_value = memories or []
+    memory.get_usage_summary.return_value = usage_summary or []
+    memory.get_today_cost.return_value = today_cost
+    memory.clear_conversation = MagicMock()
+    memory.forget = MagicMock()
+    memory.get_archived_memories.return_value = archived or []
+    config = {
+        "agent": {"provider": "anthropic", "default_model": "claude-sonnet-4-20250514"},
+        "cost": {"budget_daily_usd": 5.0, "cascade_routing": False},
+    }
+    return TelegramCommandHandler(memory=memory, config=config, rag=rag)
 
-    def _get_handler(self, api_client, allowed=None):
+
+class TestCommandHandler:
+    """Test _make_command_handler with instant TelegramCommandHandler."""
+
+    def _get_handler(self, cmd_handler, api_client, allowed=None):
         from liteagent.channels.telegram import _make_command_handler
-        return _make_command_handler(api_client, allowed)
+        return _make_command_handler(cmd_handler, api_client, allowed)
 
     @pytest.mark.asyncio
-    async def test_command_via_api(self):
-        """Command → api_client.command() → reply_text()."""
+    async def test_instant_help_no_api_call(self):
+        """Instant commands do NOT call api_client — handled locally."""
+        cmd_h = _make_cmd_handler()
         client = _make_api_client()
-        handler = self._get_handler(client)
+        handler = self._get_handler(cmd_h, client)
 
         update = _make_update()
         update.message.text = "/help"
 
         await handler(update, MagicMock())
 
-        client.command.assert_awaited_once_with("/help", "tg-456")
+        client.command.assert_not_awaited()
+        update.message.reply_text.assert_awaited()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Команды:" in text
+
+    @pytest.mark.asyncio
+    async def test_model_write_delegates_to_api(self):
+        """/model <name> should delegate to api_client (mutates agent state)."""
+        cmd_h = _make_cmd_handler()
+        client = _make_api_client(command_response={
+            "response": "Model changed.", "files": []})
+        handler = self._get_handler(cmd_h, client)
+
+        update = _make_update()
+        update.message.text = "/model gpt-4o"
+
+        await handler(update, MagicMock())
+
+        client.command.assert_awaited_once()
         update.message.reply_text.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_unknown_command(self):
-        """Unknown command → response None → 'Unknown command' message."""
-        client = _make_api_client(command_response={"response": None, "files": []})
-        handler = self._get_handler(client)
+        """Unknown command → 'Неизвестная команда' message."""
+        cmd_h = _make_cmd_handler()
+        client = _make_api_client()
+        handler = self._get_handler(cmd_h, client)
 
         update = _make_update()
         update.message.text = "/unknown"
@@ -488,7 +561,227 @@ class TestCommandHandler:
         await handler(update, MagicMock())
 
         text = update.message.reply_text.call_args[0][0]
-        assert "unknown" in text.lower() or "Unknown" in text
+        assert "Неизвестная команда" in text
+
+
+class TestTelegramCommandHandler:
+    """Test instant command handler (TelegramCommandHandler)."""
+
+    def test_help_returns_commands_list(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/help", "tg-1")
+        assert result is not None
+        assert "Команды:" in result
+        assert "/clear" in result
+        assert "/memories" in result
+
+    def test_help_includes_rag_when_available(self):
+        rag = MagicMock()
+        cmd_h = _make_cmd_handler(rag=rag)
+        result = cmd_h.handle("/help", "tg-1")
+        assert "/ingest" in result
+        assert "/documents" in result
+
+    def test_help_excludes_rag_when_unavailable(self):
+        cmd_h = _make_cmd_handler(rag=None)
+        result = cmd_h.handle("/help", "tg-1")
+        assert "/ingest" not in result
+        assert "/documents" not in result
+
+    def test_clear_calls_memory(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/clear", "tg-42")
+        assert "очищен" in result.lower()
+        cmd_h.memory.clear_conversation.assert_called_once_with("tg-42")
+
+    def test_memories_empty(self):
+        cmd_h = _make_cmd_handler(memories=[])
+        result = cmd_h.handle("/memories", "tg-1")
+        assert "пока нет" in result.lower()
+
+    def test_memories_with_data(self):
+        memories = [
+            {"type": "fact", "content": "User likes Python", "importance": 0.8},
+            {"type": "preference", "content": "Dark mode", "importance": 0.5},
+        ]
+        cmd_h = _make_cmd_handler(memories=memories)
+        result = cmd_h.handle("/memories", "tg-1")
+        assert "2 воспоминани" in result
+        assert "Python" in result
+
+    def test_usage_empty(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/usage", "tg-1")
+        assert "пока нет" in result.lower()
+
+    def test_usage_with_data(self):
+        summary = [{"model": "claude-sonnet", "calls": 10,
+                     "input_tokens": 5000, "output_tokens": 3000, "cost_usd": 0.05}]
+        cmd_h = _make_cmd_handler(usage_summary=summary, today_cost=0.02)
+        result = cmd_h.handle("/usage", "tg-1")
+        assert "$0.0200" in result
+        assert "claude-sonnet" in result
+
+    def test_forget_calls_memory(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/forget dark mode", "tg-1")
+        assert "dark mode" in result
+        cmd_h.memory.forget.assert_called_once_with("tg-1", "dark mode")
+
+    def test_conflicts_empty(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/conflicts", "tg-1")
+        assert "пока не было" in result.lower()
+
+    def test_conflicts_with_data(self):
+        archived = [{"type": "fact", "content": "Old fact",
+                      "archived_at": "2026-01-15 10:00"}]
+        cmd_h = _make_cmd_handler(archived=archived)
+        result = cmd_h.handle("/conflicts", "tg-1")
+        assert "1 архивн" in result
+        assert "Old fact" in result
+
+    def test_documents_no_rag(self):
+        cmd_h = _make_cmd_handler(rag=None)
+        result = cmd_h.handle("/documents", "tg-1")
+        assert "RAG" in result
+
+    def test_documents_empty(self):
+        rag = MagicMock()
+        rag.list_documents.return_value = []
+        cmd_h = _make_cmd_handler(rag=rag)
+        result = cmd_h.handle("/documents", "tg-1")
+        assert "пока нет" in result.lower()
+
+    def test_documents_with_data(self):
+        rag = MagicMock()
+        rag.list_documents.return_value = [
+            {"id": 1, "name": "readme.md", "chunks": 5}]
+        cmd_h = _make_cmd_handler(rag=rag)
+        result = cmd_h.handle("/documents", "tg-1")
+        assert "readme.md" in result
+        assert "5 частей" in result
+
+    def test_model_read_shows_status(self):
+        cmd_h = _make_cmd_handler()
+        with patch("liteagent.channels.telegram.TelegramCommandHandler._model_status",
+                    return_value="Провайдер: anthropic\nМодель: claude-sonnet"):
+            result = cmd_h.handle("/model", "tg-1")
+        assert "Провайдер" in result or "Модель" in result
+
+    def test_model_write_returns_none(self):
+        """'/model <name>' returns None (handled by api_client fallback)."""
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/model gpt-4o", "tg-1")
+        assert result is None
+
+    def test_ingest_returns_none(self):
+        """'/ingest' returns None (handled separately with progress)."""
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/ingest some/path", "tg-1")
+        assert result is None
+
+    def test_unknown_returns_none(self):
+        cmd_h = _make_cmd_handler()
+        result = cmd_h.handle("/foobar", "tg-1")
+        assert result is None
+
+
+class TestTypingLoop:
+    """Test _typing_loop context manager."""
+
+    @pytest.mark.asyncio
+    async def test_sends_typing_action(self):
+        """Typing action should be sent at least once."""
+        from liteagent.channels.telegram import _typing_loop
+        chat = MagicMock()
+        chat.send_action = AsyncMock()
+
+        async with _typing_loop(chat, interval=0.05):
+            await asyncio.sleep(0.1)
+
+        chat.send_action.assert_awaited()
+        assert chat.send_action.call_args_list[0][0][0] == "typing"
+
+    @pytest.mark.asyncio
+    async def test_stops_on_exit(self):
+        """Typing loop task should be cleaned up after exiting."""
+        from liteagent.channels.telegram import _typing_loop
+        chat = MagicMock()
+        chat.send_action = AsyncMock()
+
+        async with _typing_loop(chat, interval=0.05):
+            pass
+
+        # After exit, no more calls should happen
+        count_after = chat.send_action.await_count
+        await asyncio.sleep(0.15)
+        assert chat.send_action.await_count == count_after
+
+    @pytest.mark.asyncio
+    async def test_no_status_if_fast(self):
+        """No status message if operation completes quickly."""
+        from liteagent.channels.telegram import _typing_loop
+        chat = MagicMock()
+        chat.send_action = AsyncMock()
+        reply_func = AsyncMock()
+
+        async with _typing_loop(chat, reply_func=reply_func,
+                                 interval=0.05, status_after=1.0):
+            await asyncio.sleep(0.05)
+
+        reply_func.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_message_after_delay(self):
+        """Status message sent after status_after seconds."""
+        from liteagent.channels.telegram import _typing_loop
+        chat = MagicMock()
+        chat.send_action = AsyncMock()
+        reply_func = AsyncMock()
+
+        async with _typing_loop(chat, reply_func=reply_func,
+                                 interval=0.05, status_after=0.1):
+            await asyncio.sleep(0.25)
+
+        reply_func.assert_awaited_once()
+        assert "Работаю" in reply_func.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_graceful_on_send_error(self):
+        """Typing loop should not crash if send_action raises."""
+        from liteagent.channels.telegram import _typing_loop
+        chat = MagicMock()
+        chat.send_action = AsyncMock(side_effect=Exception("Network error"))
+
+        async with _typing_loop(chat, interval=0.05):
+            await asyncio.sleep(0.1)
+        # No exception raised — test passes
+
+
+class TestErrorHandling:
+    """Test _user_friendly_error function."""
+
+    def test_timeout_error(self):
+        from liteagent.channels.telegram import _user_friendly_error
+        msg = _user_friendly_error(Exception("Read timed out"))
+        assert "слишком много времени" in msg.lower()
+
+    def test_rate_limit_error(self):
+        from liteagent.channels.telegram import _user_friendly_error
+        msg = _user_friendly_error(Exception("Rate limit exceeded"))
+        assert "запрос" in msg.lower()
+
+    def test_connection_error(self):
+        from liteagent.channels.telegram import _user_friendly_error
+        msg = _user_friendly_error(Exception("Connection refused"))
+        assert "соединен" in msg.lower()
+
+    def test_generic_error(self):
+        from liteagent.channels.telegram import _user_friendly_error
+        msg = _user_friendly_error(Exception("NoneType has no attribute 'foo'"))
+        assert "ошибка" in msg.lower()
+        assert "NoneType" not in msg  # No raw exception leak
 
 
 class TestProviderConversion:

@@ -124,14 +124,126 @@ Unified interface for 4 LLM backends:
 
 Select via `config.agent.provider` (default: "anthropic").
 
-### Memory (memory.py — 4 layers)
+### Memory (memory.py — current implementation, Mar 2026)
 
-- **L1 Conversation** — RAM, current session messages
-- **L2 Scoped State** — SQLite, per-user key-value store
-- **L3 Semantic Recall** — Embeddings + keyword search, cosine similarity
-- **L4 Knowledge** — Auto-extracted facts via Haiku, importance scoring
+The memory system is now a hybrid stack with identity normalization, canonical profile slots,
+type-aware retrieval, explainability traces, and background indexing workers.
 
-**Temporal decay:** `score * exp(-decay_rate * days_since_access)` for graceful forgetting.
+**Core layers (still valid):**
+- **L1 Conversation** — RAM message buffers (`_conversations`) + persisted `chat_history`
+- **L2 Scoped State** — `user_state` / `app_state`
+- **L3 Semantic Recall** — hybrid vector + FTS/BM25 + graph recall + temporal decay
+- **L4 Knowledge Extractor** — auto extraction (`facts/preferences/corrections`) from turns
+- **L5 Memory Exchange** — precomputed context packs + shadow predictions
+- **L6 Quality/Explainability** — recall traces + quality KPIs
+
+#### 1) Canonical identity across channels
+
+**Problem solved:** `dashboard-user`, `api-user`, `tg-*` could diverge.
+
+**Now:**
+- `user_identity_map(alias_user_id -> person_id, source, confidence)` stores canonical mapping.
+- `MemorySystem.get_canonical_person_id()` resolves every memory operation to canonical `person_id`.
+- `MemorySystem.set_user_alias()` persists mapping and triggers `_merge_identity_data(alias, person)`:
+  - rewrites `user_id` in memory/chat/metrics tables
+  - merges `user_state`, `session_summaries`, `style_profiles`, canonical slot history
+  - merges in-RAM conversation buffers
+- `LiteAgent.resolve_user_id()` now checks persistent identity map first, then config aliases,
+  then heuristic auto-aliasing.
+
+#### 2) Canonical profile slots with versioning
+
+Added tables:
+- `canonical_profile_slots(person_id, slot_key, slot_value, confidence, version, source, updated_at)`
+- `canonical_profile_slot_history(...)` immutable history
+
+Supported canonical slots: `name`, `language`, `role`.
+
+`upsert_canonical_slot()` behavior:
+- confidence-aware updates (keeps stronger existing value unless new evidence is better)
+- increments `version` on real value change
+- writes immutable history row on every accepted update
+
+`get_user_profile()` now overlays canonical slot values on top of `user:profile_facts`.
+
+#### 3) Anti-pollution memory filter
+
+`_is_memory_pollution_text()` denies low-signal assistant disclaimers from entering long-term memory.
+
+Examples filtered:
+- "I can't remember previous conversations"
+- "As an AI..."
+- RU equivalents ("я не помню прошлые разговоры", etc.)
+
+Applied in:
+- `remember()` for `fact/preference/correction`
+- `extract_and_learn()` cleanup pipeline
+
+Extraction quality accounting is stored in `memory_extraction_runs`:
+- `total_candidates`, `saved_count`, `dropped_pollution`
+
+#### 4) Type-aware retrieval (personal queries)
+
+Added `recall_type_aware(query, user_id)`:
+- classifies personal intent (`_classify_query_intent`) and slot (`name/language/role`)
+- injects canonical profile slot memory first when available
+- ranks by slot-match + memory type bonuses:
+  - profile slot > fact > preference > correction > generic
+- then falls back to standard hybrid recall ordering
+
+This is now used by agent prompt building via `_cached_recall()` and by `memory_search` tool.
+
+#### 5) Memory Exchange daemon + local worker
+
+Daemon queue (`memory_exchange_intents`) already existed; now extended with:
+- priority scheduling, retry/fail status lifecycle, auto-pause on high active/queued load
+- always-on local worker loop (`run_local_memory_worker_once`) running inside daemon loop:
+  - backfills canonical slots from newly stored memories
+  - can back-link memories to graph entities
+  - controlled by:
+    - `memory_local_worker_enabled`
+    - `memory_local_worker_interval_sec`
+    - `memory_local_worker_batch_size`
+
+Daemon state exposes local-worker stats:
+- `local_worker_last_run`, `local_worker_last_stats`
+
+#### 6) Explainability and quality metrics
+
+Explainability:
+- `memory_recall_traces` stores latest retrieval traces:
+  - query, strategy, intent slot, profile expected/hit, top 3-5 memories with scores
+- APIs use `get_last_recall_trace()`
+
+Quality KPIs (`get_memory_quality_metrics()`):
+- `recall_at_k`
+- `recall_confident_at_k`
+- `profile_accuracy`
+- `contradiction_rate` (canonical slot value conflicts)
+- `memory_poison_rate`
+
+These are attached to `get_memory_metrics()` and dashboard telemetry.
+
+#### 7) Dashboard/API surfaces for memory ops
+
+Key endpoints:
+- `GET /api/memory/exchange`:
+  - queue + daemon + token economics
+  - `identity`, `quality_metrics`, `explainability`
+- `GET /api/memory/explain?user_id=&limit=`
+- `GET /api/memory/identity?user_id=`
+- `POST /api/memory/identity` (manual alias mapping)
+
+Settings endpoint (`POST /api/settings/memory`) now also saves local-worker controls.
+
+#### 8) Practical debugging checklist (for future Claude edits)
+
+When user says "agent forgot my name":
+1. `GET /api/memory/identity?user_id=dashboard-user` — verify canonical `person_id`.
+2. `GET /api/memory/exchange` — inspect `identity.aliases`, `quality_metrics.profile_accuracy`.
+3. `GET /api/memory/explain?limit=5` — verify top memories and whether profile slot was used.
+4. Check canonical slot state in DB (`canonical_profile_slots`) for `slot_key='name'`.
+5. Ensure polluted corrections are not dominating (`memory_poison_rate` high => tune filters).
 
 ### Voice Engine (voice.py)
 
@@ -185,10 +297,15 @@ Select via `config.agent.provider` (default: "anthropic").
 - `WebSocket /ws` — real-time events hub
 - `POST /tts/convert` — text → audio conversion
 - `GET /tts/status`, `GET /tts/providers` — TTS info
+- Dashboard-mounted memory endpoints:
+  - `GET /api/memory/exchange`
+  - `GET /api/memory/explain`
+  - `GET/POST /api/memory/identity`
 - Session auth via `config.channels.api.password`
 
 **Dashboard** (`channels/dashboard.py`): 6 tabs — Overview, Usage, Memories, Tools, Chat, Settings.
-- Settings includes: Agent, Provider, Telegram, Voice (TTS+STT), Features
+- Memory panel includes Memory Exchange Monitor + Explainability + quality KPIs
+- Settings includes: Agent, Provider, Telegram, Voice (TTS+STT), Features, Memory worker controls
 - REST API under `/api/` prefix
 
 **Telegram** (`channels/telegram.py`): python-telegram-bot, routes through local API via `TelegramAPIClient`.
@@ -218,7 +335,26 @@ Select via `config.agent.provider` (default: "anthropic").
     "keep_recent_messages": 20,
     "auto_learn": true,
     "temporal_decay_enabled": true,
-    "temporal_decay_rate": 0.01
+    "temporal_decay_rate": 0.01,
+    "memory_exchange_enabled": true,
+    "memory_exchange_top_k": 8,
+    "memory_exchange_pack_budget_tokens": 420,
+    "memory_exchange_max_packs": 2,
+    "memory_exchange_context_budget_tokens": 700,
+    "memory_exchange_daemon_enabled": true,
+    "memory_exchange_daemon_interval_sec": 1.0,
+    "memory_exchange_daemon_batch_size": 3,
+    "memory_exchange_daemon_auto_pause": true,
+    "memory_exchange_daemon_pause_active_requests": 1,
+    "memory_exchange_daemon_pause_queued_requests": 2,
+    "memory_exchange_queue_max_pending": 5000,
+    "memory_exchange_max_attempts": 3,
+    "memory_local_worker_enabled": true,
+    "memory_local_worker_interval_sec": 12.0,
+    "memory_local_worker_batch_size": 24,
+    "shadow_twin_enabled": true,
+    "shadow_twin_predictions": 3,
+    "shadow_twin_use_llm": false
   },
   "cost": {
     "cascade_routing": true,

@@ -9,6 +9,33 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta
 
+
+def _safe_parse_llm_json(text: str, fallback):
+    """Parse JSON from LLM output, tolerating control chars, truncation and wrong root type."""
+    import re as _re, json as _json
+    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    try:
+        return _json.loads(text)
+    except Exception:
+        pass
+    for opener, closer in (('{', '}'), ('[', ']')):
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return _json.loads(text[start:i + 1])
+                    except Exception:
+                        break
+    return fallback
+
+
 logger = logging.getLogger(__name__)
 
 # Safe import whitelist
@@ -21,7 +48,7 @@ DEFAULT_IMPORT_WHITELIST = {
 # Blocked builtins that must never be called
 BLOCKED_BUILTINS = {
     "exec", "eval", "compile", "__import__", "globals", "locals",
-    "getattr", "setattr", "delattr", "breakpoint",
+    "getattr", "setattr", "delattr", "breakpoint", "vars",
 }
 
 # Blocked attribute calls (subprocess/os execution)
@@ -62,6 +89,9 @@ def validate_tool_source(source: str,
                     return False, f"Blocked module: {node.module}"
                 if mod_root not in whitelist:
                     return False, f"Import not whitelisted: {node.module}"
+        elif isinstance(node, ast.Name):
+            if node.id == "__builtins__":
+                return False, "Blocked symbol: __builtins__"
         # Check for dangerous builtin calls
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
@@ -446,8 +476,14 @@ async def propose_tool_from_pattern(provider, pattern: dict,
     Returns {"name": str, "description": str, "source_code": str, "parameters_json": str}
     or None if generation fails.
     """
-    model = config.get("synthesis_model",
-                        config.get("planning_model", "claude-haiku-4-5-20251001"))
+    _explicit = config.get("synthesis_model") or config.get("planning_model")
+    if _explicit:
+        model = _explicit
+    else:
+        from .metacognition import _resolve_model
+        model = await _resolve_model(provider, config)
+    if not model:
+        return None
     sequence = pattern.get("sequence", [])
     count = pattern.get("count", 0)
 
@@ -483,7 +519,9 @@ async def propose_tool_from_pattern(provider, pattern: dict,
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-        proposal = json.loads(text)
+        proposal = _safe_parse_llm_json(text, {})
+        if not isinstance(proposal, dict):
+            return None
 
         # Validate required fields
         if not all(k in proposal for k in ("name", "source_code")):

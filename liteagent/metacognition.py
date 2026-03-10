@@ -1,11 +1,73 @@
 """Metacognition — confidence gating, counterfactual replay, dream cycle."""
 
+import inspect
 import json
 import logging
 import pickle
 from datetime import datetime
 
+
+def _safe_parse_llm_json(text: str, fallback):
+    """Parse JSON from LLM output, tolerating control chars, truncation and wrong root type."""
+    import re as _re, json as _json
+    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    try:
+        return _json.loads(text)
+    except Exception:
+        pass
+    for opener, closer in (('{', '}'), ('[', ']')):
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return _json.loads(text[start:i + 1])
+                    except Exception:
+                        break
+    return fallback
+
+
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_model(provider, config: dict) -> str | None:
+    """Resolve a lightweight model for meta-tasks (confidence, replay, dreams).
+
+    Checks config['extraction_model'] first, then probes provider capabilities.
+    Falls back to agent config's simple/default model for local providers.
+    """
+    model = config.get("extraction_model")
+    if model:
+        return model
+
+    # For Ollama/local providers, skip cloud model probing — use agent config directly
+    provider_cls = provider.__class__.__name__
+    if provider_cls == "OllamaProvider":
+        agent_cfg = config.get("_agent_config", {})
+        models = agent_cfg.get("models", {})
+        return models.get("simple") or agent_cfg.get("default_model") or None
+
+    # For cloud providers, probe for lightweight models
+    for candidate in ("claude-haiku-4-5-20251001", "gpt-4o-mini", "gemini-2.0-flash"):
+        try:
+            supported = provider.supports_model(candidate)
+            if inspect.isawaitable(supported):
+                supported = await supported
+            if supported:
+                return candidate
+        except Exception:
+            continue
+
+    # Generic fallback via agent config
+    agent_cfg = config.get("_agent_config", {})
+    models = agent_cfg.get("models", {})
+    return models.get("simple") or agent_cfg.get("default_model") or None
 
 
 # ══════════════════════════════════════════
@@ -14,7 +76,7 @@ logger = logging.getLogger(__name__)
 
 async def assess_confidence(provider, user_input: str, response: str,
                             config: dict) -> dict:
-    """Quick Haiku self-assessment of response confidence.
+    """Quick self-assessment of response confidence using the lightest available model.
 
     Returns {"confidence": int, "reason": str, "action": str}.
     """
@@ -24,7 +86,9 @@ async def assess_confidence(provider, user_input: str, response: str,
         '{"confidence":N,"reason":"brief","action":"none|search|escalate|admit"}\n\n'
         f"User: {user_input[:500]}\nResponse: {response[:500]}"
     )
-    model = config.get("extraction_model", "claude-haiku-4-5-20251001")
+    model = await _resolve_model(provider, config)
+    if not model:
+        return {"confidence": 10, "reason": "no_model_available", "action": "none"}
     try:
         result = await provider.complete(
             model=model, max_tokens=100,
@@ -33,7 +97,10 @@ async def assess_confidence(provider, user_input: str, response: str,
         text = result.content[0].text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        return json.loads(text)
+        # Strip <think>...</think> from thinking models
+        import re
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+        return _safe_parse_llm_json(text, {"confidence": 10, "reason": "parse_error", "action": "none"})
     except Exception as e:
         logger.debug("Confidence assessment failed: %s", e)
         return {"confidence": 10, "reason": "assessment_failed", "action": "none"}
@@ -74,7 +141,10 @@ async def run_counterfactual_replay(provider, db, memory_system,
     if not rows:
         return 0
 
-    model = config.get("extraction_model", "claude-haiku-4-5-20251001")
+    model = await _resolve_model(provider, config)
+    if not model:
+        logger.debug("No model available for counterfactual replay")
+        return 0
     lessons_count = 0
 
     for row_id, user_id, user_input, response, tools_json in rows:
@@ -92,7 +162,9 @@ async def run_counterfactual_replay(provider, db, memory_system,
             text = result.content[0].text.strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            data = json.loads(text)
+            data = _safe_parse_llm_json(text, {})
+            if not isinstance(data, dict):
+                data = {}
             lesson = data.get("lesson", "")
             if lesson and len(lesson) > 10:
                 await memory_system.remember(
@@ -114,7 +186,10 @@ async def run_dream_cycle(provider, db, memory_system, config: dict) -> dict:
     threshold = config.get("similarity_threshold", 0.85)
     decay_rate = config.get("decay_rate", 0.05)
     max_consolidations = config.get("max_consolidations_per_run", 20)
-    model = config.get("extraction_model", "claude-haiku-4-5-20251001")
+    model = await _resolve_model(provider, config)
+    if not model:
+        logger.debug("No model available for dream cycle")
+        return {"decayed": 0, "merged": 0, "insights": 0}
 
     stats = {"decayed": 0, "merged": 0, "insights": 0}
 

@@ -44,6 +44,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .file_types import detect_file_type, extract_text_from_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,13 +267,18 @@ class KnowledgeBase:
             raise ValueError(
                 f"File too large: {size_mb:.1f}MB (max {self._max_file_size_mb}MB)")
 
+        raw = p.read_bytes()
         suffix = p.suffix.lower()
-        if suffix == ".pdf":
+        file_info = detect_file_type(raw, p.name)
+
+        if file_info.is_pdf:
             return self._parse_pdf(p)
         elif suffix in (".md", ".markdown"):
             return self._parse_markdown(p)
-        elif suffix in (".html", ".htm"):
+        elif suffix in (".html", ".htm") or file_info.mime_type == "text/html":
             return self._parse_html(p)
+        elif file_info.can_extract_text:
+            return self._parse_extracted_text(p, file_info, raw)
         else:
             return self._parse_plain_text(p)
 
@@ -513,6 +520,18 @@ class KnowledgeBase:
     def _parse_plain_text(self, path: Path) -> dict:
         """Parse plain text with paragraph detection."""
         text = path.read_text(encoding="utf-8", errors="replace")
+        return self._structure_extracted_text(path.stem, text)
+
+    def _parse_extracted_text(self, path: Path, file_info, data: bytes) -> dict:
+        """Parse text extracted from office/ebook/plain text documents."""
+        text = extract_text_from_file(data, file_info)
+        if not text.strip():
+            return self._parse_plain_text(path)
+        return self._structure_extracted_text(path.stem, text)
+
+    @staticmethod
+    def _structure_extracted_text(name: str, text: str) -> dict:
+        """Convert extracted text into a simple structured page model."""
         pages = [{"number": 1, "sections": [], "tables": []}]
 
         # Split on double newlines as "sections"
@@ -527,7 +546,7 @@ class KnowledgeBase:
                 })
 
         return {
-            "name": path.stem,
+            "name": name,
             "pages": pages,
             "total_pages": 1,
         }
@@ -1422,6 +1441,16 @@ class KnowledgeBase:
             "metadata_json, created_at FROM kb_documents "
             "ORDER BY created_at DESC").fetchall()
         return [dict(row) for row in rows]
+
+    async def get_document(self, doc_id: str) -> dict | None:
+        """Get a single document by id or name."""
+        row = self.db.execute(
+            "SELECT id, name, source_path, page_count, chunk_count, "
+            "metadata_json, created_at FROM kb_documents "
+            "WHERE id = ? OR name = ?",
+            (doc_id, doc_id),
+        ).fetchone()
+        return dict(row) if row else None
 
     async def delete_document(self, doc_id: str) -> bool:
         """Delete a document and all its chunks."""

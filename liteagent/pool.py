@@ -1,5 +1,6 @@
 """Multi-agent pool with delegation support."""
 
+import contextvars
 import logging
 from typing import Optional
 
@@ -7,6 +8,14 @@ from .agent import LiteAgent
 from .config import get_soul_prompt
 
 logger = logging.getLogger(__name__)
+
+# ── Delegation safety: cycle & depth tracking ──
+_delegation_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    'delegation_depth', default=0)
+_delegation_chain: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    'delegation_chain', default=())
+
+MAX_DELEGATION_DEPTH = 3
 
 
 class AgentPool:
@@ -52,7 +61,7 @@ class AgentPool:
         return pool
 
     def _wire_delegation(self):
-        """Add 'delegate' tool to each agent so they can call other agents."""
+        """Add 'delegate' tool to each agent with cycle detection and depth limits."""
         if len(self._agents) < 2:
             return
 
@@ -61,14 +70,40 @@ class AgentPool:
             descriptions = ", ".join(other_names)
 
             async def delegate_handler(agent_name: str, query: str,
-                                       _pool=self) -> str:
+                                       _pool=self, _from=name) -> str:
                 """Delegate a task to another agent.
                 agent_name: Name of the agent to delegate to
                 query: The task or question for the other agent"""
+                depth = _delegation_depth.get(0)
+                chain = _delegation_chain.get(())
+
+                # Cycle detection
+                if agent_name in chain:
+                    logger.warning("Delegation cycle: %s → %s (chain: %s)",
+                                   _from, agent_name, " → ".join(chain))
+                    return (f"Error: delegation cycle detected "
+                            f"({' → '.join(chain)} → {agent_name}). "
+                            f"Cannot delegate back to an agent already in the chain.")
+
+                # Depth limit
+                if depth >= MAX_DELEGATION_DEPTH:
+                    logger.warning("Delegation depth limit (%d) reached: %s",
+                                   MAX_DELEGATION_DEPTH, " → ".join(chain))
+                    return (f"Error: max delegation depth ({MAX_DELEGATION_DEPTH}) "
+                            f"reached. Chain: {' → '.join(chain)}")
+
                 target = _pool.get(agent_name)
                 if not target:
                     return f"Unknown agent: {agent_name}. Available: {descriptions}"
-                return await target.run(query)
+
+                # Set context for nested call
+                token_d = _delegation_depth.set(depth + 1)
+                token_c = _delegation_chain.set(chain + (_from,))
+                try:
+                    return await target.run(query)
+                finally:
+                    _delegation_depth.reset(token_d)
+                    _delegation_chain.reset(token_c)
 
             agent.tools._tools["delegate"] = {
                 "name": "delegate",

@@ -8,28 +8,19 @@ that agent.run() accepts.
 import base64
 import logging
 
+from .file_types import (
+    CODE_EXTENSIONS,
+    IMAGE_MIME_TYPES,
+    TEXT_EXTENSIONS,
+    detect_file_type,
+    extract_text_from_file,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── Supported file types ──────────────────────────────────────
 
-IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-
-DOC_TYPES = {
-    "application/pdf", "text/plain", "text/csv", "text/html",
-    "text/markdown", "application/json", "text/xml", "application/xml",
-}
-
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
-    ".html", ".log", ".ini", ".toml", ".env", ".cfg",
-}
-
-CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h",
-    ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".cs", ".sh", ".bash",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".r", ".lua",
-    ".css", ".scss", ".less", ".vue", ".svelte",
-}
+IMAGE_TYPES = IMAGE_MIME_TYPES
 
 MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 MB
 MAX_TEXT_CHARS = 100_000           # ~100K chars
@@ -56,32 +47,47 @@ def file_to_content_block(
             f"File '{filename}' too large ({size_mb:.1f} MB, max {MAX_FILE_SIZE // (1024*1024)} MB)"
         )
 
-    ext = ""
-    if "." in filename:
-        ext = "." + filename.rsplit(".", 1)[-1].lower()
+    info = detect_file_type(data, filename, mime_type)
 
     # ── Image ──
-    if mime_type in IMAGE_TYPES:
+    if info.is_image:
         b64 = base64.b64encode(data).decode()
         return {
             "type": "image",
-            "source": {"type": "base64", "media_type": mime_type, "data": b64},
+            "source": {
+                "type": "base64",
+                "media_type": info.mime_type,
+                "data": b64,
+                "filename": filename,
+            },
         }
 
     # ── PDF ──
-    if mime_type == "application/pdf" or ext == ".pdf":
+    if info.is_pdf:
         b64 = base64.b64encode(data).decode()
         return {
             "type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": b64,
+                "filename": filename,
+            },
         }
 
-    # ── Text / Code / Known doc types ──
-    if (mime_type in DOC_TYPES
-            or ext in TEXT_EXTENSIONS
-            or ext in CODE_EXTENSIONS
-            or mime_type.startswith("text/")):
-        text = _decode_text(data)
+    # ── Text / Code / Extractable office docs ──
+    if info.can_extract_text:
+        text = extract_text_from_file(data, info)
+        if not text and (info.mime_type.startswith("text/") or info.extension in TEXT_EXTENSIONS or info.extension in CODE_EXTENSIONS):
+            text = _decode_text(data)
+        if not text:
+            size_kb = len(data) / 1024
+            return {
+                "type": "text",
+                "text": (f"[Binary file attached: {filename} "
+                         f"({info.label}, {info.mime_type or 'unknown type'}, {size_kb:.1f} KB) "
+                         f"— content extraction unavailable]"),
+            }
         if len(text) > MAX_TEXT_CHARS:
             text = text[:MAX_TEXT_CHARS] + "\n\n... [truncated]"
         return {
@@ -89,23 +95,14 @@ def file_to_content_block(
             "text": f"--- File: {filename} ---\n{text}\n--- End of {filename} ---",
         }
 
-    # ── Unknown type: try text, fallback to binary note ──
-    try:
-        text = data.decode("utf-8")
-        if len(text) > MAX_TEXT_CHARS:
-            text = text[:MAX_TEXT_CHARS] + "\n\n... [truncated]"
-        return {
-            "type": "text",
-            "text": f"--- File: {filename} ({mime_type or 'unknown type'}) ---\n{text}\n--- End of {filename} ---",
-        }
-    except UnicodeDecodeError:
-        size_kb = len(data) / 1024
-        return {
-            "type": "text",
-            "text": (f"[Binary file attached: {filename} "
-                     f"({mime_type or 'unknown type'}, {size_kb:.1f} KB) "
-                     f"— cannot display content]"),
-        }
+    # ── Unknown-ish type: try text, fallback to typed binary note ──
+    size_kb = len(data) / 1024
+    return {
+        "type": "text",
+        "text": (f"[Binary file attached: {filename} "
+                 f"({info.label}, {info.mime_type or 'unknown type'}, {size_kb:.1f} KB) "
+                 f"— cannot display content]"),
+    }
 
 
 def file_to_emoji(block: dict, filename: str = "") -> str:

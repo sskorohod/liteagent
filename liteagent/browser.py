@@ -122,18 +122,18 @@ class BrowserEngine:
         if self._context:
             try:
                 await self._context.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error closing browser context: %s", e)
         if self._browser:
             try:
                 await self._browser.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error closing browser: %s", e)
         if self._playwright:
             try:
                 await self._playwright.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error stopping playwright: %s", e)
         self._browser = None
         self._playwright = None
         self._context = None

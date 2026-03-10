@@ -258,14 +258,25 @@ def setup_scheduler(agent, config: dict) -> Scheduler | None:
 
     # ── Feature scheduler jobs ──────────────────
     features = config.get("features", {})
+    memory_cfg = config.get("memory", {})
+    agent_cfg = config.get("agent", {})
+
+    def _meta_cfg(feature_cfg: dict) -> dict:
+        merged = dict(feature_cfg or {})
+        merged["_agent_config"] = agent_cfg
+        extraction_model = str(memory_cfg.get("extraction_model", "")).strip()
+        if extraction_model:
+            merged["extraction_model"] = extraction_model
+        return merged
 
     # Dream Cycle
     dream_cfg = features.get("dream_cycle", {})
     if dream_cfg.get("enabled"):
+        dream_meta_cfg = _meta_cfg(dream_cfg)
         async def dream_job():
             from .metacognition import run_dream_cycle
             stats = await run_dream_cycle(
-                agent.provider, agent.memory.db, agent.memory, dream_cfg)
+                agent.provider, agent.memory.db, agent.memory, dream_meta_cfg)
             logger.info("Dream cycle complete: %s", stats)
         scheduler.add_job(
             "dream_cycle", dream_cfg.get("cron", "0 3 * * *"), dream_job,
@@ -274,10 +285,11 @@ def setup_scheduler(agent, config: dict) -> Scheduler | None:
     # Counterfactual Replay
     replay_cfg = features.get("counterfactual_replay", {})
     if replay_cfg.get("enabled"):
+        replay_meta_cfg = _meta_cfg(replay_cfg)
         async def replay_job():
             from .metacognition import run_counterfactual_replay
             count = await run_counterfactual_replay(
-                agent.provider, agent.memory.db, agent.memory, replay_cfg)
+                agent.provider, agent.memory.db, agent.memory, replay_meta_cfg)
             logger.info("Counterfactual replay: %d lessons extracted", count)
         scheduler.add_job(
             "counterfactual_replay",
@@ -287,13 +299,14 @@ def setup_scheduler(agent, config: dict) -> Scheduler | None:
     # Self-Evolving Prompt review
     evolve_cfg = features.get("self_evolving_prompt", {})
     if evolve_cfg.get("enabled"):
+        evolve_meta_cfg = _meta_cfg(evolve_cfg)
         async def evolve_job():
             from .evolution import synthesize_prompt_patches
             patches = await synthesize_prompt_patches(
-                agent.provider, agent.memory.db, evolve_cfg)
+                agent.provider, agent.memory.db, evolve_meta_cfg)
             if patches:
                 logger.info("Prompt patches proposed: %s", patches)
-                if evolve_cfg.get("auto_apply"):
+                if evolve_meta_cfg.get("auto_apply", True):
                     for p in patches:
                         agent.memory.db.execute(
                             "UPDATE prompt_patches SET applied=1 "

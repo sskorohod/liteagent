@@ -14,8 +14,10 @@ from liteagent.voice import (
     DEFAULT_EDGE_VOICE,
     DEFAULT_ELEVENLABS_MODEL_ID,
     DEFAULT_ELEVENLABS_VOICE_ID,
+    DEFAULT_GROQ_TTS_LANGUAGE,
     DEFAULT_OPENAI_TTS_MODEL,
     DEFAULT_OPENAI_TTS_VOICE,
+    DEFAULT_TTS_LANGUAGE,
     DEFAULT_TTS_MAX_LENGTH,
     OPENAI_TTS_MODELS,
     OPENAI_TTS_VOICES,
@@ -33,6 +35,7 @@ from liteagent.voice import (
     text_to_speech,
     _resolve_output_format,
     _resolve_provider_order,
+    _groq_model_supports_language,
 )
 
 
@@ -46,9 +49,12 @@ class TestResolveVoiceConfig:
         assert cfg["tts"]["auto"] == "off"
         assert cfg["tts"]["provider"] == "edge"
         assert cfg["tts"]["max_length"] == DEFAULT_TTS_MAX_LENGTH
+        assert cfg["tts"]["language"] == DEFAULT_TTS_LANGUAGE
         assert cfg["tts"]["openai"]["model"] == DEFAULT_OPENAI_TTS_MODEL
         assert cfg["tts"]["openai"]["voice"] == DEFAULT_OPENAI_TTS_VOICE
         assert cfg["tts"]["elevenlabs"]["voice_id"] == DEFAULT_ELEVENLABS_VOICE_ID
+        assert cfg["tts"]["groq"]["language"] == DEFAULT_GROQ_TTS_LANGUAGE
+        assert cfg["tts"]["edge"]["language"] == "ru"
         assert cfg["tts"]["edge"]["voice"] == DEFAULT_EDGE_VOICE
         assert cfg["stt"]["provider"] == "openai"
 
@@ -59,6 +65,7 @@ class TestResolveVoiceConfig:
                     "auto": "always",
                     "provider": "openai",
                     "openai": {"voice": "nova", "model": "tts-1-hd"},
+                    "edge": {"voice": "en-US-GuyNeural"},
                 },
                 "stt": {
                     "provider": "groq",
@@ -70,8 +77,34 @@ class TestResolveVoiceConfig:
         assert cfg["tts"]["provider"] == "openai"
         assert cfg["tts"]["openai"]["voice"] == "nova"
         assert cfg["tts"]["openai"]["model"] == "tts-1-hd"
+        assert cfg["tts"]["edge"]["language"] == "en"
         assert cfg["stt"]["provider"] == "groq"
         assert cfg["stt"]["groq"]["language"] == "en"
+
+    def test_edge_language_picks_default_voice(self):
+        cfg = resolve_voice_config({
+            "voice": {
+                "tts": {
+                    "edge": {"language": "en"},
+                }
+            },
+        })
+        assert cfg["tts"]["edge"]["language"] == "en"
+        assert cfg["tts"]["edge"]["voice"].startswith("en-")
+
+    def test_groq_russian_keeps_direct_model(self):
+        cfg = resolve_voice_config({
+            "voice": {
+                "tts": {
+                    "provider": "groq",
+                    "language": "ru",
+                    "groq": {"language": "ru", "model": "playai-tts"},
+                }
+            },
+        })
+        assert cfg["tts"]["groq"]["language"] == "ru"
+        assert cfg["tts"]["groq"]["model"] == "playai-tts"
+        assert _groq_model_supports_language("playai-tts", "ru") is True
 
 
 class TestOutputFormat:
@@ -97,7 +130,7 @@ class TestProviderOrder:
 
     def test_default_order(self):
         order = _resolve_provider_order("openai")
-        assert order == ["openai", "elevenlabs", "edge"]
+        assert order == ["openai", "elevenlabs", "groq", "edge"]
 
 
 # ══════════════════════════════════════════
@@ -468,6 +501,40 @@ class TestProviderFallback:
             assert result.provider == "edge" or not result.success
 
     @pytest.mark.asyncio
+    async def test_groq_russian_runs_directly_on_groq(self):
+        voice_cfg = resolve_voice_config({
+            "voice": {
+                "tts": {
+                    "provider": "groq",
+                    "language": "ru",
+                    "groq": {
+                        "language": "ru",
+                        "model": "playai-tts",
+                        "voice": "Fritz-PlayAI",
+                    },
+                }
+            }
+        })
+
+        with patch("liteagent.voice._get_tts_api_key") as mock_key, \
+             patch("liteagent.voice.groq_tts") as mock_groq, \
+             patch("liteagent.voice.edge_tts_synthesize", side_effect=AssertionError("edge fallback should not be used")):
+
+            mock_key.side_effect = lambda provider, _config: "test-key" if provider == "groq" else None
+            mock_groq.return_value = b"RIFFfake-wav-data"
+
+            result = await text_to_speech(
+                "Привет, это проверка русского языка.",
+                voice_cfg,
+                {},
+                channel="api",
+            )
+
+            assert result.success is True
+            assert result.provider == "groq"
+            assert mock_groq.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_all_providers_fail(self):
         """When all providers fail, returns error."""
         voice_cfg = resolve_voice_config({
@@ -635,8 +702,12 @@ class TestVoiceConfigTools:
         assert "stt_providers" in result
         assert "active_tts" in result
         assert "active_stt" in result
-        assert len(result["tts_providers"]) == 3
+        assert len(result["tts_providers"]) == 4
         assert len(result["stt_providers"]) == 3
+        edge = next(p for p in result["tts_providers"] if p["id"] == "edge")
+        assert "languages" in edge
+        assert "ru" in edge["languages"]
+        assert "language_labels" in edge
 
     def test_list_voice_providers_configured_status(self):
         handlers, _ = _wire_and_get_handlers()
