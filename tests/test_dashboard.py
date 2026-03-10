@@ -264,6 +264,43 @@ class TestGoalStatusEndpoint:
         assert "# Night coding export" in body
         assert "Finished one verified patch" in body
 
+    def test_self_improvement_goal_status_includes_morning_report(self, client):
+        c, agent = client
+        from liteagent.goals import GoalManager
+
+        gm = GoalManager(agent.memory.db)
+        agent._goal_manager = gm
+        goal = gm.add_goal(
+            title="Self improvement status",
+            objective="Summarize self-improvement findings",
+            user_id="dashboard-user",
+            goal_type="self_improvement",
+            config={"workspace": "/Users/vskorokhod/liteagent"},
+            source="dashboard",
+        )
+        gid = int(goal["id"])
+        gm.add_attempt(
+            gid,
+            outcome="failed",
+            summary="Memory recall brought back low-signal noise",
+            error="noise in recall ranking",
+            insight="Try a stronger anti-noise ranking penalty before the next cycle",
+        )
+        gm.add_attempt(
+            gid,
+            outcome="done",
+            summary="Added a stronger memory relevance filter",
+            progress_delta=0.15,
+        )
+
+        resp = c.get(f"/api/goals/{gid}/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        morning = data["report"]["morning_report"]
+        assert any("noise" in item.lower() for item in morning["found_problems"])
+        assert any("memory relevance filter" in item.lower() for item in morning["accepted_decisions"])
+        assert any("ranking penalty" in item.lower() for item in morning["unvalidated_ideas"])
+
     def test_ops_active_normalizes_parallel_and_background_items(self, client):
         c, agent = client
         from liteagent.agent import LiteAgent

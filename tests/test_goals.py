@@ -228,6 +228,45 @@ class TestGoalManager:
         assert "## Recent Attempts" in md
         assert "Resolved two failing tests" in md
 
+    def test_self_improvement_report_contains_morning_brief_sections(self, goals_agent):
+        gm = GoalManager(goals_agent.memory.db)
+        goal = gm.add_goal(
+            title="Self-improvement export",
+            objective="Leave a focused morning brief",
+            user_id="u1",
+            goal_type="self_improvement",
+            config={"workspace": "/Users/vskorokhod/liteagent", "local_model": "qwen3-coder:30b"},
+            source="dashboard",
+        )
+        gid = int(goal["id"])
+        gm.add_attempt(
+            gid,
+            outcome="failed",
+            step_title="Stabilize tool loop",
+            summary="Tool loop stalled on repeated no-tool answers",
+            error="no-tool loop remained unresolved",
+            insight="Add a stricter recovery path after repeated no-tool responses",
+        )
+        gm.add_attempt(
+            gid,
+            outcome="done",
+            step_title="Harden runtime guard",
+            summary="Added a runtime guard for repeated no-tool responses",
+            progress_delta=0.2,
+        )
+        report = gm.build_goal_report(gid, attempt_limit=10)
+        morning = report.get("morning_report") or {}
+        assert report["goal_type"] == "self_improvement"
+        assert any("Tool loop stalled" in item or "no-tool loop" in item for item in morning.get("found_problems", []))
+        assert any("runtime guard" in item.lower() for item in morning.get("accepted_decisions", []))
+        assert any("recovery path" in item.lower() for item in morning.get("unvalidated_ideas", []))
+
+        md = gm.render_goal_report_markdown(gid, attempt_limit=10)
+        assert "## Self-Improvement Morning Report" in md
+        assert "### Found Problems" in md
+        assert "### Accepted Decisions" in md
+        assert "### Unvalidated Ideas" in md
+
 
 class TestGoalCoordinator:
     @pytest.mark.asyncio

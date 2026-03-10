@@ -4207,6 +4207,10 @@ function renderGoalInspector() {
     const blockers = Array.isArray(report?.blockers) ? report.blockers : [];
     const nextActions = Array.isArray(report?.next_recommended_actions) ? report.next_recommended_actions : [];
     const outcomes = report?.outcomes || {};
+    const morning = report?.morning_report || null;
+    const morningProblems = Array.isArray(morning?.found_problems) ? morning.found_problems : [];
+    const morningDecisions = Array.isArray(morning?.accepted_decisions) ? morning.accepted_decisions : [];
+    const morningIdeas = Array.isArray(morning?.unvalidated_ideas) ? morning.unvalidated_ideas : [];
     reportEl.innerHTML = `
       <div class="grid grid-cols-2 gap-2">
         <div class="rounded-xl border border-white/[0.05] bg-white/[0.03] px-3 py-2">
@@ -4237,6 +4241,25 @@ function renderGoalInspector() {
         <div class="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Next Recommended</div>
         ${nextActions.length ? nextActions.map(item => `<div class="text-xs text-zinc-300 leading-5">• ${escapeHtml(item)}</div>`).join('') : '<div class="text-xs text-zinc-600">No next actions yet</div>'}
       </div>
+      ${morning ? `
+      <div class="rounded-xl border border-violet-400/15 bg-violet-500/5 px-3 py-3">
+        <div class="text-[10px] uppercase tracking-wide text-violet-300 mb-1">Morning Report</div>
+        <div class="text-xs text-zinc-300 leading-6">${escapeHtml(morning?.headline || 'Self-improvement morning brief')}</div>
+        <div class="grid md:grid-cols-3 gap-3 mt-3">
+          <div>
+            <div class="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Found Problems</div>
+            ${morningProblems.length ? morningProblems.map(item => `<div class="text-xs text-amber-200 leading-5">• ${escapeHtml(item)}</div>`).join('') : '<div class="text-xs text-zinc-600">No material problems captured</div>'}
+          </div>
+          <div>
+            <div class="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Accepted Decisions</div>
+            ${morningDecisions.length ? morningDecisions.map(item => `<div class="text-xs text-emerald-200 leading-5">• ${escapeHtml(item)}</div>`).join('') : '<div class="text-xs text-zinc-600">No accepted decisions captured</div>'}
+          </div>
+          <div>
+            <div class="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Unvalidated Ideas</div>
+            ${morningIdeas.length ? morningIdeas.map(item => `<div class="text-xs text-zinc-300 leading-5">• ${escapeHtml(item)}</div>`).join('') : '<div class="text-xs text-zinc-600">No unvalidated ideas captured</div>'}
+          </div>
+        </div>
+      </div>` : ''}
     `;
   }
 

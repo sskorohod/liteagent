@@ -667,9 +667,74 @@ class GoalManager:
             if note:
                 blockers.append(note[:220])
 
+        goal_type = str(goal.get("goal_type") or "generic")
+        morning_report = None
+        if goal_type == "self_improvement":
+            problems: list[str] = []
+            decisions: list[str] = []
+            ideas: list[str] = []
+            seen_problems: set[str] = set()
+            seen_decisions: set[str] = set()
+            seen_ideas: set[str] = set()
+
+            def _collect_unique(bucket: list[str], seen: set[str], raw: str, limit: int = 3) -> None:
+                value = str(raw or "").strip()
+                if not value or len(bucket) >= limit:
+                    return
+                head = value.splitlines()[0].strip()[:220]
+                key = head.casefold()
+                if not head or key in seen:
+                    return
+                seen.add(key)
+                bucket.append(head)
+
+            for item in failed:
+                _collect_unique(
+                    problems,
+                    seen_problems,
+                    item.get("error") or item.get("summary") or item.get("action_query") or item.get("step_title"),
+                )
+
+            for item in completed[-4:]:
+                decision_text = (
+                    item.get("summary")
+                    or item.get("step_title")
+                    or item.get("action_query")
+                )
+                _collect_unique(decisions, seen_decisions, decision_text)
+
+            for item in attempts_chrono:
+                if str(item.get("outcome") or "") == "done":
+                    continue
+                idea_text = item.get("insight") or item.get("summary")
+                _collect_unique(ideas, seen_ideas, idea_text)
+
+            for source in events[:8]:
+                if not isinstance(source, dict):
+                    continue
+                event_type = str(source.get("event_type") or "").strip().lower()
+                message = str(source.get("message") or "").strip()
+                if event_type in {"goal_completed", "goal_progress", "goal_updated", "goal_replanned"}:
+                    _collect_unique(decisions, seen_decisions, message)
+                elif event_type in {"goal_failed", "guard_stop"}:
+                    _collect_unique(problems, seen_problems, message)
+                else:
+                    _collect_unique(ideas, seen_ideas, message)
+
+            if not ideas:
+                for item in next_actions:
+                    _collect_unique(ideas, seen_ideas, item)
+
+            morning_report = {
+                "headline": "Self-improvement morning brief",
+                "found_problems": problems,
+                "accepted_decisions": decisions,
+                "unvalidated_ideas": ideas,
+            }
+
         return {
             "goal_id": int(goal_id),
-            "goal_type": str(goal.get("goal_type") or "generic"),
+            "goal_type": goal_type,
             "status": str(goal.get("status") or ""),
             "phase": str(goal.get("current_phase") or ""),
             "progress": float(goal.get("progress") or 0.0),
@@ -683,6 +748,7 @@ class GoalManager:
             "recent_progress_cycles": len(progress),
             "last_summary": str(goal.get("last_result") or latest_attempt.get("summary") or "").strip()[:400],
             "next_recommended_actions": next_actions[:3],
+            "morning_report": morning_report,
             "updated_at": goal.get("updated_at"),
         }
 
@@ -749,6 +815,34 @@ class GoalManager:
             lines.extend([f"- {str(item).strip()}" for item in next_actions if str(item).strip()])
         else:
             lines.append("- None yet")
+        morning_report = report.get("morning_report") if isinstance(report.get("morning_report"), dict) else None
+        if morning_report:
+            lines.extend([
+                "",
+                "## Self-Improvement Morning Report",
+                "",
+                str(morning_report.get("headline") or "Self-improvement morning brief"),
+                "",
+                "### Found Problems",
+                "",
+            ])
+            found_problems = list(morning_report.get("found_problems") or [])
+            if found_problems:
+                lines.extend([f"- {str(item).strip()}" for item in found_problems if str(item).strip()])
+            else:
+                lines.append("- No material problems captured")
+            lines.extend(["", "### Accepted Decisions", ""])
+            accepted_decisions = list(morning_report.get("accepted_decisions") or [])
+            if accepted_decisions:
+                lines.extend([f"- {str(item).strip()}" for item in accepted_decisions if str(item).strip()])
+            else:
+                lines.append("- No accepted decisions captured")
+            lines.extend(["", "### Unvalidated Ideas", ""])
+            unvalidated_ideas = list(morning_report.get("unvalidated_ideas") or [])
+            if unvalidated_ideas:
+                lines.extend([f"- {str(item).strip()}" for item in unvalidated_ideas if str(item).strip()])
+            else:
+                lines.append("- No unvalidated ideas captured")
         if plan:
             lines.extend(["", "## Active Plan", ""])
             strategy = str(plan.get("strategy") or "").strip()
