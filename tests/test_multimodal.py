@@ -1,6 +1,9 @@
 """Tests for liteagent/multimodal.py — content-block builder."""
 
 import base64
+import zipfile
+from io import BytesIO
+
 import pytest
 from liteagent.multimodal import (
     file_to_content_block,
@@ -12,6 +15,34 @@ from liteagent.multimodal import (
 )
 
 
+def _zip_bytes(files: dict[str, bytes | str]) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, content in files.items():
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            archive.writestr(name, content)
+    return buf.getvalue()
+
+
+def make_docx_bytes(text: str = "Roadmap draft") -> bytes:
+    return _zip_bytes({
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/word/document.xml"
+               ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+            </Types>""",
+        "word/document.xml": f"""<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>
+            </w:document>""",
+    })
+
+
+def make_legacy_doc_bytes(text: str = "Legacy contract notes") -> bytes:
+    return b"\xd0\xcf\x11\xe0" + b"\x00" * 24 + text.encode("latin-1") + b"\x00"
+
+
 class TestImageBlocks:
     """Image files → image content blocks."""
 
@@ -21,6 +52,7 @@ class TestImageBlocks:
         assert block["type"] == "image"
         assert block["source"]["type"] == "base64"
         assert block["source"]["media_type"] == "image/jpeg"
+        assert block["source"]["filename"] == "photo.jpg"
         assert block["source"]["data"] == base64.b64encode(data).decode()
 
     def test_png_image(self):
@@ -51,6 +83,7 @@ class TestPDFBlocks:
         assert block["type"] == "document"
         assert block["source"]["type"] == "base64"
         assert block["source"]["media_type"] == "application/pdf"
+        assert block["source"]["filename"] == "report.pdf"
 
     def test_pdf_by_extension(self):
         """Even without correct MIME, .pdf extension should work."""
@@ -113,6 +146,25 @@ class TestTextBlocks:
             block = file_to_content_block(data, f"file{ext}", "")
             assert block["type"] == "text", f"Extension {ext} not recognized as text"
 
+    def test_docx_is_extracted_to_text_block(self):
+        block = file_to_content_block(
+            make_docx_bytes("Executive summary"),
+            "summary.docx",
+            "application/octet-stream",
+        )
+        assert block["type"] == "text"
+        assert "Executive summary" in block["text"]
+        assert "summary.docx" in block["text"]
+
+    def test_legacy_doc_is_extracted_to_text_block(self):
+        block = file_to_content_block(
+            make_legacy_doc_bytes("Legacy contract notes"),
+            "contract.doc",
+            "application/octet-stream",
+        )
+        assert block["type"] == "text"
+        assert "Legacy contract notes" in block["text"]
+
 
 class TestTextTruncation:
     """Large text files are truncated."""
@@ -156,6 +208,16 @@ class TestUnknownFiles:
         assert block["type"] == "text"
         assert "[Binary file attached" in block["text"]
         assert "binary.dat" in block["text"]
+
+    def test_archive_binary_fallback_is_not_rendered_as_gibberish_text(self):
+        block = file_to_content_block(
+            b"PK\x03\x04" + b"\x00" * 512,
+            "archive.zip",
+            "application/octet-stream",
+        )
+        assert block["type"] == "text"
+        assert "[Binary file attached" in block["text"]
+        assert "archive" in block["text"]
 
 
 class TestFileEmoji:

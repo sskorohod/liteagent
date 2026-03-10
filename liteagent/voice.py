@@ -1,6 +1,6 @@
 """Voice engine — TTS and STT provider abstraction layer.
 
-TTS providers: OpenAI, ElevenLabs, Edge TTS (free, no API key)
+TTS providers: OpenAI, ElevenLabs, Groq (PlayAI/Orpheus), Edge TTS (free, no API key)
 STT providers: OpenAI Whisper, Deepgram, Groq
 
 Architecture inspired by OpenClaw's voice system, adapted for Python async.
@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ══════════════════════════════════════════
 
-TTS_PROVIDERS = ("openai", "elevenlabs", "edge")
+TTS_PROVIDERS = ("openai", "elevenlabs", "groq", "edge")
 STT_PROVIDERS = ("openai", "deepgram", "groq")
+TTS_LANGUAGE_OPTIONS = ("ru", "en", "ar")
 
 OPENAI_TTS_MODELS = ("tts-1", "tts-1-hd", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICES = (
@@ -46,6 +47,7 @@ OPENAI_TTS_VOICES = (
 DEFAULT_TTS_MAX_LENGTH = 1500
 DEFAULT_TTS_MAX_TEXT_LENGTH = 4096
 DEFAULT_TTS_TIMEOUT_MS = 30_000
+DEFAULT_TTS_LANGUAGE = "ru"
 
 DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 DEFAULT_ELEVENLABS_VOICE_ID = "pMsXgVXv3BLzUgSXRplE"
@@ -65,11 +67,136 @@ DEFAULT_EDGE_VOICE = "ru-RU-SvetlanaNeural"
 DEFAULT_EDGE_RATE = "+0%"
 DEFAULT_EDGE_VOLUME = "+0%"
 DEFAULT_EDGE_PITCH = "+0Hz"
+DEFAULT_EDGE_LANGUAGE = "ru"
+
+EDGE_TTS_VOICES_BY_LANGUAGE = {
+    "ru": [
+        "ru-RU-SvetlanaNeural",
+        "ru-RU-DmitryNeural",
+    ],
+    "en": [
+        "en-US-MichelleNeural",
+        "en-US-GuyNeural",
+        "en-GB-SoniaNeural",
+        "en-GB-RyanNeural",
+    ],
+    "ar": [
+        "ar-SA-HamedNeural",
+        "ar-SA-ZariyahNeural",
+    ],
+    "de": [
+        "de-DE-KatjaNeural",
+        "de-DE-ConradNeural",
+    ],
+    "fr": [
+        "fr-FR-DeniseNeural",
+        "fr-FR-HenriNeural",
+    ],
+    "es": [
+        "es-ES-ElviraNeural",
+        "es-ES-AlvaroNeural",
+    ],
+    "ja": [
+        "ja-JP-NanamiNeural",
+        "ja-JP-KeitaNeural",
+    ],
+    "zh": [
+        "zh-CN-XiaoxiaoNeural",
+        "zh-CN-YunxiNeural",
+    ],
+}
+EDGE_TTS_LANGUAGE_LABELS = {
+    "ru": "Russian",
+    "en": "English",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "ja": "Japanese",
+    "zh": "Chinese",
+}
+
+# Groq TTS (PlayAI Dialog + Orpheus via OpenAI-compatible API)
+GROQ_TTS_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_TTS_MODEL = "playai-tts"
+DEFAULT_GROQ_TTS_VOICE = "Fritz-PlayAI"
+DEFAULT_GROQ_TTS_LANGUAGE = "en"
+
+GROQ_TTS_MODELS = (
+    "playai-tts",                          # PlayAI Dialog English
+    "playai-tts-arabic",                   # PlayAI Dialog Arabic
+    "canopylabs/orpheus-v1-english",       # Orpheus English (vocal directions)
+    "canopylabs/orpheus-arabic-saudi",     # Orpheus Saudi Arabic
+)
+
+GROQ_TTS_VOICES_PLAYAI = (
+    "Arista-PlayAI", "Atlas-PlayAI", "Basil-PlayAI", "Briggs-PlayAI",
+    "Calista-PlayAI", "Celeste-PlayAI", "Cheyenne-PlayAI", "Chip-PlayAI",
+    "Cillian-PlayAI", "Deedee-PlayAI", "Eleanor-PlayAI", "Fritz-PlayAI",
+    "Gail-PlayAI", "Indigo-PlayAI", "Jennifer-PlayAI", "Judy-PlayAI",
+    "Mamaw-PlayAI", "Marina-PlayAI", "Moira-PlayAI", "Nia-PlayAI",
+    "Quinn-PlayAI", "Renata-PlayAI", "Sam-PlayAI", "Timo-PlayAI",
+)
+
+GROQ_TTS_VOICES_ORPHEUS_ENGLISH = (
+    "autumn", "diana", "hannah",    # Female
+    "austin", "daniel", "troy",     # Male
+)
+GROQ_TTS_VOICES_ORPHEUS_ARABIC = (
+    "fahad", "sultan", "lulwa", "noura",
+)
+
+GROQ_TTS_MODEL_INFO = {
+    "playai-tts": {
+        "label": "PlayAI Dialog",
+        "family": "playai",
+        "language": "en",
+        "language_label": "English",
+        "supported_languages": ["en", "ru"],
+        "experimental_languages": ["ru"],
+        "voices": list(GROQ_TTS_VOICES_PLAYAI),
+        "cost": "~$50/1M chars",
+        "notes": "Fast Groq-hosted PlayAI dialog synthesis. Russian is enabled in LiteAgent as an experimental direct mode.",
+    },
+    "playai-tts-arabic": {
+        "label": "PlayAI Dialog Arabic",
+        "family": "playai",
+        "language": "ar",
+        "language_label": "Arabic",
+        "voices": list(GROQ_TTS_VOICES_PLAYAI),
+        "cost": "~$50/1M chars",
+        "notes": "Arabic PlayAI endpoint on Groq.",
+    },
+    "canopylabs/orpheus-v1-english": {
+        "label": "Orpheus V1 English",
+        "family": "orpheus",
+        "language": "en",
+        "language_label": "English",
+        "voices": list(GROQ_TTS_VOICES_ORPHEUS_ENGLISH),
+        "cost": "~$22/1M chars",
+        "notes": "Expressive English with vocal directions.",
+    },
+    "canopylabs/orpheus-arabic-saudi": {
+        "label": "Orpheus Arabic Saudi",
+        "family": "orpheus",
+        "language": "ar",
+        "language_label": "Arabic (Saudi)",
+        "voices": list(GROQ_TTS_VOICES_ORPHEUS_ARABIC),
+        "cost": "~$40/1M chars",
+        "notes": "Authentic Saudi Arabic. No vocal directions.",
+    },
+}
+GROQ_TTS_LANGUAGE_LABELS = {
+    "ru": "Russian",
+    "en": "English",
+    "ar": "Arabic",
+}
 
 # Output format routing (like OpenClaw's TELEGRAM_OUTPUT / DEFAULT_OUTPUT)
 TELEGRAM_FORMAT = {
     "openai": "opus",
     "elevenlabs": "opus_48000_64",
+    "groq": "wav",      # Groq supports wav; convert to ogg for Telegram
     "edge": "webm-24khz-16bit-mono-opus",
     "extension": ".ogg",
     "voice_compatible": True,
@@ -80,6 +207,7 @@ EDGE_MP3_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
 DEFAULT_FORMAT = {
     "openai": "mp3",
     "elevenlabs": "mp3_44100_128",
+    "groq": "wav",       # Groq primary format
     "edge": "mp3",
     "extension": ".mp3",
     "voice_compatible": False,
@@ -112,11 +240,20 @@ BUILTIN_PRESETS: dict[str, dict] = {
         "provider": "edge",
         "edge": {"voice": "ru-RU-SvetlanaNeural", "rate": "+0%"},
     },
+    "groq_fast": {
+        "provider": "groq",
+        "groq": {"model": "playai-tts", "voice": "Fritz-PlayAI", "speed": 1.0},
+    },
+    "groq_expressive": {
+        "provider": "groq",
+        "groq": {"model": "canopylabs/orpheus-v1-english", "voice": "autumn", "speed": 1.0},
+    },
 }
 
 TTS_COST_INFO = {
     "openai": "~$15/1M chars (tts-1), ~$30/1M (tts-1-hd)",
     "elevenlabs": "~$30/1M chars (depends on plan)",
+    "groq": "~$50/1M chars (PlayAI Dialog), ~$22/1M (Orpheus), ultra-fast",
     "edge": "free (unlimited)",
 }
 
@@ -189,6 +326,19 @@ def resolve_voice_config(config: dict) -> dict:
     voice = config.get("voice", {})
     tts = voice.get("tts", {})
     stt = voice.get("stt", {})
+    groq_cfg = tts.get("groq", {})
+    edge_cfg = tts.get("edge", {})
+    groq_model = groq_cfg.get("model") or DEFAULT_GROQ_TTS_MODEL
+    groq_language = _normalize_tts_language(
+        groq_cfg.get("language"),
+        default=_groq_model_language(groq_model),
+    )
+    edge_voice = edge_cfg.get("voice")
+    edge_language = _normalize_edge_language(
+        edge_cfg.get("language"),
+        default=_edge_language_from_voice(edge_voice or DEFAULT_EDGE_VOICE),
+    )
+    edge_voice = edge_voice or _edge_default_voice(edge_language)
 
     return {
         "tts": {
@@ -197,6 +347,10 @@ def resolve_voice_config(config: dict) -> dict:
             "max_length": tts.get("max_length", DEFAULT_TTS_MAX_LENGTH),
             "max_text_length": tts.get("max_text_length", DEFAULT_TTS_MAX_TEXT_LENGTH),
             "timeout_ms": tts.get("timeout_ms", DEFAULT_TTS_TIMEOUT_MS),
+            "language": _normalize_tts_language(
+                tts.get("language"),
+                default=DEFAULT_TTS_LANGUAGE,
+            ),
             "openai": {
                 "model": tts.get("openai", {}).get("model", DEFAULT_OPENAI_TTS_MODEL),
                 "voice": tts.get("openai", {}).get("voice", DEFAULT_OPENAI_TTS_VOICE),
@@ -227,12 +381,22 @@ def resolve_voice_config(config: dict) -> dict:
                     "speed", DEFAULT_ELEVENLABS_VOICE_SETTINGS["speed"]
                 ),
             },
+            "groq": {
+                "model": groq_model,
+                "voice": groq_cfg.get(
+                    "voice",
+                    _groq_default_voice(groq_model),
+                ) or _groq_default_voice(groq_model),
+                "language": groq_language,
+                "speed": groq_cfg.get("speed", 1.0),
+            },
             "edge": {
-                "enabled": tts.get("edge", {}).get("enabled", True),
-                "voice": tts.get("edge", {}).get("voice", DEFAULT_EDGE_VOICE),
-                "rate": tts.get("edge", {}).get("rate", DEFAULT_EDGE_RATE),
-                "volume": tts.get("edge", {}).get("volume", DEFAULT_EDGE_VOLUME),
-                "pitch": tts.get("edge", {}).get("pitch") or DEFAULT_EDGE_PITCH,
+                "enabled": edge_cfg.get("enabled", True),
+                "language": edge_language,
+                "voice": edge_voice,
+                "rate": edge_cfg.get("rate", DEFAULT_EDGE_RATE),
+                "volume": edge_cfg.get("volume", DEFAULT_EDGE_VOLUME),
+                "pitch": edge_cfg.get("pitch") or DEFAULT_EDGE_PITCH,
             },
         },
         "stt": {
@@ -251,6 +415,74 @@ def resolve_voice_config(config: dict) -> dict:
             },
         },
     }
+
+
+def _normalize_tts_language(value: str | None, default: str = DEFAULT_TTS_LANGUAGE) -> str:
+    language = (value or default or DEFAULT_TTS_LANGUAGE).strip().lower()
+    if language not in TTS_LANGUAGE_OPTIONS:
+        return default
+    return language
+
+
+def _normalize_edge_language(value: str | None, default: str = DEFAULT_EDGE_LANGUAGE) -> str:
+    language = (value or default or DEFAULT_EDGE_LANGUAGE).strip().lower()
+    if language not in EDGE_TTS_VOICES_BY_LANGUAGE:
+        return default
+    return language
+
+
+def _edge_language_from_voice(voice: str | None) -> str:
+    if not voice:
+        return DEFAULT_EDGE_LANGUAGE
+    prefix = voice.split("-", 1)[0].strip().lower()
+    return _normalize_edge_language(prefix, default=DEFAULT_EDGE_LANGUAGE)
+
+
+def _edge_default_voice(language: str) -> str:
+    normalized = _normalize_edge_language(language)
+    voices = EDGE_TTS_VOICES_BY_LANGUAGE.get(normalized) or [DEFAULT_EDGE_VOICE]
+    if normalized == DEFAULT_EDGE_LANGUAGE and DEFAULT_EDGE_VOICE in voices:
+        return DEFAULT_EDGE_VOICE
+    return voices[0]
+
+
+def _groq_model_info(model: str) -> dict:
+    return GROQ_TTS_MODEL_INFO.get(model, GROQ_TTS_MODEL_INFO[DEFAULT_GROQ_TTS_MODEL])
+
+
+def _groq_model_language(model: str) -> str:
+    return _groq_model_info(model).get("language", DEFAULT_GROQ_TTS_LANGUAGE)
+
+
+def _groq_model_supports_language(model: str, language: str) -> bool:
+    normalized = _normalize_tts_language(language, default=_groq_model_language(model))
+    meta = _groq_model_info(model)
+    supported = meta.get("supported_languages")
+    if supported:
+        return normalized in supported
+    return normalized == _groq_model_language(model)
+
+
+def _groq_model_voices(model: str) -> list[str]:
+    voices = _groq_model_info(model).get("voices") or [DEFAULT_GROQ_TTS_VOICE]
+    return list(voices)
+
+
+def _groq_default_voice(model: str) -> str:
+    voices = _groq_model_voices(model)
+    if model == DEFAULT_GROQ_TTS_MODEL and DEFAULT_GROQ_TTS_VOICE in voices:
+        return DEFAULT_GROQ_TTS_VOICE
+    return voices[0]
+
+
+def _groq_supported_languages() -> tuple[str, ...]:
+    languages = []
+    for model in GROQ_TTS_MODELS:
+        meta = _groq_model_info(model)
+        for language in meta.get("supported_languages") or [_groq_model_language(model)]:
+            if language not in languages:
+                languages.append(language)
+    return tuple(languages)
 
 
 def _resolve_output_format(channel: str = "api") -> dict:
@@ -272,6 +504,9 @@ def _get_tts_api_key(provider: str, config: dict) -> str | None:
         if key:
             return key
         return os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("XI_API_KEY")
+    if provider == "groq":
+        key = get_api_key("groq")
+        return key or os.environ.get("GROQ_API_KEY")
     return None  # edge doesn't need a key
 
 
@@ -302,6 +537,9 @@ def _get_tts_provider(voice_cfg: dict, config: dict) -> str:
         return "edge"
     if _get_tts_api_key(provider, config):
         return provider
+    # Fallback: try groq (fast + cheap), then edge (free)
+    if provider != "groq" and _get_tts_api_key("groq", config):
+        return "groq"
     return "edge"
 
 
@@ -571,6 +809,43 @@ async def elevenlabs_tts(
             raise RuntimeError(f"ElevenLabs API error ({e.code})") from e
 
     return await loop.run_in_executor(None, _fetch)
+
+
+async def groq_tts(
+    text: str,
+    api_key: str,
+    model: str = DEFAULT_GROQ_TTS_MODEL,
+    voice: str = DEFAULT_GROQ_TTS_VOICE,
+    response_format: str = "wav",
+    speed: float = 1.0,
+    timeout_ms: int = DEFAULT_TTS_TIMEOUT_MS,
+) -> bytes:
+    """Synthesize speech using Groq TTS API (OpenAI-compatible).
+
+    Supports PlayAI Dialog and Orpheus models. Ultra-fast inference.
+    """
+    try:
+        import openai
+    except ImportError:
+        raise RuntimeError("openai package required: pip install liteagent[openai]")
+
+    client = openai.AsyncOpenAI(
+        api_key=api_key,
+        base_url=GROQ_TTS_BASE_URL,
+        timeout=timeout_ms / 1000,
+    )
+
+    kwargs: dict = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+    }
+    if speed != 1.0:
+        kwargs["speed"] = speed
+
+    response = await client.audio.speech.create(**kwargs)
+    return response.content
 
 
 async def _convert_to_ogg_opus(input_path: str, output_path: str) -> bool:
@@ -843,6 +1118,26 @@ async def text_to_speech(
                     else overrides.elevenlabs_speed,
                     timeout_ms=tts_cfg["timeout_ms"],
                 )
+            elif provider == "groq":
+                groq_cfg = tts_cfg["groq"]
+                preferred_language = _normalize_tts_language(
+                    groq_cfg.get("language") or tts_cfg.get("language"),
+                    default=_groq_model_language(groq_cfg["model"]),
+                )
+                if not _groq_model_supports_language(groq_cfg["model"], preferred_language):
+                    errors.append(
+                        "groq: selected language does not match the configured Groq model"
+                    )
+                    continue
+                audio_bytes = await groq_tts(
+                    text=text,
+                    api_key=api_key,
+                    model=groq_cfg["model"],
+                    voice=groq_cfg["voice"],
+                    response_format="wav",
+                    speed=groq_cfg.get("speed", 1.0),
+                    timeout_ms=tts_cfg["timeout_ms"],
+                )
             else:  # openai
                 oai_cfg = tts_cfg["openai"]
                 audio_bytes = await openai_tts(
@@ -861,20 +1156,41 @@ async def text_to_speech(
 
             # Save to temp file
             tmp_dir = tempfile.mkdtemp(prefix="tts-")
-            audio_path = os.path.join(
-                tmp_dir, f"voice-{int(time.time())}{output['extension']}"
-            )
-            with open(audio_path, "wb") as f:
-                f.write(audio_bytes)
+            needs_opus = output.get("voice_compatible", False)
+
+            if provider == "groq" and needs_opus:
+                # Groq outputs WAV; convert to OGG Opus for Telegram
+                wav_path = os.path.join(tmp_dir, f"voice-{int(time.time())}.wav")
+                with open(wav_path, "wb") as f:
+                    f.write(audio_bytes)
+                audio_path = os.path.join(tmp_dir, f"voice-{int(time.time())}.ogg")
+                converted = await _convert_to_ogg_opus(wav_path, audio_path)
+                if converted:
+                    os.unlink(wav_path)
+                    out_format = "ogg-opus"
+                else:
+                    audio_path = wav_path
+                    out_format = "wav"
+            elif provider == "groq":
+                # Non-Telegram: save WAV directly
+                audio_path = os.path.join(tmp_dir, f"voice-{int(time.time())}.wav")
+                with open(audio_path, "wb") as f:
+                    f.write(audio_bytes)
+                out_format = "wav"
+            else:
+                audio_path = os.path.join(
+                    tmp_dir, f"voice-{int(time.time())}{output['extension']}"
+                )
+                with open(audio_path, "wb") as f:
+                    f.write(audio_bytes)
+                out_format = output.get(provider, "mp3")
 
             return TtsResult(
                 success=True,
                 audio_path=audio_path,
                 latency_ms=latency,
                 provider=provider,
-                output_format=output["openai"]
-                if provider == "openai"
-                else output["elevenlabs"],
+                output_format=out_format,
                 voice_compatible=output["voice_compatible"],
             )
 

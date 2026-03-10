@@ -106,18 +106,38 @@ def get_pricing(model: str) -> dict[str, float]:
 # ══════════════════════════════════════════
 
 class AnthropicProvider:
-    """Anthropic Claude provider (default)."""
+    """Anthropic Claude provider (default).
+
+    Supports auth profile key rotation (from OpenClaw): if multiple API keys
+    are registered via config.providers.anthropic.api_keys, rotates through
+    them automatically on failures.
+    """
 
     def __init__(self):
         import anthropic
         self.client = anthropic.AsyncAnthropic()
         self._last_stream_response: LLMResponse | None = None
+        self._current_key: str | None = None
 
     def supports_model(self, model: str) -> bool:
         return model.startswith("claude-") or model.startswith("anthropic/")
 
+    async def _get_client(self):
+        """Return client, optionally rotating key via auth profiles."""
+        import anthropic
+        try:
+            from .auth_profiles import get_next_api_key
+            key = await get_next_api_key("anthropic")
+            if key and key != self._current_key:
+                self._current_key = key
+                self.client = anthropic.AsyncAnthropic(api_key=key)
+        except Exception:
+            pass
+        return self.client
+
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
+        client = await self._get_client()
         kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
         if system is not None:
             kwargs["system"] = system
@@ -125,11 +145,23 @@ class AnthropicProvider:
             kwargs["tools"] = tools
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = await self.client.messages.create(**kwargs)
-        return self._to_response(response)
+        try:
+            response = await client.messages.create(**kwargs)
+            if self._current_key:
+                from .auth_profiles import report_key_success
+                await report_key_success("anthropic", self._current_key)
+            return self._to_response(response)
+        except Exception as exc:
+            if self._current_key:
+                from .auth_profiles import report_key_failure
+                reason = "rate_limit" if "rate" in str(exc).lower() else \
+                         "auth_error" if "auth" in str(exc).lower() else "unknown"
+                await report_key_failure("anthropic", self._current_key, reason)
+            raise
 
     async def stream(self, model: str, max_tokens: int, messages: list,
                      system=None, tools=None, temperature=None) -> AsyncGenerator:
+        client = await self._get_client()
         kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
         if system is not None:
             kwargs["system"] = system
@@ -138,7 +170,7 @@ class AnthropicProvider:
         if temperature is not None:
             kwargs["temperature"] = temperature
 
-        async with self.client.messages.stream(**kwargs) as stream:
+        async with client.messages.stream(**kwargs) as stream:
             async for event in stream:
                 if hasattr(event, 'type') and event.type == "content_block_delta":
                     if hasattr(event.delta, 'text'):
@@ -174,6 +206,8 @@ class OpenAIProvider:
     def __init__(self, base_url: str | None = None,
                  api_key_env: str = "OPENAI_API_KEY"):
         import openai
+        self._base_url = base_url
+        self._api_key_env = api_key_env
         kwargs = {}
         if base_url:
             kwargs["base_url"] = base_url
@@ -181,6 +215,7 @@ class OpenAIProvider:
         if key:
             kwargs["api_key"] = key
         self.client = openai.AsyncOpenAI(**kwargs)
+        self._current_key: str | None = key
         self._last_stream_response: LLMResponse | None = None
 
     def supports_model(self, model: str) -> bool:
@@ -188,24 +223,55 @@ class OpenAIProvider:
                 or model.startswith("o3") or model.startswith("qwen")
                 or model.startswith("grok"))
 
+    async def _get_client(self):
+        """Return client, optionally rotating key via auth profiles."""
+        import openai
+        try:
+            from .auth_profiles import get_next_api_key
+            key = await get_next_api_key("openai")
+            if key and key != self._current_key:
+                self._current_key = key
+                kwargs = {"api_key": key}
+                if self._base_url:
+                    kwargs["base_url"] = self._base_url
+                self.client = openai.AsyncOpenAI(**kwargs)
+        except Exception:
+            pass
+        return self.client
+
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
+        client = await self._get_client()
         oai_messages = self._convert_messages(messages, system)
         kwargs = {"model": model, "max_tokens": max_tokens, "messages": oai_messages}
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tool_choice"] = "auto"
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = await self.client.chat.completions.create(**kwargs)
-        return self._to_response(response)
+        try:
+            response = await client.chat.completions.create(**kwargs)
+            if self._current_key:
+                from .auth_profiles import report_key_success
+                await report_key_success("openai", self._current_key)
+            return self._to_response(response)
+        except Exception as exc:
+            if self._current_key:
+                from .auth_profiles import report_key_failure
+                reason = "rate_limit" if "rate" in str(exc).lower() else \
+                         "auth_error" if "auth" in str(exc).lower() else "unknown"
+                await report_key_failure("openai", self._current_key, reason)
+            raise
 
     async def stream(self, model: str, max_tokens: int, messages: list,
                      system=None, tools=None, temperature=None) -> AsyncGenerator:
+        client = await self._get_client()
         oai_messages = self._convert_messages(messages, system)
         kwargs = {"model": model, "max_tokens": max_tokens, "messages": oai_messages,
                   "stream": True}
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tool_choice"] = "auto"
         if temperature is not None:
             kwargs["temperature"] = temperature
 
@@ -214,7 +280,7 @@ class OpenAIProvider:
         finish_reason = "stop"
         import json as _json
 
-        response = await self.client.chat.completions.create(**kwargs)
+        response = await client.chat.completions.create(**kwargs)
         async for chunk in response:
             delta = chunk.choices[0].delta if chunk.choices else None
             if not delta:
@@ -414,6 +480,7 @@ class OllamaProvider(OpenAIProvider):
         import openai
         self.client = openai.AsyncOpenAI(base_url=base_url, api_key="ollama")
         self._base_url = base_url
+        self._current_key: str | None = None
         self._last_stream_response: LLMResponse | None = None
 
     def supports_model(self, model: str) -> bool:
@@ -542,16 +609,46 @@ class GeminiProvider:
 
     def __init__(self, api_key_env: str = "GOOGLE_API_KEY"):
         import google.generativeai as genai
+        self._api_key_env = api_key_env
         api_key = os.environ.get(api_key_env, "")
         genai.configure(api_key=api_key)
         self._genai = genai
+        self._current_key: str | None = api_key or None
         self._last_stream_response: LLMResponse | None = None
 
     def supports_model(self, model: str) -> bool:
         return model.startswith("gemini-") or model.startswith("models/")
 
+    async def _rotate_key(self) -> None:
+        """Rotate to next key via auth profiles if available."""
+        try:
+            from .auth_profiles import get_next_api_key
+            key = await get_next_api_key("gemini")
+            if key and key != self._current_key:
+                self._current_key = key
+                self._genai.configure(api_key=key)
+        except Exception:
+            pass
+
     async def complete(self, model: str, max_tokens: int, messages: list,
                        system=None, tools=None, temperature=None) -> LLMResponse:
+        await self._rotate_key()
+        try:
+            result = await self._do_complete(model, max_tokens, messages, system, temperature, tools)
+            if self._current_key:
+                from .auth_profiles import report_key_success
+                await report_key_success("gemini", self._current_key)
+            return result
+        except Exception as exc:
+            if self._current_key:
+                from .auth_profiles import report_key_failure
+                reason = "rate_limit" if "rate" in str(exc).lower() or "quota" in str(exc).lower() else \
+                         "auth_error" if "auth" in str(exc).lower() or "api_key" in str(exc).lower() else "unknown"
+                await report_key_failure("gemini", self._current_key, reason)
+            raise
+
+    async def _do_complete(self, model: str, max_tokens: int, messages: list,
+                           system=None, temperature=None, tools=None) -> LLMResponse:
         gen_model = self._genai.GenerativeModel(
             model_name=model,
             system_instruction=self._flatten_system(system) or None)
@@ -561,23 +658,61 @@ class GeminiProvider:
         if temperature is not None:
             gen_config["temperature"] = temperature
 
-        response = await asyncio.to_thread(
-            gen_model.generate_content, contents,
-            generation_config=gen_config)
+        kwargs: dict = {"generation_config": gen_config}
+        tools_param = self._convert_tools_to_gemini(tools)
+        if tools_param:
+            kwargs["tools"] = tools_param
+            kwargs["tool_config"] = {"function_calling_config": {"mode": "AUTO"}}
 
-        text = response.text or ""
+        response = await asyncio.to_thread(
+            gen_model.generate_content, contents, **kwargs)
+
         usage = TokenUsage()
         if hasattr(response, 'usage_metadata') and response.usage_metadata:
             usage.input_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0)
             usage.output_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0)
 
+        # Parse response: may contain text parts and/or function_call parts
+        blocks: list = []
+        has_tool_use = False
+        try:
+            candidates = response.candidates or []
+        except Exception:
+            candidates = []
+
+        for candidate in candidates:
+            try:
+                parts = candidate.content.parts or []
+            except Exception:
+                parts = []
+            for part in parts:
+                if hasattr(part, 'function_call') and getattr(part.function_call, 'name', None):
+                    fc = part.function_call
+                    blocks.append(ToolUseBlock(
+                        id=f"gemini_{fc.name}_{id(fc)}",
+                        name=fc.name,
+                        input=dict(fc.args) if fc.args else {},
+                    ))
+                    has_tool_use = True
+                elif hasattr(part, 'text') and part.text:
+                    blocks.append(TextBlock(text=part.text))
+
+        if not blocks:
+            # Fallback: try response.text shortcut
+            try:
+                text = response.text or ""
+            except Exception:
+                text = ""
+            blocks = [TextBlock(text=text)]
+
         return LLMResponse(
-            content=[TextBlock(text=text)],
-            stop_reason="end_turn",
+            content=blocks,
+            stop_reason="tool_use" if has_tool_use else "end_turn",
             usage=usage)
 
     async def stream(self, model: str, max_tokens: int, messages: list,
                      system=None, tools=None, temperature=None) -> AsyncGenerator:
+        await self._rotate_key()
         gen_model = self._genai.GenerativeModel(
             model_name=model,
             system_instruction=self._flatten_system(system) or None)
@@ -587,19 +722,56 @@ class GeminiProvider:
         if temperature is not None:
             gen_config["temperature"] = temperature
 
+        kwargs: dict = {"generation_config": gen_config, "stream": True}
+        tools_param = self._convert_tools_to_gemini(tools)
+        if tools_param:
+            kwargs["tools"] = tools_param
+            kwargs["tool_config"] = {"function_calling_config": {"mode": "AUTO"}}
+
         response = await asyncio.to_thread(
-            gen_model.generate_content, contents,
-            generation_config=gen_config, stream=True)
+            gen_model.generate_content, contents, **kwargs)
 
         full_text = ""
+        tool_blocks: list[ToolUseBlock] = []
+
         for chunk in response:
-            if chunk.text:
-                full_text += chunk.text
-                yield chunk.text
+            # Try to get parts from candidates first (needed when tools are active)
+            got_parts = False
+            try:
+                for candidate in (chunk.candidates or []):
+                    for part in (candidate.content.parts or []):
+                        got_parts = True
+                        if hasattr(part, 'function_call') and getattr(part.function_call, 'name', None):
+                            fc = part.function_call
+                            tool_blocks.append(ToolUseBlock(
+                                id=f"gemini_{fc.name}_{id(fc)}",
+                                name=fc.name,
+                                input=dict(fc.args) if fc.args else {},
+                            ))
+                        elif hasattr(part, 'text') and part.text:
+                            full_text += part.text
+                            yield part.text
+            except Exception:
+                pass
+
+            if not got_parts:
+                # Fallback: try chunk.text
+                try:
+                    t = chunk.text
+                    if t:
+                        full_text += t
+                        yield t
+                except Exception:
+                    pass
+
+        content_blocks: list = []
+        if full_text:
+            content_blocks.append(TextBlock(text=full_text))
+        content_blocks.extend(tool_blocks)
 
         self._last_stream_response = LLMResponse(
-            content=[TextBlock(text=full_text)],
-            stop_reason="end_turn",
+            content=content_blocks,
+            stop_reason="tool_use" if tool_blocks else "end_turn",
             usage=TokenUsage())
 
     @staticmethod
@@ -611,41 +783,131 @@ class GeminiProvider:
         return str(system)
 
     @staticmethod
+    def _convert_schema(schema: dict) -> dict:
+        """Convert JSON Schema to Gemini Schema format (uppercase types)."""
+        if not schema:
+            return {"type": "OBJECT"}
+        _type_map = {
+            "string": "STRING", "number": "NUMBER", "integer": "INTEGER",
+            "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
+        }
+        result: dict = {}
+        jtype = schema.get("type", "object")
+        result["type"] = _type_map.get(str(jtype).lower(), "STRING")
+        if "description" in schema:
+            result["description"] = schema["description"]
+        if "enum" in schema:
+            result["enum"] = schema["enum"]
+        if "properties" in schema:
+            result["properties"] = {
+                k: GeminiProvider._convert_schema(v)
+                for k, v in schema["properties"].items()
+            }
+        if "required" in schema:
+            result["required"] = schema["required"]
+        if "items" in schema:
+            result["items"] = GeminiProvider._convert_schema(schema["items"])
+        return result
+
+    def _convert_tools_to_gemini(self, tools) -> list | None:
+        """Convert Anthropic-format tool defs to Gemini function_declarations."""
+        if not tools:
+            return None
+        function_declarations = []
+        for tool in tools:
+            fd: dict = {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+            }
+            schema = tool.get("input_schema", {})
+            if schema:
+                fd["parameters"] = self._convert_schema(schema)
+            function_declarations.append(fd)
+        return [{"function_declarations": function_declarations}]
+
+    @staticmethod
     def _convert_messages(messages: list) -> list:
-        """Convert to Gemini format (supports text + image + document blocks)."""
+        """Convert to Gemini format (text + images + tool_use + tool_result)."""
+        # Build tool_use_id → tool_name map needed for function_response
+        tool_id_to_name: dict[str, str] = {}
+        for msg in messages:
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_id_to_name[block.get("id", "")] = block.get("name", "tool")
+                    elif hasattr(block, 'type') and getattr(block, 'type', None) == "tool_use":
+                        tool_id_to_name[block.id] = block.name
+
         contents = []
         for msg in messages:
             role = "user" if msg["role"] == "user" else "model"
             content = msg["content"]
+
             if isinstance(content, str):
                 contents.append({"role": role, "parts": [content]})
-            elif isinstance(content, list):
-                parts = []
+                continue
+
+            if isinstance(content, list):
+                parts: list = []
+                fn_response_parts: list = []
+
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif isinstance(block, dict) and block.get("type") == "image":
-                        # Gemini inline_data format for images
-                        source = block.get("source", {})
-                        parts.append({
-                            "inline_data": {
-                                "mime_type": source.get("media_type", "image/jpeg"),
-                                "data": source.get("data", ""),
-                            }
-                        })
-                    elif isinstance(block, dict) and block.get("type") == "document":
-                        # Gemini supports PDF via inline_data
-                        source = block.get("source", {})
-                        parts.append({
-                            "inline_data": {
-                                "mime_type": source.get("media_type", "application/pdf"),
-                                "data": source.get("data", ""),
-                            }
-                        })
-                    elif hasattr(block, 'type') and block.type == "text":
-                        parts.append(block.text)
-                if parts:
+                    if isinstance(block, dict):
+                        btype = block.get("type", "")
+                        if btype == "text":
+                            parts.append(block.get("text", ""))
+                        elif btype == "tool_use":
+                            parts.append({
+                                "function_call": {
+                                    "name": block.get("name", ""),
+                                    "args": block.get("input", {}),
+                                }
+                            })
+                        elif btype == "tool_result":
+                            tool_id = block.get("tool_use_id", "")
+                            fn_name = tool_id_to_name.get(tool_id, tool_id or "tool")
+                            raw = block.get("content", "")
+                            response_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                            fn_response_parts.append({
+                                "function_response": {
+                                    "name": fn_name,
+                                    "response": {"result": response_text},
+                                }
+                            })
+                        elif btype == "image":
+                            source = block.get("source", {})
+                            parts.append({
+                                "inline_data": {
+                                    "mime_type": source.get("media_type", "image/jpeg"),
+                                    "data": source.get("data", ""),
+                                }
+                            })
+                        elif btype == "document":
+                            source = block.get("source", {})
+                            parts.append({
+                                "inline_data": {
+                                    "mime_type": source.get("media_type", "application/pdf"),
+                                    "data": source.get("data", ""),
+                                }
+                            })
+                    elif hasattr(block, 'type'):
+                        btype = getattr(block, 'type', None)
+                        if btype == "text":
+                            parts.append(block.text)
+                        elif btype == "tool_use":
+                            parts.append({
+                                "function_call": {
+                                    "name": block.name,
+                                    "args": block.input,
+                                }
+                            })
+
+                if fn_response_parts:
+                    contents.append({"role": "user", "parts": fn_response_parts})
+                elif parts:
                     contents.append({"role": role, "parts": parts})
+
         return contents
 
 
@@ -759,8 +1021,18 @@ def create_provider(config: dict):
 
     If the configured provider's API key is missing, falls back to
     the first provider that has a key available.
+
+    Auth profiles (from OpenClaw): if config.providers.<name>.api_keys is a list,
+    registers all keys in the AuthProfileManager for round-robin rotation.
     """
     from .config import get_api_key, PROVIDER_ENV_VARS
+
+    # Register any multi-key profiles from config (OpenClaw auth profiles)
+    try:
+        from .auth_profiles import register_keys_from_config
+        register_keys_from_config(config)
+    except Exception:
+        pass
 
     agent_cfg = config.get("agent", {})
     provider_name = agent_cfg.get("provider", "anthropic")

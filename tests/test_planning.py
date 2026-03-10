@@ -80,6 +80,10 @@ class TestGeneratePlan:
             "complexity": "complex",
             "tools_needed": ["read_file", "write_file"],
             "estimated_iterations": 5,
+            "assumptions": ["Use existing project structure"],
+            "verification_steps": ["Run targeted tests"],
+            "ask_user": False,
+            "ask_user_reason": "",
         })
         provider = _mock_provider(plan_json)
         config = {"planning_model": "claude-haiku-4-5-20251001", "skip_simple": True}
@@ -92,6 +96,27 @@ class TestGeneratePlan:
         assert plan["complexity"] == "complex"
         assert len(plan["steps"]) == 3
         assert "read_file" in plan["tools_needed"]
+        assert plan["assumptions"] == ["Use existing project structure"]
+        assert plan["verification_steps"] == ["Run targeted tests"]
+        assert plan["ask_user"] is False
+
+    @pytest.mark.asyncio
+    async def test_plan_defaults_new_autonomy_fields(self):
+        plan_json = json.dumps({
+            "steps": ["Inspect files"],
+            "complexity": "medium",
+            "tools_needed": ["read_file"],
+            "estimated_iterations": 2,
+        })
+        provider = _mock_provider(plan_json)
+        config = {"skip_simple": True}
+
+        plan = await generate_plan(provider, "Fix the bug", [], [{"name": "read_file"}], config)
+        assert plan is not None
+        assert plan["assumptions"] == []
+        assert plan["verification_steps"] == []
+        assert plan["ask_user"] is False
+        assert plan["ask_user_reason"] == ""
 
     @pytest.mark.asyncio
     async def test_simple_request_returns_none(self):
@@ -219,6 +244,8 @@ class TestFormatPlan:
             "steps": ["Read the code", "Write tests"],
             "tools_needed": ["read_file", "write_file"],
             "estimated_iterations": 3,
+            "assumptions": ["Use the existing test harness"],
+            "verification_steps": ["Run the edited tests"],
         }
         text = format_plan_for_prompt(plan)
         assert "## Your execution plan:" in text
@@ -227,6 +254,9 @@ class TestFormatPlan:
         assert "read_file, write_file" in text
         assert "3" in text
         assert "Follow this plan" in text
+        assert "Working assumptions:" in text
+        assert "Critical verification before final answer:" in text
+        assert "Do NOT ask the user for routine confirmation" in text
 
     def test_empty_tools(self):
         plan = {"steps": ["Think", "Answer"], "tools_needed": [], "estimated_iterations": 1}

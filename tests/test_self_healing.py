@@ -1,6 +1,7 @@
 """Tests for self-healing: provider fallback + tool error recovery."""
 
 import os
+import asyncio
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -73,6 +74,24 @@ class TestFallbackProvider:
         monkeypatch.setattr("liteagent.agent.LiteAgent._get_fallback_provider",
                             lambda self: None)
         assert agent._get_fallback_provider() is None
+
+    def test_fallback_returns_none_in_ollama_mode(self, tmp_path):
+        from liteagent.agent import LiteAgent
+
+        config = {
+            "agent": {
+                "provider": "ollama",
+                "default_model": "qwen3-coder:30b",
+            },
+            "memory": {"db_path": str(tmp_path / "test.db"), "auto_learn": False},
+            "cost": {"cascade_routing": False, "budget_daily_usd": 100.0},
+            "tools": {"builtin": []},
+        }
+        agent = LiteAgent(config)
+        try:
+            assert agent._get_fallback_provider() is None
+        finally:
+            agent.memory.close()
 
     async def test_switch_provider_updates_state(self, monkeypatch):
         agent = self._make_agent()
@@ -148,6 +167,52 @@ class TestCallApiWithFallback:
         with patch.object(agent, "_get_fallback_provider", return_value=None):
             with pytest.raises(Exception, match="authentication"):
                 await agent._call_api(model="test", messages=[], max_tokens=10)
+
+    @pytest.mark.asyncio
+    async def test_call_api_timeout_does_not_switch_provider_in_ollama_mode(self, tmp_path, monkeypatch):
+        from liteagent.agent import LiteAgent
+
+        config = {
+            "agent": {
+                "provider": "ollama",
+                "default_model": "qwen3-coder:30b",
+            },
+            "memory": {"db_path": str(tmp_path / "test.db"), "auto_learn": False},
+            "cost": {"cascade_routing": False, "budget_daily_usd": 100.0},
+            "tools": {"builtin": []},
+        }
+        agent = LiteAgent(config)
+        try:
+            agent.provider.complete = AsyncMock(side_effect=asyncio.TimeoutError())
+            switch_mock = AsyncMock()
+            monkeypatch.setattr(agent, "_switch_provider", switch_mock)
+
+            with pytest.raises(TimeoutError, match="timed out"):
+                await agent._call_api(model="qwen3-coder:30b", messages=[], max_tokens=10)
+
+            switch_mock.assert_not_called()
+            assert agent.config["agent"]["provider"] == "ollama"
+        finally:
+            agent.memory.close()
+
+    def test_ollama_default_provider_timeout_is_600s(self, tmp_path):
+        from liteagent.agent import LiteAgent
+
+        config = {
+            "agent": {
+                "provider": "ollama",
+                "default_model": "qwen3-coder:30b",
+            },
+            "memory": {"db_path": str(tmp_path / "test.db"), "auto_learn": False},
+            "cost": {"cascade_routing": False, "budget_daily_usd": 100.0},
+            "tools": {"builtin": []},
+        }
+        agent = LiteAgent(config)
+        try:
+            assert agent._provider_call_timeout("ollama") == 600.0
+            assert agent._provider_call_timeout("anthropic") == 120.0
+        finally:
+            agent.memory.close()
 
 
 class TestToolExecuteOne:

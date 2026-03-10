@@ -348,6 +348,17 @@ class RAGPipeline:
         self._vector_top_k = search_cfg.get("vector_top_k", 50)
         self._keyword_top_k = search_cfg.get("keyword_top_k", 50)
 
+        # MMR re-ranking (from OpenClaw)
+        from .mmr import MMRConfig
+        mmr_cfg = search_cfg.get("mmr", {})
+        self._mmr = MMRConfig(
+            enabled=mmr_cfg.get("enabled", False),
+            lambda_=mmr_cfg.get("lambda", 0.7),
+        )
+
+        # Query expansion for FTS (from OpenClaw)
+        self._query_expansion = search_cfg.get("query_expansion", True)
+
         # Vector backend (tiered: sqlite-vec → Qdrant → brute-force → None)
         self._backend: VectorBackend | None = None
         self._collection = cfg.get("collection", "liteagent_rag")
@@ -706,28 +717,55 @@ class RAGPipeline:
     # ═══════════════════════════════════════
 
     def search(self, query: str, top_k: int | None = None) -> list[dict]:
-        """Hybrid search: vector + keyword with RRF fusion."""
+        """Hybrid search: vector + keyword + RRF + optional MMR re-ranking.
+
+        Query expansion (OpenClaw) is applied to keyword search when embeddings
+        are unavailable or in keyword-only mode.
+        MMR re-ranking (OpenClaw) diversifies results when enabled.
+        """
         k = top_k or self.top_k
         mode = self._search_mode
 
-        vector_results = []
-        keyword_results = []
+        vector_results: list[dict] = []
+        keyword_results: list[dict] = []
+
+        # Expand query for FTS when beneficial (OpenClaw query expansion)
+        fts_query = query
+        if self._query_expansion:
+            from .query_expansion import maybe_expand
+            fts_query = maybe_expand(query)
+            if fts_query != query:
+                logger.debug("RAG query expanded: %r → %r", query, fts_query)
 
         # Vector search
         if mode in ("hybrid", "vector") and self._embedder:
             vector_results = self._vector_search(query, self._vector_top_k)
 
-        # Keyword search
+        # Keyword search (with expanded query)
         if mode in ("hybrid", "keyword"):
-            keyword_results = self._keyword_search(query, self._keyword_top_k)
+            keyword_results = self._keyword_search(fts_query, self._keyword_top_k)
 
         # Fusion
         if mode == "hybrid" and vector_results and keyword_results:
-            return self._rrf_fusion(vector_results, keyword_results, k=self._rrf_k)[:k]
+            results = self._rrf_fusion(vector_results, keyword_results, k=self._rrf_k)[:k]
+        else:
+            results = (vector_results or keyword_results)[:k]
 
-        # Single-mode results
-        results = vector_results or keyword_results
-        return results[:k]
+        # MMR re-ranking (OpenClaw) — diversify results when enabled
+        if self._mmr.enabled and len(results) > 1:
+            from .mmr import mmr_rerank, MMRItem
+            mmr_items: list[MMRItem] = [
+                {"id": r.get("source", str(i)), "score": r.get("score", 0.0),
+                 "content": r.get("content", "")}
+                for i, r in enumerate(results)
+            ]
+            reranked = mmr_rerank(mmr_items, self._mmr, top_k=k)
+            # Map back: preserve original dicts in re-ranked order
+            id_to_result = {r.get("source", str(i)): r
+                            for i, r in enumerate(results)}
+            results = [id_to_result.get(item["id"], results[0]) for item in reranked]
+
+        return results
 
     def _vector_search(self, query: str, top_k: int) -> list[dict]:
         """Vector search via backend."""

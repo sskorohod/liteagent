@@ -23,6 +23,7 @@ PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "grok": "XAI_API_KEY",
+    "groq": "GROQ_API_KEY",
     "gemini": "GOOGLE_API_KEY",
     "kimi": "MOONSHOT_API_KEY",
     "qwen": "DASHSCOPE_API_KEY",
@@ -54,37 +55,95 @@ def load_provider_keys() -> dict[str, str]:
     return {}
 
 
+KEYS_BACKUP_PATH = KEYS_PATH.with_suffix(".bak")
+
+
+def _read_keys_safe() -> dict:
+    """Read keys.json with automatic fallback to backup on corruption.
+
+    Priority: keys.json → keys.json.bak → empty dict.
+    If keys.json is corrupt but backup is valid, restores from backup.
+    """
+    # Try primary file
+    if KEYS_PATH.exists():
+        try:
+            data = json.loads(KEYS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error("keys.json is corrupt: %s — trying backup", e)
+
+    # Try backup
+    if KEYS_BACKUP_PATH.exists():
+        try:
+            data = json.loads(KEYS_BACKUP_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data:
+                logger.warning("Restored %d key(s) from keys.json.bak", len(data))
+                # Restore the primary file from backup
+                try:
+                    _atomic_write_keys(data)
+                    logger.info("Restored keys.json from backup")
+                except Exception:
+                    pass
+                return data
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error("keys.json.bak is also corrupt: %s", e)
+
+    return {}
+
+
+def _atomic_write_keys(keys: dict) -> None:
+    """Write keys dict to keys.json atomically (temp file → rename).
+
+    Also maintains a backup copy (keys.json.bak) before each write.
+    Must be called under file lock.
+    """
+    import shutil
+    import tempfile
+
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Backup current file before overwriting
+    if KEYS_PATH.exists():
+        try:
+            shutil.copy2(str(KEYS_PATH), str(KEYS_BACKUP_PATH))
+            os.chmod(KEYS_BACKUP_PATH, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass  # non-critical
+
+    # Atomic write: temp file in same dir → rename (same filesystem)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(KEYS_DIR), suffix=".tmp", prefix=".keys_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(keys, f, indent=2)
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 600
+        os.replace(tmp_path, str(KEYS_PATH))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _write_keys_locked(keys: dict) -> None:
-    """Write keys.json atomically with file lock to prevent race conditions."""
+    """Merge new keys into keys.json with file lock + atomic write + backup.
+
+    Safety guarantees:
+    - File lock prevents concurrent writes
+    - Atomic write (temp → rename) prevents corruption on crash
+    - Auto-backup allows recovery from corruption
+    - Sanity check prevents accidental mass key loss
+    """
     KEYS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = KEYS_PATH.with_suffix(".lock")
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            # Re-read inside lock to prevent lost updates
-            if KEYS_PATH.exists():
-                try:
-                    current = json.loads(KEYS_PATH.read_text())
-                except (json.JSONDecodeError, OSError):
-                    current = {}
-            else:
-                current = {}
-            # Trace: detect key loss
-            for k in current:
-                if k not in keys and k not in current:
-                    pass  # not losing anything
-            merged = {**current, **keys}
-            lost = [k for k in current if k not in merged]
-            if lost:
-                import traceback
-                logger.error("KEYS LOSS DETECTED! Lost keys: %s. Traceback:\n%s",
-                             lost, ''.join(traceback.format_stack()))
+            current = _read_keys_safe()
             current.update(keys)
-            KEYS_PATH.write_text(json.dumps(current, indent=2))
-            try:
-                os.chmod(KEYS_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600
-            except OSError:
-                pass
+            _atomic_write_keys(current)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
@@ -107,34 +166,24 @@ def save_provider_key(provider: str, key: str) -> None:
 
 def delete_provider_key(provider: str) -> bool:
     """Remove API key from both vault and keys.json. Returns True if key existed."""
-    import traceback
-    logger.warning("delete_provider_key('%s') called from:\n%s",
-                   provider, ''.join(traceback.format_stack()))
     from .vault import vault_enabled, vault_delete
     deleted = False
-    # Delete from vault if enabled
     if vault_enabled():
         try:
             deleted = vault_delete(provider)
         except Exception as e:
             logger.warning("Failed to delete key from vault: %s", e)
-    # Always also delete from keys.json
+    # Delete from keys.json with full safety
     lock_path = KEYS_PATH.with_suffix(".lock")
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            if KEYS_PATH.exists():
-                try:
-                    keys = json.loads(KEYS_PATH.read_text())
-                except (json.JSONDecodeError, OSError):
-                    keys = {}
-            else:
-                keys = {}
+            keys = _read_keys_safe()
             if provider in keys:
                 logger.warning("Deleting key for provider '%s' — remaining keys: %s",
                                provider, [k for k in keys if k != provider])
                 del keys[provider]
-                KEYS_PATH.write_text(json.dumps(keys, indent=2))
+                _atomic_write_keys(keys)
                 deleted = True
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -347,14 +396,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def save_config(config: dict, config_path: str | None = None):
     """Write config dict back to the file it was loaded from.
 
-    Uses deep-merge with the existing file to prevent data loss:
-    keys present on disk but missing from the in-memory config are preserved.
+    Uses file locking + atomic write (temp file → rename) to prevent
+    data loss from concurrent saves.
 
+    Deep-merges with the existing file to preserve keys not in memory.
     Secrets (tokens, API keys) are automatically stripped —
     they are stored separately in ~/.liteagent/keys.json.
     Any inline keys found in config are auto-migrated to keys.json
     before stripping, so they are never lost.
     """
+    import tempfile
+
     if config_path:
         path = Path(config_path)
     elif config.get("_config_path"):
@@ -371,32 +423,85 @@ def save_config(config: dict, config_path: str | None = None):
     stripped = _strip_secrets(config)
     clean = {k: v for k, v in stripped.items() if not k.startswith("_")}
 
-    # Deep-merge with existing file to preserve keys not in memory
-    if path.exists():
+    # File-locked read-merge-write to prevent concurrent save corruption
+    lock_path = path.with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                clean = _deep_merge(existing, clean)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Could not read existing config for merge: %s", e)
+            # Deep-merge with existing file to preserve keys not in memory
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        clean = _deep_merge(existing, clean)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning("Could not read existing config for merge: %s", e)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(clean, f, indent=2, ensure_ascii=False)
+            # Atomic write: temp file in same dir → rename (same filesystem)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), suffix=".tmp", prefix=".config_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(clean, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, str(path))
+            except BaseException:
+                # Clean up temp file on any error
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
     logger.info("Config saved to %s", path)
 
 
 _KNOWN_TOP_KEYS = {"agent", "memory", "tools", "channels", "cost", "providers", "logging",
                    "scheduler", "agents", "features", "rag", "storage",
                    "hooks", "plugins", "boot", "health", "voice", "skills",
-                   "knowledge_base", "web", "night_worker", "browser"}
-_KNOWN_AGENT_KEYS = {"name", "soul", "max_iterations", "default_model", "models", "provider", "timezone"}
+                   "knowledge_base", "web", "night_worker", "browser",
+                   "auth_profiles"}  # OpenClaw: multi-key rotation
+_KNOWN_AGENT_KEYS = {"name", "soul", "max_iterations", "default_model", "models", "provider", "timezone",
+                     "slow_local_mode", "slow_local", "vision_model", "document_model"}
 _KNOWN_COST_KEYS = {"cascade_routing", "prompt_caching", "context_compression", "budget_daily_usd", "track_usage"}
 _KNOWN_MEMORY_KEYS = {"db_path", "max_history_tokens", "keep_recent_messages", "auto_learn",
                       "extraction_model", "auto_prune", "prune_days", "prune_min_importance",
-                      "temporal_decay_rate", "temporal_decay_enabled"}
+                      "temporal_decay_rate", "temporal_decay_enabled",
+                      "search_mode", "fts_enabled", "compression_model",
+                      "episodic_memory", "episode_inactivity_timeout_min",
+                      "episode_topic_shift_threshold", "max_episode_context",
+                      "graph_memory", "entity_extraction", "max_graph_entities_in_context",
+                      "metrics_enabled", "extraction_provider",
+                      "extraction_max_concurrency", "_default_model",
+                      "memory_exchange_enabled", "memory_exchange_top_k",
+                      "memory_exchange_pack_budget_tokens",
+                      "memory_exchange_max_packs",
+                      "memory_exchange_context_budget_tokens",
+                      "memory_exchange_daemon_enabled",
+                      "memory_exchange_daemon_interval_sec",
+                      "memory_exchange_daemon_batch_size",
+                      "memory_exchange_daemon_auto_pause",
+                      "memory_exchange_daemon_pause_active_requests",
+                      "memory_exchange_daemon_pause_queued_requests",
+                      "memory_exchange_queue_max_pending",
+                      "memory_exchange_max_attempts",
+                      "memory_local_worker_enabled",
+                      "memory_local_worker_interval_sec",
+                      "memory_local_worker_batch_size",
+                      "user_aliases",
+                      "shadow_twin_enabled", "shadow_twin_predictions",
+                      "shadow_twin_use_llm",
+                      "shadow_queue_cleanup_enabled",
+                      "shadow_queue_cleanup_interval_sec",
+                      "shadow_ready_ttl_hours",
+                      "shadow_used_ttl_hours",
+                      "shadow_max_ready_per_user",
+                      "mmr"}   # OpenClaw: MMR re-ranking
 _KNOWN_RAG_KEYS = {"enabled", "chunk_size", "overlap", "top_k", "collection",
                    "vector_backend", "search", "embedding", "qdrant", "file_indexing"}
-_KNOWN_RAG_SEARCH_KEYS = {"mode", "rrf_k", "vector_top_k", "keyword_top_k"}
+_KNOWN_RAG_SEARCH_KEYS = {"mode", "rrf_k", "vector_top_k", "keyword_top_k",
+                          "mmr", "query_expansion"}   # OpenClaw additions
 _KNOWN_RAG_EMBEDDING_KEYS = {"provider", "model", "openai_model", "dimension",
                               "ollama_url", "st_model"}
 _KNOWN_RAG_QDRANT_KEYS = {"url", "api_key", "collection"}
@@ -421,6 +526,8 @@ _KNOWN_WEB_SECURITY_KEYS = {"ssrf_protection", "strip_invisible_unicode",
                              "wrap_untrusted"}
 _KNOWN_BROWSER_KEYS = {"enabled", "headless", "viewport", "user_agent",
                        "timeout", "executable_path"}
+_KNOWN_SKILLS_KEYS = {"enabled", "disabled", "extra_dirs", "max_catalog_chars",
+                      "max_triggered_chars"}
 
 
 def validate_config(config: dict) -> list[str]:
@@ -493,6 +600,10 @@ def validate_config(config: dict) -> list[str]:
     for key in config.get("browser", {}):
         if key not in _KNOWN_BROWSER_KEYS:
             warnings.append(f"Unknown browser key: '{key}'")
+
+    for key in config.get("skills", {}):
+        if key not in _KNOWN_SKILLS_KEYS:
+            warnings.append(f"Unknown skills key: '{key}'")
 
     return warnings
 

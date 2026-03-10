@@ -81,7 +81,8 @@ def main():
     parser.add_argument("-c", "--config", default=None, help="Path to config.json")
     parser.add_argument("--user", default="cli-user", help="User ID for memory isolation")
     parser.add_argument("--one-shot", "-1", default=None, help="Run single query and exit")
-    parser.add_argument("--channel", default=None, choices=["cli", "telegram", "api"],
+    parser.add_argument("--channel", default=None,
+                        choices=["cli", "telegram", "api", "discord", "slack"],
                         help="Channel to use (default: auto-detect from config)")
     # Vault commands
     parser.add_argument("--vault-migrate", action="store_true",
@@ -173,8 +174,23 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     # Determine channel — default is always "api" (dashboard)
-    # Telegram runs alongside API automatically if enabled in config
-    channel = args.channel or "api"
+    # Telegram, Discord, Slack run alongside API automatically if enabled in config
+    if args.channel:
+        channel = args.channel
+    else:
+        # Auto-detect: check if Discord or Slack is explicitly configured
+        channels_cfg = config.get("channels", {})
+        discord_cfg = channels_cfg.get("discord", {})
+        slack_cfg = channels_cfg.get("slack", {})
+        if discord_cfg.get("enabled") and (
+                os.environ.get(discord_cfg.get("token_env", "DISCORD_BOT_TOKEN")) or
+                discord_cfg.get("token")):
+            channel = "discord"
+        elif slack_cfg.get("enabled") and (
+                os.environ.get(slack_cfg.get("bot_token_env", "SLACK_BOT_TOKEN"))):
+            channel = "slack"
+        else:
+            channel = "api"
 
     # Setup scheduler
     from .scheduler import setup_scheduler
@@ -183,9 +199,10 @@ def main():
         agent._scheduler = scheduler  # Expose for dashboard API
 
     # Setup user tasks (persistent scheduled tasks)
-    from .tasks import TaskManager, setup_task_checker
+    from .tasks import TaskManager, setup_task_checker, setup_background_task_daemon
     task_manager = TaskManager(agent.memory.db)
     agent.enable_tasks(task_manager)
+    agent._background_task_daemon = setup_background_task_daemon(agent, task_manager, config)
     if scheduler:
         setup_task_checker(scheduler, agent, task_manager)
     else:
@@ -194,6 +211,12 @@ def main():
         scheduler = Scheduler()
         setup_task_checker(scheduler, agent, task_manager)
         agent._scheduler = scheduler
+
+    # Setup long-running goals + background goal coordinator.
+    from .goals import GoalManager, setup_goal_coordinator_daemon
+    goal_manager = GoalManager(agent.memory.db)
+    agent._goal_manager = goal_manager
+    agent._goal_coordinator = setup_goal_coordinator_daemon(agent, goal_manager, config)
 
     # Health monitor (exposed for dashboard + scheduler integration)
     from .health import HealthMonitor
@@ -266,7 +289,8 @@ def main():
                     import uvicorn
                     from .channels.api import create_app
                     from .channels.telegram import (
-                        TelegramAPIClient, _parse_chat_ids,
+                        TelegramAPIClient, TelegramCommandHandler,
+                        _parse_chat_ids,
                         _register_all_handlers, _set_bot_commands,
                     )
 
@@ -332,9 +356,16 @@ def main():
                         print(f"[Jess] Telegram token present: {bool(token)}", flush=True)
                         if token:
                             allowed_chat_ids = _parse_chat_ids(tg_cfg)
+                            cmd_handler = TelegramCommandHandler(
+                                memory=agent.memory,
+                                config=config,
+                                rag=getattr(agent, '_rag', None),
+                                file_manager=getattr(agent, '_file_manager', None),
+                            )
                             tg_app = Application.builder().token(token).build()
                             _register_all_handlers(
-                                tg_app, api_client, allowed_chat_ids, tg_cfg)
+                                tg_app, api_client, cmd_handler,
+                                allowed_chat_ids, tg_cfg)
 
                             await tg_app.initialize()
                             await tg_app.updater.start_polling(drop_pending_updates=True)
@@ -366,6 +397,25 @@ def main():
                 asyncio.run(_run_api_with_telegram())
             else:
                 run_api_with_scheduler(agent, api_cfg, scheduler, full_config=config)
+
+        elif channel == "discord":
+            from .channels.discord_channel import run_discord
+
+            async def _run_discord_with_scheduler():
+                if scheduler:
+                    scheduler.start()
+                await run_discord(agent, config)
+            asyncio.run(_run_discord_with_scheduler())
+
+        elif channel == "slack":
+            from .channels.slack_channel import run_slack
+
+            async def _run_slack_with_scheduler():
+                if scheduler:
+                    scheduler.start()
+                await run_slack(agent, config)
+            asyncio.run(_run_slack_with_scheduler())
+
         else:
             async def _run_cli_with_scheduler():
                 if scheduler:

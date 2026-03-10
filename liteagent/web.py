@@ -740,7 +740,10 @@ async def _search_brave(query: str, count: int, api_key: str, *,
     if status != 200:
         raise RuntimeError(f"Brave search HTTP {status}")
 
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f"Brave search: invalid JSON response: {e}") from e
     results = []
     for r in data.get("web", {}).get("results", [])[:count]:
         results.append(SearchResult(
@@ -826,7 +829,10 @@ async def _search_searxng(query: str, count: int, base_url: str, *,
     if status != 200:
         raise RuntimeError(f"SearXNG search HTTP {status}")
 
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f"SearXNG search: invalid JSON response: {e}") from e
     results = []
     for r in data.get("results", [])[:count]:
         results.append(SearchResult(

@@ -113,6 +113,7 @@ def create_app(agent):
                   description="Ultra-lightweight AI agent API")
 
     api_cfg = agent.config.get("channels", {}).get("api", {})
+    api_host = str(api_cfg.get("host", "127.0.0.1")).strip()
 
     # ── WebSocket Hub (shared across agent + scheduler) ──
     hub = WSHub()
@@ -125,6 +126,46 @@ def create_app(agent):
     sched = getattr(agent, '_scheduler', None)
     if sched:
         sched._ws_hub = hub
+
+    @app.on_event("startup")
+    async def _memory_exchange_startup():
+        try:
+            if hasattr(agent, "memory"):
+                await agent.memory.start_memory_exchange_daemon()
+        except Exception as e:
+            logger.warning("Memory exchange daemon startup failed: %s", e)
+        try:
+            daemon = getattr(agent, "_background_task_daemon", None)
+            if daemon:
+                await daemon.start()
+        except Exception as e:
+            logger.warning("Background task daemon startup failed: %s", e)
+        try:
+            daemon = getattr(agent, "_goal_coordinator", None)
+            if daemon:
+                await daemon.start()
+        except Exception as e:
+            logger.warning("Goal coordinator startup failed: %s", e)
+
+    @app.on_event("shutdown")
+    async def _memory_exchange_shutdown():
+        try:
+            if hasattr(agent, "memory"):
+                await agent.memory.stop_memory_exchange_daemon()
+        except Exception:
+            pass
+        try:
+            daemon = getattr(agent, "_background_task_daemon", None)
+            if daemon:
+                await daemon.stop()
+        except Exception:
+            pass
+        try:
+            daemon = getattr(agent, "_goal_coordinator", None)
+            if daemon:
+                await daemon.stop()
+        except Exception:
+            pass
 
     # ── Internal auth token (for Telegram → API service-to-service calls) ──
     internal_token = secrets.token_urlsafe(48)
@@ -152,6 +193,14 @@ def create_app(agent):
 
     # ── Session Auth (optional, if password is set) ──
     auth_password = api_cfg.get("password")
+    allow_unauth_public = bool(api_cfg.get("allow_unauthenticated_public", False))
+    if not auth_password:
+        is_loopback = api_host in {"127.0.0.1", "localhost", "::1"}
+        if not is_loopback and not allow_unauth_public:
+            raise RuntimeError(
+                "Unsafe API config: host is non-loopback but auth password is not set. "
+                "Set channels.api.password or channels.api.allow_unauthenticated_public=true."
+            )
     sessions = SessionStore() if auth_password else None
 
     PUBLIC_PATHS = {"/health", "/api/login", "/api/auth/check", "/favicon.ico"}
@@ -295,24 +344,54 @@ def create_app(agent):
     class ChatRequest(BaseModel):
         message: str = Field(..., max_length=50000)
         user_id: str = "api-user"
+        chat_id: str | None = None
         stream: bool = False
         agent_name: str | None = None
+        model: str | None = None
 
     class ChatResponse(BaseModel):
         response: str
         files: list = []
+        meta: dict = {}
+
+    def _remember_telegram_chat(user_id: str, chat_id: str | None) -> None:
+        uid = str(user_id or "").strip()
+        cid = str(chat_id or "").strip()
+        if not uid.startswith("tg-") or not cid:
+            return
+        try:
+            agent.memory.set_state("user:telegram_chat_id", cid, user_id=uid)
+        except Exception:
+            pass
 
     @app.post("/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest):
         """Send a message and get a response."""
+        _remember_telegram_chat(req.user_id, req.chat_id)
         if req.stream:
             async def generate():
-                async for chunk in agent.stream(req.message, req.user_id):
-                    yield chunk
+                token = None
+                try:
+                    token = agent._set_current_chat_id(req.chat_id)
+                    async for chunk in agent.stream(
+                        req.message,
+                        req.user_id,
+                        requested_model=req.model,
+                    ):
+                        yield chunk
+                finally:
+                    if token is not None:
+                        agent._reset_current_chat_id(token)
 
             return StreamingResponse(generate(), media_type="text/event-stream")
 
-        response = await agent.run(req.message, req.user_id)
+        token = None
+        try:
+            token = agent._set_current_chat_id(req.chat_id)
+            response = await agent.run(req.message, req.user_id, requested_model=req.model)
+        finally:
+            if token is not None:
+                agent._reset_current_chat_id(token)
 
         # Auto-TTS: synthesize voice if enabled
         from ..voice import maybe_apply_tts
@@ -326,10 +405,10 @@ def create_app(agent):
             )
 
         files = serialize_file_queue(get_file_queue())
-        return ChatResponse(response=response, files=files)
+        return ChatResponse(response=response, files=files, meta=dict(getattr(agent, "_last_response_meta", {}) or {}))
 
     @app.get("/chat/stream")
-    async def chat_stream(message: str, user_id: str = "dashboard-user"):
+    async def chat_stream(message: str, user_id: str = "dashboard-user", model: str = ""):
         """SSE streaming endpoint for real-time chat."""
         import re
         _TOOL_START_RE = re.compile(r'__TOOL_START__(.+?)__TOOL_END__')
@@ -338,7 +417,11 @@ def create_app(agent):
         async def event_generator():
             try:
                 buffer = ""
-                async for chunk in agent.stream(message, user_id):
+                async for chunk in agent.stream(
+                    message,
+                    user_id,
+                    requested_model=(model or None),
+                ):
                     buffer += chunk
                     # Check for tool markers in buffer
                     while True:
@@ -371,16 +454,16 @@ def create_app(agent):
                     # Flush text that definitely doesn't contain markers
                     # Keep potential partial markers in buffer
                     if "__TOOL" not in buffer and buffer:
-                        yield f"data: {json.dumps({'text': buffer})}\n\n"
+                        if buffer.strip():
+                            yield f"data: {json.dumps({'text': buffer})}\n\n"
                         buffer = ""
 
                 # Flush remaining buffer
                 if buffer.strip():
                     yield f"data: {json.dumps({'text': buffer})}\n\n"
-                # Include provider/model info in done event
-                provider_name = agent.config.get("agent", {}).get("provider", "anthropic")
-                model_name = agent.default_model
-                yield f"data: {json.dumps({'done': True, 'provider': provider_name, 'model': model_name})}\n\n"
+                meta = dict(getattr(agent, "_last_response_meta", {}) or {})
+                route = dict(meta.get("response_route") or {})
+                yield f"data: {json.dumps({'done': True, 'provider': route.get('provider'), 'model': route.get('model'), 'meta': meta})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
         return StreamingResponse(
@@ -400,13 +483,17 @@ def create_app(agent):
     async def chat_multimodal(
         message: str = Form(...),
         user_id: str = Form("dashboard-user"),
+        chat_id: str = Form(""),
+        model: str = Form(""),
         files: List[UploadFile] = File(default=[]),
     ):
         """Send a message with optional file attachments (images, PDFs, text, code)."""
         from ..multimodal import file_to_content_block, file_to_emoji
+        _remember_telegram_chat(user_id, chat_id)
 
         content_blocks = [{"type": "text", "text": message}]
         file_descriptions = []
+        ingested_files = []
 
         for file in files:
             data = await file.read()
@@ -419,24 +506,77 @@ def create_app(agent):
             except ValueError as e:
                 raise HTTPException(400, str(e))
             # Auto-ingest uploaded files to S3
-            await agent.ingest_file(
+            ingest_result = await agent.ingest_file(
                 data, fname, source="api", user_id=user_id, mime_type=ct)
+            ingested_files.append({
+                "result": ingest_result,
+                "filename": fname,
+                "mime_type": ct,
+                "block_type": str(block.get("type") or ""),
+            })
 
-        response = await agent.run(content_blocks, user_id)
+        token = None
+        try:
+            token = agent._set_current_chat_id(chat_id or None)
+            try:
+                response = await agent.run(content_blocks, user_id, requested_model=(model or None))
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if (
+                    "image length and width" in low
+                    or "image size" in low
+                    or "invalid image" in low
+                    or "unsupported image" in low
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=("Изображение отклонено vision-моделью. "
+                                "Проверь, что файл не повреждён и что ширина/высота больше 10 px.")
+                    )
+                raise HTTPException(status_code=500, detail=msg or "Agent error")
+        finally:
+            if token is not None:
+                agent._reset_current_chat_id(token)
 
         from ..file_queue import get_file_queue, serialize_file_queue
         files = serialize_file_queue(get_file_queue())
-        return {"response": response, "files_processed": file_descriptions, "files": files}
+        meta = dict(getattr(agent, "_last_response_meta", {}) or {})
+
+        media_explainability = list(meta.get("media_explainability") or [])
+        if ingested_files and media_explainability and getattr(agent, "_file_manager", None) is not None:
+            explanation_idx = 0
+            for item in ingested_files:
+                if item.get("block_type") not in {"image", "document"}:
+                    continue
+                if explanation_idx >= len(media_explainability):
+                    break
+                summary = str((media_explainability[explanation_idx] or {}).get("summary") or "").strip()
+                explanation_idx += 1
+                storage_key = str(((item.get("result") or {}) if isinstance(item.get("result"), dict) else {}).get("storage_key") or "").strip()
+                if storage_key and summary:
+                    try:
+                        agent._file_manager.update_description(storage_key, summary, user_id=user_id)
+                    except Exception:
+                        pass
+        return {
+            "response": response,
+            "files_processed": file_descriptions,
+            "files": files,
+            "meta": meta,
+        }
 
     @app.post("/chat/voice")
     async def chat_voice(
         audio: UploadFile = File(...),
         user_id: str = Form("tg-user"),
+        chat_id: str = Form(""),
         duration: str = Form("0"),
     ):
         """Handle voice message: store audio for transcription, then run agent."""
         import uuid as _uuid
         import tempfile
+        _remember_telegram_chat(user_id, chat_id)
 
         audio_bytes = await audio.read()
         voice_id = f"voice_{_uuid.uuid4().hex[:8]}"
@@ -457,29 +597,52 @@ def create_app(agent):
         if hasattr(agent, 'store_voice'):
             agent.store_voice(voice_id, audio_bytes, tg_cfg)
 
-        # Build transcription prompt with tool hints
-        tool_hint = "Use any available transcription tool."
-        if hasattr(agent, 'tools'):
-            tool_names = list(agent.tools._tools.keys())
-            mcp_voice = [n for n in tool_names if "transcribe_voice" in n]
-            builtin_voice = "transcribe_voice" in tool_names
-            if mcp_voice:
-                tool_hint = (f"Use tool '{mcp_voice[0]}' with argument "
-                             f"path=\"{tmp_path}\" to transcribe.")
-            elif builtin_voice:
-                tool_hint = (f"Use tool 'transcribe_voice' with argument "
-                             f"voice_id=\"{voice_id}\" to transcribe.")
+        # Pre-transcribe: try to transcribe audio BEFORE sending to model
+        # This is more reliable than asking models (especially local/Ollama) to call tools
+        transcription = None
+        try:
+            from ..voice import transcribe as voice_transcribe
+            stt_result = await voice_transcribe(audio_bytes, agent.config)
+            if stt_result.success and stt_result.text:
+                transcription = stt_result.text.strip()
+                logger.info("Pre-transcribed voice (%s): %s",
+                            voice_id, transcription[:100])
+        except Exception as e:
+            logger.warning("Pre-transcription failed: %s", e)
 
-        voice_msg = (
-            f"[User sent a voice message ({duration}s). "
-            f"Audio file: {tmp_path} | voice_id: {voice_id}. "
-            f"{tool_hint} "
-            f"Transcribe the audio, then respond directly to the user's request. "
-            f"Do NOT repeat or show the transcription text to the user — "
-            f"just answer as if they typed the message themselves.]"
-        )
+        if transcription:
+            # Send transcribed text directly — model gets clean user input
+            voice_msg = transcription
+        else:
+            # Fallback: ask model to call transcribe tool (less reliable)
+            tool_hint = "Use any available transcription tool."
+            if hasattr(agent, 'tools'):
+                tool_names = list(agent.tools._tools.keys())
+                mcp_voice = [n for n in tool_names if "transcribe" in n and "__" in n]
+                builtin_voice = "transcribe_voice" in tool_names
+                if mcp_voice:
+                    tool_hint = (f"Use tool '{mcp_voice[0]}' with argument "
+                                 f"path=\"{tmp_path}\" to transcribe.")
+                elif builtin_voice:
+                    tool_hint = (f"Use tool 'transcribe_voice' with argument "
+                                 f"voice_id=\"{voice_id}\" to transcribe.")
 
-        response = await agent.run(voice_msg, user_id)
+            voice_msg = (
+                f"[User sent a voice message ({duration}s). "
+                f"Audio file: {tmp_path} | voice_id: {voice_id}. "
+                f"{tool_hint} "
+                f"Transcribe the audio, then respond directly to the user's request. "
+                f"Do NOT repeat or show the transcription text to the user — "
+                f"just answer as if they typed the message themselves.]"
+            )
+
+        token = None
+        try:
+            token = agent._set_current_chat_id(chat_id or None)
+            response = await agent.run(voice_msg, user_id)
+        finally:
+            if token is not None:
+                agent._reset_current_chat_id(token)
 
         # Auto-TTS for inbound audio (mode=inbound or always)
         from ..voice import maybe_apply_tts
@@ -542,7 +705,11 @@ def create_app(agent):
     @app.get("/tts/providers")
     async def tts_providers():
         """List available TTS providers and their configuration."""
-        from ..voice import resolve_voice_config, _get_tts_api_key, OPENAI_TTS_VOICES, OPENAI_TTS_MODELS
+        from ..voice import (
+            resolve_voice_config, _get_tts_api_key,
+            OPENAI_TTS_VOICES, OPENAI_TTS_MODELS,
+            GROQ_TTS_MODELS, GROQ_TTS_VOICES_PLAYAI, GROQ_TTS_VOICES_ORPHEUS,
+        )
         voice_cfg = resolve_voice_config(agent.config)
         tts = voice_cfg["tts"]
         return {
@@ -560,6 +727,14 @@ def create_app(agent):
                     "name": "ElevenLabs",
                     "available": bool(_get_tts_api_key("elevenlabs", agent.config)),
                     "config": tts["elevenlabs"],
+                },
+                {
+                    "id": "groq",
+                    "name": "Groq TTS (PlayAI / Orpheus)",
+                    "available": bool(_get_tts_api_key("groq", agent.config)),
+                    "voices": list(GROQ_TTS_VOICES_PLAYAI) + list(GROQ_TTS_VOICES_ORPHEUS),
+                    "models": list(GROQ_TTS_MODELS),
+                    "config": tts.get("groq", {}),
                 },
                 {
                     "id": "edge",

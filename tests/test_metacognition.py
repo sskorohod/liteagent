@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from array import array
 
 from liteagent.metacognition import (
-    log_interaction, run_counterfactual_replay, _find_clusters,
+    log_interaction, run_counterfactual_replay, _find_clusters, _resolve_model,
 )
 
 
@@ -94,6 +94,18 @@ class TestConfidenceGate:
             "SELECT success, confidence FROM interaction_log").fetchone()
         assert row[0] == 0
         assert row[1] == 3.0
+
+
+class TestResolveModel:
+    @pytest.mark.asyncio
+    async def test_async_supports_model(self):
+        class AsyncProvider:
+            @staticmethod
+            async def supports_model(candidate):
+                return candidate == "gpt-4o-mini"
+
+        model = await _resolve_model(AsyncProvider(), {})
+        assert model == "gpt-4o-mini"
 
 
 class TestCounterfactualReplay:

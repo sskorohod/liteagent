@@ -5,6 +5,33 @@ import json
 import logging
 import re
 
+
+def _safe_parse_llm_json(text: str, fallback):
+    """Parse JSON from LLM output, tolerating control chars, truncation and wrong root type."""
+    import re as _re, json as _json
+    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    try:
+        return _json.loads(text)
+    except Exception:
+        pass
+    for opener, closer in (('{', '}'), ('[', ']')):
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return _json.loads(text[start:i + 1])
+                    except Exception:
+                        break
+    return fallback
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +80,68 @@ def resolve_planning_model(provider, config: dict) -> str:
     return _CHEAPEST_MODEL.get(provider_cls, "claude-haiku-4-5-20251001")
 
 
+
+# ══════════════════════════════════════════
+# INTENT CLASSIFICATION (zero LLM cost)
+# ══════════════════════════════════════════
+
+# Pattern sets for each intent type (EN + RU).
+# Evaluated in priority order; first match wins.
+_INTENT_PATTERNS: list[tuple[str, list[str]]] = [
+    ("search", [
+        r"найди в интернете", r"загугли", r"поищи в сети", r"web search",
+        r"search (the web|online|internet)", r"look up online",
+    ]),
+    ("creative", [
+        r"(напиши|сочини|придумай|сгенерируй).{0,30}(текст|стихи?|историю|рассказ|сценарий|рекламу|слоган|эссе|пост)",
+        r"(write|create|generate|compose).{0,30}(poem|story|essay|slogan|ad|script|creative|fiction)",
+        r"придумай (идею|название|концепцию)",
+        r"(creative writing|roleplay|generate story)",
+    ]),
+    ("command", [
+        r"^(сделай|создай|напиши|переведи|вычисли|посчитай|конвертируй|запусти|выполни|открой|закрой|удали|скопируй|переименуй)",
+        r"^(do|make|create|write|translate|calculate|compute|run|execute|open|close|delete|copy|rename)",
+        r"(код|code|скрипт|script|программ).{0,30}(написать|создать|write|create|generate)",
+        r"(fix|исправь|починить|отладь|debug)",
+        r"помог.{0,10}(написать|создать|сделать)",
+    ]),
+    ("question", [
+        r"^(что|как|почему|зачем|когда|где|кто|какой|какая|какие|сколько)",
+        r"^(what|how|why|when|where|who|which|whose|whom)",
+        r"\?$",
+        r"(объясни|расскажи|опиши|explain|describe|tell me|what is|what are)",
+    ]),
+    ("chat", [
+        r"^(привет|здравствуй|добрый|hi|hello|hey|good morning|good evening)",
+        r"^(спасибо|благодарю|thanks|thank you)",
+        r"^(пока|до свидания|goodbye|bye)",
+        r"^(как дела|как ты|how are you)",
+    ]),
+]
+
+_COMPILED: list[tuple[str, list]] | None = None
+
+
+def classify_intent(text: str) -> str:
+    """Classify user intent using fast regex patterns (no LLM call).
+
+    Returns one of: "search", "creative", "command", "question", "chat", "unknown".
+    """
+    global _COMPILED
+    if _COMPILED is None:
+        _COMPILED = [
+            (intent, [re.compile(p, re.IGNORECASE) for p in patterns])
+            for intent, patterns in _INTENT_PATTERNS
+        ]
+
+    t = text.strip()
+    for intent, compiled_patterns in _COMPILED:
+        for pat in compiled_patterns:
+            if pat.search(t):
+                return intent
+    return "unknown"
+
+
 # ══════════════════════════════════════════
 # PLAN GENERATION
 # ══════════════════════════════════════════
@@ -67,6 +156,9 @@ async def generate_plan(provider, user_input: str, memories: list,
     skip_simple = config.get("skip_simple", True)
     model = resolve_planning_model(provider, config)
 
+    # Fast zero-cost intent classification
+    intent = classify_intent(user_input)
+
     # Build context
     tool_names = [t.get("name", "") for t in tools] if tools else []
     memory_context = ""
@@ -75,21 +167,31 @@ async def generate_plan(provider, user_input: str, memories: list,
         if memory_lines:
             memory_context = "\nKnown context: " + "; ".join(memory_lines)
 
+    intent_hint = f"\nDetected intent type: {intent}" if intent != "unknown" else ""
+
     prompt = (
         "You are a planning module. Analyze the user's request and produce a brief execution plan.\n\n"
         f"User request: {user_input[:500]}\n"
         f"Available tools: {', '.join(tool_names[:15])}\n"
-        f"{memory_context}\n\n"
+        f"{memory_context}{intent_hint}\n\n"
         'Return ONLY valid JSON:\n'
         '{"steps": ["step1", "step2", ...], '
         '"complexity": "simple" or "medium" or "complex", '
         '"tools_needed": ["tool1", ...], '
-        '"estimated_iterations": N}\n\n'
+        '"estimated_iterations": N, '
+        '"assumptions": ["assumption 1", ...], '
+        '"verification_steps": ["check 1", ...], '
+        '"ask_user": false, '
+        '"ask_user_reason": ""}\n\n'
         "Rules:\n"
         "- steps: 1-5 brief action steps\n"
         "- complexity: simple (greeting, factual Q&A), medium (code/analysis), complex (multi-step research/creation)\n"
         "- tools_needed: which tools from the available list are needed (empty array if none)\n"
         "- estimated_iterations: how many LLM turns needed (1-10)\n"
+        "- assumptions: 0-3 short working assumptions you can safely make to keep moving\n"
+        "- verification_steps: 0-3 checks to confirm the result before finalizing\n"
+        "- ask_user: false by default; set true only if blocked by missing credentials/access, an irreversible destructive choice, or conflicting requirements you cannot resolve from context\n"
+        "- ask_user_reason: short reason, only when ask_user=true\n"
         "- Keep it concise. Max 5 steps."
     )
 
@@ -105,13 +207,30 @@ async def generate_plan(provider, user_input: str, memories: list,
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-        plan = json.loads(text)
+        plan = _safe_parse_llm_json(text, {})
+        if not isinstance(plan, dict):
+            return None
 
         # Validate structure
         if not isinstance(plan.get("steps"), list):
             return None
         if "complexity" not in plan:
             plan["complexity"] = "medium"
+        if not isinstance(plan.get("tools_needed"), list):
+            plan["tools_needed"] = []
+        if not isinstance(plan.get("assumptions"), list):
+            plan["assumptions"] = []
+        else:
+            plan["assumptions"] = [str(item).strip() for item in plan["assumptions"][:3] if str(item).strip()]
+        if not isinstance(plan.get("verification_steps"), list):
+            plan["verification_steps"] = []
+        else:
+            plan["verification_steps"] = [str(item).strip() for item in plan["verification_steps"][:3] if str(item).strip()]
+        plan["ask_user"] = bool(plan.get("ask_user", False))
+        plan["ask_user_reason"] = str(plan.get("ask_user_reason", "") or "").strip()[:240]
+
+        # Attach pre-computed intent (zero-cost, overrides any LLM-inferred value)
+        plan["intent"] = intent
 
         # Clamp estimated_iterations to sane range
         est = plan.get("estimated_iterations")
@@ -141,10 +260,23 @@ async def generate_plan(provider, user_input: str, memories: list,
 # FORMAT FOR SYSTEM PROMPT
 # ══════════════════════════════════════════
 
+_INTENT_STYLE_HINTS: dict[str, str] = {
+    "question":  "Give a clear, direct answer. Cite sources or reasoning when helpful.",
+    "command":   "Execute the task step by step. Confirm completion concisely.",
+    "creative":  "Be imaginative and original. Prioritise quality over brevity.",
+    "search":    "Retrieve up-to-date information using available search tools.",
+    "chat":      "Keep the tone conversational and friendly.",
+}
+
+
 def format_plan_for_prompt(plan: dict) -> str:
     """Convert a plan dict into a system prompt section."""
     steps = plan.get("steps", [])
     tools = plan.get("tools_needed", [])
+    assumptions = plan.get("assumptions", [])
+    verification_steps = plan.get("verification_steps", [])
+    ask_user = bool(plan.get("ask_user"))
+    ask_user_reason = str(plan.get("ask_user_reason", "") or "").strip()
 
     lines = ["\n\n## Your execution plan:"]
     for i, step in enumerate(steps, 1):
@@ -156,9 +288,31 @@ def format_plan_for_prompt(plan: dict) -> str:
     est = plan.get("estimated_iterations")
     if est:
         lines.append(f"Estimated iterations: {est}")
+    if assumptions:
+        lines.append("\nWorking assumptions:")
+        lines.extend(f"- {item}" for item in assumptions)
+    if verification_steps:
+        lines.append("\nCritical verification before final answer:")
+        lines.extend(f"- {item}" for item in verification_steps)
 
-    lines.append("\nFollow this plan step by step. Use only the listed tools unless "
-                 "absolutely necessary.")
+    intent = plan.get("intent", "unknown")
+    style_hint = _INTENT_STYLE_HINTS.get(intent)
+    if style_hint:
+        lines.append(f"Response style ({intent}): {style_hint}")
+
+    lines.append(
+        "\nFollow this plan. "
+        "⚡ AUTONOMOUS EXECUTION REQUIRED: First do a silent critical review of the plan, "
+        "assumptions, available context, memory, and tool options. Then execute ALL steps above "
+        "sequentially without stopping. Prefer the smallest reversible action that creates evidence. "
+        "Re-check your work with at least one verification step before you finalize. "
+        "Do NOT ask the user for routine confirmation between steps. "
+        "Do NOT send intermediate progress messages. Call tools one after another until the ENTIRE "
+        "task is complete. Only ask the user if you are blocked by missing credentials/access, an "
+        "irreversible destructive decision, or conflicting requirements you cannot resolve from context."
+    )
+    if ask_user and ask_user_reason:
+        lines.append(f"Potential blocker if still unresolved after inspection: {ask_user_reason}")
 
     return "\n".join(lines)
 

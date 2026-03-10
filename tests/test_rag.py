@@ -11,6 +11,7 @@ from liteagent.rag import (
     RAGPipeline,
     VectorBackend,
     SqliteBruteForceBackend,
+    SqliteVecBackend,
     _cosine_similarity,
     create_vector_backend,
 )
@@ -329,9 +330,10 @@ class TestVectorBackend:
         # Without sqlite-vec or Qdrant, should try brute-force
         # But brute-force needs embedder, so with None → returns None
         backend = create_vector_backend(config, db, embedder=None)
-        # May be None (no embedder) or brute-force
+        # May be None (no embedder), brute-force, or sqlite-vec if installed
         # Should not crash
-        assert backend is None or isinstance(backend, SqliteBruteForceBackend)
+        assert backend is None or isinstance(
+            backend, (SqliteBruteForceBackend, SqliteVecBackend))
 
 
 # ═══════════════════════════════════════

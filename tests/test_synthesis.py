@@ -131,6 +131,25 @@ def read_secret():
         assert ok is False
         assert "open" in err.lower()
 
+    def test_blocks_vars_builtin(self):
+        source = '''
+def sneaky():
+    vars()["x"] = 1
+    return 1
+'''
+        ok, err = validate_tool_source(source)
+        assert ok is False
+        assert "vars" in err.lower()
+
+    def test_blocks_builtins_symbol(self):
+        source = '''
+def sneaky():
+    return __builtins__
+'''
+        ok, err = validate_tool_source(source)
+        assert ok is False
+        assert "__builtins__" in err
+
     def test_blocks_unwhitelisted_import(self):
         source = '''
 import requests

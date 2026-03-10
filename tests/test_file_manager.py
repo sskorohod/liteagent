@@ -3,6 +3,8 @@
 import asyncio
 import pickle
 import sqlite3
+import zipfile
+from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -58,6 +60,50 @@ def fm(mock_storage, db):
     return FileManager(mock_storage, db, embedder=None)
 
 
+def _zip_bytes(files: dict[str, bytes | str]) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, content in files.items():
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            archive.writestr(name, content)
+    return buf.getvalue()
+
+
+def make_docx_bytes(text: str = "Policy overview") -> bytes:
+    return _zip_bytes({
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/word/document.xml"
+               ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+            </Types>""",
+        "word/document.xml": f"""<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>
+            </w:document>""",
+    })
+
+
+def make_xlsx_bytes(text: str = "Expense forecast") -> bytes:
+    return _zip_bytes({
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Override PartName="/xl/workbook.xml"
+               ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+            </Types>""",
+        "xl/workbook.xml": """<?xml version="1.0" encoding="UTF-8"?>
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>""",
+        "xl/sharedStrings.xml": f"""<?xml version="1.0" encoding="UTF-8"?>
+            <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <si><t>{text}</t></si>
+            </sst>""",
+    })
+
+
+def make_legacy_doc_bytes(text: str = "Legacy policy memo") -> bytes:
+    return b"\xd0\xcf\x11\xe0" + b"\x00" * 24 + text.encode("latin-1") + b"\x00"
+
+
 # ── Ingest ───────────────────────────────────────────────────
 
 async def test_ingest_basic(fm, mock_storage, db):
@@ -85,6 +131,22 @@ async def test_ingest_auto_describe_text(fm):
         source="api", user_id="user-1")
 
     assert "First line" in result["description"]
+
+
+async def test_ingest_docx_detects_mime_and_description(fm, mock_storage):
+    """OOXML docs should be recognized even with wrong incoming MIME."""
+    result = await fm.ingest(
+        make_docx_bytes("Annual policy review"),
+        "policy.bin",
+        source="api",
+        user_id="user-1",
+        mime_type="application/octet-stream",
+    )
+
+    assert result["mime_type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert "Annual policy review" in result["description"]
+    upload_kwargs = mock_storage.async_upload.await_args.kwargs
+    assert upload_kwargs["content_type"] == result["mime_type"]
 
 
 async def test_ingest_deduplication(fm, mock_storage, db):
@@ -198,6 +260,25 @@ async def test_list_files(fm):
     assert len(files) == 2
 
 
+async def test_update_description_merges_context(fm, db):
+    """Description enrichment should preserve the original short descriptor."""
+    result = await fm.ingest(b"image-bytes", "photo.jpg", source="api", user_id="u1")
+    ok = fm.update_description(
+        result["storage_key"],
+        "Ukrainian passport for Inga Smelova, number FP139628",
+        user_id="u1",
+    )
+
+    assert ok is True
+    row = db.execute(
+        "SELECT description FROM file_index WHERE storage_key = ?",
+        (result["storage_key"],),
+    ).fetchone()
+    assert row is not None
+    assert "photo.jpg" in row[0]
+    assert "Inga Smelova" in row[0]
+
+
 async def test_list_files_by_source(fm):
     """Filter by source."""
     await fm.ingest(b"a", "a.txt", source="api")
@@ -299,6 +380,50 @@ def test_auto_describe_unknown():
     desc = FileManager._auto_describe(
         b"\x00\x01", "application/octet-stream", "data.bin")
     assert "data.bin" in desc
+
+
+def test_auto_describe_docx_uses_extracted_text():
+    desc = FileManager._auto_describe(
+        make_docx_bytes("Product launch brief"),
+        "application/octet-stream",
+        "brief.docx",
+    )
+    assert "Product launch brief" in desc
+
+
+def test_auto_describe_legacy_doc_uses_extracted_text():
+    desc = FileManager._auto_describe(
+        make_legacy_doc_bytes("Legacy policy memo"),
+        "application/octet-stream",
+        "memo.doc",
+    )
+    assert "Legacy policy memo" in desc
+
+
+def test_extract_text_xlsx():
+    text = FileManager._extract_text(
+        make_xlsx_bytes("Expense forecast"),
+        "application/octet-stream",
+    )
+    assert "Expense forecast" in text
+
+
+def test_should_index_extractable_docx(fm):
+    class Info:
+        extension = ".docx"
+        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        can_extract_text = True
+
+    assert fm._should_index(Info(), 1024) is True
+
+
+def test_should_not_index_large_binary_archive(fm):
+    class Info:
+        extension = ".zip"
+        mime_type = "application/zip"
+        can_extract_text = False
+
+    assert fm._should_index(Info(), 1024) is False
 
 
 # ── create_file_manager ─────────────────────────────────────

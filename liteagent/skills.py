@@ -62,6 +62,8 @@ class SkillRegistry:
 
     def load_all(self, config: dict) -> None:
         """Load skills from all sources (bundled, user, project)."""
+        self._skills.clear()
+
         skills_cfg = config.get("skills", {})
         if skills_cfg.get("enabled") is False:
             logger.info("Skills system disabled via config")
@@ -182,18 +184,95 @@ class SkillRegistry:
         result = []
         for skill in self._skills.values():
             eligible = self._check_eligibility(skill)
+            missing_bins = []
+            missing_env = []
+            if skill.metadata.requires_bins:
+                missing_bins = [b for b in skill.metadata.requires_bins
+                                if shutil.which(b) is None]
+            if skill.metadata.requires_env:
+                missing_env = [e for e in skill.metadata.requires_env
+                               if not os.environ.get(e)]
             result.append({
                 "name": skill.metadata.name,
                 "description": skill.metadata.description,
                 "emoji": skill.metadata.emoji,
                 "source": skill.source,
                 "eligible": eligible,
+                "always": skill.metadata.always,
                 "keywords": skill.metadata.keywords,
                 "tools": skill.metadata.tools or [],
+                "missing_bins": missing_bins,
+                "missing_env": missing_env,
                 "has_scripts": (skill.base_dir / "scripts").is_dir(),
                 "has_references": (skill.base_dir / "references").is_dir(),
             })
         return result
+
+    def get_skill(self, name: str) -> dict | None:
+        """Return full details for a single skill, or None if not found."""
+        skill = self._skills.get(name)
+        if not skill:
+            return None
+        eligible = self._check_eligibility(skill)
+        missing_bins = []
+        missing_env = []
+        if skill.metadata.requires_bins:
+            missing_bins = [b for b in skill.metadata.requires_bins
+                            if shutil.which(b) is None]
+        if skill.metadata.requires_env:
+            missing_env = [e for e in skill.metadata.requires_env
+                           if not os.environ.get(e)]
+        return {
+            "name": skill.metadata.name,
+            "description": skill.metadata.description,
+            "emoji": skill.metadata.emoji,
+            "source": skill.source,
+            "eligible": eligible,
+            "always": skill.metadata.always,
+            "keywords": skill.metadata.keywords,
+            "tools": skill.metadata.tools or [],
+            "os": skill.metadata.os,
+            "requires_bins": skill.metadata.requires_bins,
+            "requires_env": skill.metadata.requires_env,
+            "missing_bins": missing_bins,
+            "missing_env": missing_env,
+            "has_scripts": (skill.base_dir / "scripts").is_dir(),
+            "has_references": (skill.base_dir / "references").is_dir(),
+            "body": skill.body,
+            "base_dir": str(skill.base_dir),
+        }
+
+    def write_skill(self, name: str, body: str, frontmatter: dict) -> Path:
+        """Write a skill to the user skills directory. Returns the SKILL.md path."""
+        skill_dir = _USER_SKILLS_DIR / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build YAML frontmatter text
+        try:
+            import yaml
+            yaml_text = yaml.dump(frontmatter, allow_unicode=True,
+                                  default_flow_style=False).rstrip()
+        except ImportError:
+            yaml_text = _dict_to_yaml(frontmatter)
+
+        content = f"---\n{yaml_text}\n---\n\n{body}"
+        skill_path = skill_dir / "SKILL.md"
+        skill_path.write_text(content, encoding="utf-8")
+        logger.info("Skill written: %s → %s", name, skill_path)
+        return skill_path
+
+    def delete_skill(self, name: str) -> bool:
+        """Delete a user/project skill directory. Returns True if deleted."""
+        skill = self._skills.get(name)
+        if not skill:
+            return False
+        if skill.source == "bundled":
+            return False
+        import shutil as _shutil
+        _shutil.rmtree(skill.base_dir)
+        del self._skills[name]
+        logger.info("Skill deleted: %s (source=%s)", name, skill.source)
+        return True
 
     # ── Internal ──────────────────────────────────────────────────
 
@@ -314,3 +393,22 @@ def _minimal_yaml_parse(text: str) -> dict:
             elif value:
                 result[key] = value
     return result
+
+
+def _dict_to_yaml(d: dict, indent: int = 0) -> str:
+    """Simple dict→YAML serializer (fallback when PyYAML unavailable)."""
+    lines = []
+    prefix = "  " * indent
+    for key, value in d.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.append(_dict_to_yaml(value, indent + 1))
+        elif isinstance(value, list):
+            lines.append(f"{prefix}{key}:")
+            for item in value:
+                lines.append(f"{prefix}  - {item}")
+        elif isinstance(value, bool):
+            lines.append(f"{prefix}{key}: {'true' if value else 'false'}")
+        else:
+            lines.append(f"{prefix}{key}: {value}")
+    return "\n".join(lines)
