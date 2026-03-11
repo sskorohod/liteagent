@@ -1,11 +1,13 @@
 """Tests for the agent core logic (no API calls)."""
 
 import asyncio
+import os
 import pytest
 from unittest.mock import AsyncMock
 
 from liteagent.agent import LiteAgent, MODEL_PRICING
 from liteagent.hooks import HookContext
+from liteagent.providers import LLMResponse, TextBlock
 
 
 class TestModelSelection:
@@ -2234,3 +2236,42 @@ class TestRecentFileFollowups:
         assert "passport_scan.pdf" in first
         assert "passport_scan.pdf" in second
         assert len(queued) == 2
+
+    @pytest.mark.asyncio
+    async def test_internal_autonomous_prompt_bypasses_document_unlock_handler(self, agent, monkeypatch):
+        monkeypatch.setattr("liteagent.config.get_api_key", lambda name: "alpha-omega" if name == "document_unlock_phrase" else None)
+        monkeypatch.setattr(agent.provider, "complete", AsyncMock(return_value=LLMResponse(
+            content=[TextBlock(text="planner response")],
+            stop_reason="end_turn",
+        )))
+
+        result = await agent.run(
+            "You are running one autonomous self-improvement cycle. Use actual tools and continue improving after the original objective.",
+            "tg-169108358",
+        )
+
+        assert "кодовое слово" not in result.lower()
+        assert result == "planner response"
+
+    @pytest.mark.asyncio
+    async def test_run_sends_recent_markdown_file_without_llm(self, agent, monkeypatch, tmp_path):
+        md_path = tmp_path / "5M_Strategy_Summary.md"
+        md_path.write_text("# Summary\nbody", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        agent.memory.add_message("u1", "assistant", "Файл `5M_Strategy_Summary.md` успешно создан и готов.")
+
+        queued = {}
+
+        def fake_send_file_to_user(file_path: str = "", caption: str = "", content: str = ""):
+            queued["file_path"] = file_path
+            queued["caption"] = caption
+            return f"File queued for delivery: {os.path.basename(file_path)}"
+
+        monkeypatch.setitem(agent.tools._handlers, "send_file_to_user", fake_send_file_to_user)
+        monkeypatch.setattr(agent.provider, "complete", AsyncMock(side_effect=AssertionError("LLM must not be called")))
+
+        result = await agent.run("Пришли мне этот файл Markdown", "u1")
+
+        assert "5M_Strategy_Summary.md" in result
+        assert queued["caption"] == "5M_Strategy_Summary.md"
+        assert queued["file_path"] == str(md_path)

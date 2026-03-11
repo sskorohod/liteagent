@@ -5543,6 +5543,93 @@ class LiteAgent:
 
         return None
 
+    @staticmethod
+    def _looks_like_markdown_file_delivery_request(user_input: str) -> bool:
+        text = " ".join(str(user_input or "").strip().lower().split())
+        if not text:
+            return False
+        action_markers = ("пришли", "отправь", "скинь", "вышли", "дай", "send", "deliver", "attach")
+        file_markers = ("markdown", "md файл", "md-файл", ".md", "этот файл", "this file", "markdown file")
+        return any(marker in text for marker in action_markers) and any(marker in text for marker in file_markers)
+
+    def _recent_referenced_local_files(self, user_id: str, *, limit: int = 5) -> list[str]:
+        try:
+            history = list(self.memory.get_history(user_id) or [])
+        except Exception:
+            return []
+
+        import re
+
+        file_names: list[str] = []
+        seen: set[str] = set()
+        pattern = re.compile(r"(?:(?:`|\b)([A-Za-z0-9_./-]+\.(?:md|markdown|txt|pdf|json|csv|html))(?:`|\b))", re.IGNORECASE)
+        for message in reversed(history):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = self._flatten_message_content_to_text(message.get("content"))
+            if not content:
+                continue
+            for match in pattern.findall(content):
+                candidate = str(match or "").strip()
+                if not candidate:
+                    continue
+                key = candidate.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                file_names.append(candidate)
+                if len(file_names) >= limit:
+                    return file_names
+        return file_names
+
+    def _resolve_recent_local_file_reference(self, user_id: str) -> str | None:
+        def _search_by_basename(basename: str) -> str | None:
+            root = os.getcwd()
+            skip_dirs = {".git", ".venv", ".audit-venv", "__pycache__", "node_modules", "develop"}
+            matches: list[tuple[float, str]] = []
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                if basename in filenames:
+                    path = os.path.join(dirpath, basename)
+                    try:
+                        matches.append((os.path.getmtime(path), path))
+                    except OSError:
+                        matches.append((0.0, path))
+                    if len(matches) >= 10:
+                        break
+            if not matches:
+                return None
+            matches.sort(key=lambda item: item[0], reverse=True)
+            return matches[0][1]
+
+        for candidate in self._recent_referenced_local_files(user_id, limit=8):
+            expanded = os.path.expanduser(candidate)
+            if os.path.isabs(expanded) and os.path.isfile(expanded):
+                return expanded
+            basename = os.path.basename(candidate)
+            if not basename:
+                continue
+            found = _search_by_basename(basename)
+            if found:
+                return found
+        return None
+
+    async def _direct_recent_markdown_file_delivery(self, user_input: str, user_id: str) -> str | None:
+        if not self._looks_like_markdown_file_delivery_request(user_input):
+            return None
+        file_path = self._resolve_recent_local_file_reference(user_id)
+        if not file_path:
+            return None
+        sender = self.tools._handlers.get("send_file_to_user")
+        if not callable(sender):
+            return None
+        result = str(sender(file_path=file_path, caption=os.path.basename(file_path)) or "").strip()
+        if result.startswith("File queued for delivery:"):
+            return f"Файл `{os.path.basename(file_path)}` поставлен в очередь на отправку."
+        if result.startswith("Error:"):
+            return f"Не удалось отправить markdown-файл. {result}"
+        return None
+
     def _get_recent_substantive_assistant_text(self, user_id: str) -> str:
         """Return the latest non-status assistant message that can be forwarded to Telegram."""
         try:
@@ -5637,6 +5724,16 @@ class LiteAgent:
             return None
         candidate = uid[3:].strip()
         return candidate if candidate.isdigit() else None
+
+    @staticmethod
+    def _is_internal_autonomous_prompt(text: str) -> bool:
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized:
+            return False
+        return (
+            normalized.startswith("you are the planner for an autonomous ")
+            or normalized.startswith("you are running one autonomous ")
+        )
 
     @staticmethod
     def _prepare_kb_query(query: str) -> str:
@@ -6033,25 +6130,31 @@ class LiteAgent:
             self.memory.add_message(user_id, "assistant", direct_memory_summary)
             return direct_memory_summary
 
-        direct_telegram_guidance = self._direct_telegram_target_guidance(text_for_memory, user_id)
-        if direct_telegram_guidance:
-            self.memory.add_message(user_id, "assistant", direct_telegram_guidance)
-            return direct_telegram_guidance
+        if not self._is_internal_autonomous_prompt(text_for_memory):
+            direct_telegram_guidance = self._direct_telegram_target_guidance(text_for_memory, user_id)
+            if direct_telegram_guidance:
+                self.memory.add_message(user_id, "assistant", direct_telegram_guidance)
+                return direct_telegram_guidance
 
-        direct_followup_delivery = self._direct_followup_telegram_delivery(text_for_memory, user_id)
-        if direct_followup_delivery:
-            self.memory.add_message(user_id, "assistant", direct_followup_delivery)
-            return direct_followup_delivery
+            direct_followup_delivery = self._direct_followup_telegram_delivery(text_for_memory, user_id)
+            if direct_followup_delivery:
+                self.memory.add_message(user_id, "assistant", direct_followup_delivery)
+                return direct_followup_delivery
 
-        direct_owned_document = await self._direct_owned_document_delivery(text_for_memory, user_id)
-        if direct_owned_document:
-            self.memory.add_message(user_id, "assistant", direct_owned_document)
-            return direct_owned_document
+            direct_markdown_file = await self._direct_recent_markdown_file_delivery(text_for_memory, user_id)
+            if direct_markdown_file:
+                self.memory.add_message(user_id, "assistant", direct_markdown_file)
+                return direct_markdown_file
 
-        direct_recent_file = await self._direct_recent_file_followup(text_for_memory, user_id)
-        if direct_recent_file:
-            self.memory.add_message(user_id, "assistant", direct_recent_file)
-            return direct_recent_file
+            direct_owned_document = await self._direct_owned_document_delivery(text_for_memory, user_id)
+            if direct_owned_document:
+                self.memory.add_message(user_id, "assistant", direct_owned_document)
+                return direct_owned_document
+
+            direct_recent_file = await self._direct_recent_file_followup(text_for_memory, user_id)
+            if direct_recent_file:
+                self.memory.add_message(user_id, "assistant", direct_recent_file)
+                return direct_recent_file
 
         # Deterministic profile-slot answers prevent occasional LLM misses on
         # questions like "как меня зовут".
@@ -6727,29 +6830,36 @@ class LiteAgent:
             yield direct_memory_summary
             return
 
-        direct_telegram_guidance = self._direct_telegram_target_guidance(user_input, user_id)
-        if direct_telegram_guidance:
-            self.memory.add_message(user_id, "assistant", direct_telegram_guidance)
-            yield direct_telegram_guidance
-            return
+        if not self._is_internal_autonomous_prompt(user_input):
+            direct_telegram_guidance = self._direct_telegram_target_guidance(user_input, user_id)
+            if direct_telegram_guidance:
+                self.memory.add_message(user_id, "assistant", direct_telegram_guidance)
+                yield direct_telegram_guidance
+                return
 
-        direct_followup_delivery = self._direct_followup_telegram_delivery(user_input, user_id)
-        if direct_followup_delivery:
-            self.memory.add_message(user_id, "assistant", direct_followup_delivery)
-            yield direct_followup_delivery
-            return
+            direct_followup_delivery = self._direct_followup_telegram_delivery(user_input, user_id)
+            if direct_followup_delivery:
+                self.memory.add_message(user_id, "assistant", direct_followup_delivery)
+                yield direct_followup_delivery
+                return
 
-        direct_owned_document = await self._direct_owned_document_delivery(user_input, user_id)
-        if direct_owned_document:
-            self.memory.add_message(user_id, "assistant", direct_owned_document)
-            yield direct_owned_document
-            return
+            direct_markdown_file = await self._direct_recent_markdown_file_delivery(user_input, user_id)
+            if direct_markdown_file:
+                self.memory.add_message(user_id, "assistant", direct_markdown_file)
+                yield direct_markdown_file
+                return
 
-        direct_recent_file = await self._direct_recent_file_followup(user_input, user_id)
-        if direct_recent_file:
-            self.memory.add_message(user_id, "assistant", direct_recent_file)
-            yield direct_recent_file
-            return
+            direct_owned_document = await self._direct_owned_document_delivery(user_input, user_id)
+            if direct_owned_document:
+                self.memory.add_message(user_id, "assistant", direct_owned_document)
+                yield direct_owned_document
+                return
+
+            direct_recent_file = await self._direct_recent_file_followup(user_input, user_id)
+            if direct_recent_file:
+                self.memory.add_message(user_id, "assistant", direct_recent_file)
+                yield direct_recent_file
+                return
 
         direct_profile = self._direct_profile_memory_answer(user_input, user_id)
         if direct_profile:
